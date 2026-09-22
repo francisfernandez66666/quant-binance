@@ -1,0 +1,6390 @@
+// Package engine 顶层编排引擎：持有全部子代理（NewsAgent/StrategyAgent/SectorAgent/CombatAgent），
+// 每 5 分钟驱动一次完整流水线：新闻拉取 → Stage0/Stage1/Stage2 → 固化 → 板块验证 → 战法扫描 → 信号聚合 → SSE 广播。
+// 各子模块只输出结果，不直接相互调用；引擎是唯一的编排者，控制流程顺序、阈值过滤和状态同步。
+// English: top-level orchestrating engine that holds all sub-agents (NewsAgent/StrategyAgent/SectorAgent/CombatAgent).
+// Drives a full pipeline every 5 minutes: news pull → Stage0/1/2 → fixation → sector verification
+// → strategy scanning → signal aggregation → SSE broadcast.
+// Sub-modules only output results; they do not call each other directly.
+// The engine is the sole orchestrator, controlling flow order, threshold filtering, and state sync.
+package engine
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"log"
+	"math"
+	"os"
+	"path/filepath"
+	"regexp"
+	"runtime"
+	"runtime/debug"
+	"sort"
+	"strconv"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
+	"unicode/utf8"
+
+	"quant-trading-v2/internal/combat_agent"
+	"quant-trading-v2/internal/config"
+	"quant-trading-v2/internal/data"
+	"quant-trading-v2/internal/display"
+	"quant-trading-v2/internal/llm"
+	"quant-trading-v2/internal/metrics"
+	"quant-trading-v2/internal/newsagent"
+	"quant-trading-v2/internal/notify"
+	"quant-trading-v2/internal/opslog"
+	"quant-trading-v2/internal/paper"
+	"quant-trading-v2/internal/report"
+	"quant-trading-v2/internal/research"
+	"quant-trading-v2/internal/sector_agent"
+	"quant-trading-v2/internal/server"
+	"quant-trading-v2/internal/signalctl"
+	"quant-trading-v2/internal/store"
+	factorstrat "quant-trading-v2/internal/strategies/factor"
+	patternstrat "quant-trading-v2/internal/strategies/pattern"
+	"quant-trading-v2/internal/strategy_engine"
+	"quant-trading-v2/internal/trading"
+)
+
+// llmDegradeCount 包级 LLM 降级计数：累计因 LLM 不可用/限流/失败而退化为中性(或规则兜底)的次数，
+// 供运维观测 LLM 异常频率（结合日志与 /api/debug）。默认相关个股/板块降级为中性占位，但保证日志可见。
+// （llmDegradeCount is a package-level counter of LLM-degradation events (LLM down/throttled/failed) where
+// affected stocks/sectors fall back to a neutral placeholder; it lets ops monitor LLM anomaly frequency.）
+var llmDegradeCount int64
+
+// Engine 顶层编排引擎，持有全部子代理引用与利好/利空开关。
+// 它是唯一被允许跨模块调用的对象：把新闻流水线、板块验证、战法扫描与信号聚合串联成一条完整链路。
+type Engine struct {
+	mu sync.RWMutex // 保护全部可变字段的读写锁（多 goroutine：主循环 + 近实时打分循环 + SSE/HTTP 调用）
+
+	// consultBlockCache 咨询数据块按代码缓存（§生产 20260916）：数据上下文改为无条件注入后，
+	// 咨询可任意频次触发，单次单股 4 次外部行情调用必须收敛；60s 新鲜度对咨询足够。
+	// consultBlockMu 保护该 map（与 mu 分开，避免行情慢调用阻塞引擎主锁）。
+	// §FIX-6(20260919 批四)：consultFlight 为同代码 single-flight（并发首查只穿透一路行情），
+	// consultBlockCache 加条数上限（超限淘汰最旧，防无界增长）。
+	consultBlockMu    sync.Mutex
+	consultBlockCache map[string]consultBlockEntry
+	consultFlight     map[string]*consultBlockFlight
+	// consultBlockLoad §FIX-6 测试缝：非 nil 时替代 buildStockBlockUncached 作为穿透加载器
+	// （单测用它统计并发穿透次数；生产恒 nil 走行情源直调）。
+	consultBlockLoad func(code, name string) string
+
+	// lastAlertEval §WS-L 阈值告警评估节流时间戳（scoreCycle 每 30s 跑一轮）。
+	lastAlertEval time.Time
+
+	marketAPI *data.MarketAPI // 行情 API（实时价/K线/资金流/涨停池）
+	// §MARKET_RISK_GATE P0 风险盘口主源：注入多源协调器后，涨停池等盘口统计走 hithink 主源、
+	// 东财兜底；未注入（nil）或 riskHithink=false 时全部回落旧的 e.marketAPI 东财直连。
+	// English: multi-source coordinator for the risk boards — once injected, board stats route
+	// through hithink primary + EastMoney fallback; nil or riskHithink=false reverts to EM-direct.
+	coordinator *data.DataCoordinator
+	riskHithink bool
+	// §MARKET_RISK_GATE P2 指数均线斜率日级缓存（趋势斜率日内不变，避免每轮重复拉指数日K）：
+	// maSlopeDay 记录已算交易日，跨日才重算；未注入源/取数失败时保持 NaN 弃权。
+	// English: daily cache of index MA slopes (trend slope is intraday-invariant; recompute only on a
+	// new trading day; NaN abstain when no source or on failure).
+	maSlopeDay   string
+	maSlope20    float64
+	maSlope60    float64
+	newsAgent    *newsagent.Agent        // 新闻代理（拉取 + Stage0/1/2 归因分析）
+	strategy     *strategy_engine.Engine // 策略引擎（事件归因 → 评分池 → 行情数据）
+	sectorAgent  *sector_agent.Agent     // 板块验证代理（战法扫描前做板块真伪验证）
+	combatAgent  *combat_agent.Agent     // 战法代理（8a/8b 打分 + 多战法信号扫描）
+	agg          *display.Aggregator     // 看板聚合器（SSE 数据源）
+	rpt          *report.Report          // 持仓/交易报表（止盈止损提醒依赖）
+	stockTracker *data.StockTracker      // 个股跟踪池（8a/8b 入池与失效管理）
+	wlMgr        *data.WatchlistManager  // 用户自选股管理
+	sse          *server.SSEBroker       // SSE 广播器（推送打分/信号到前端）
+	llmClient    *llm.Client             // LLM 客户端（D1 评分 / 标题党校正）
+	ths          *data.THSClient         // 同花顺客户端（板块名单/行情表/实时报价降级）
+	scanner      *data.SectorScanner     // 板块扫描器（板块名单索引，板块验真与归因校验依赖）
+
+	userID string // 账号 ID（多账号独立引擎：该引擎只计算本账号的信号/评分）（Account ID; in multi-account mode this engine computes only this account's signals/分 scores）
+	// §WMQ-1（20260917）：共享引擎的 QMT 配置热同步源账号（首建/管理员成员，registry 注入）。
+	// 旧行为：共享引擎 userID=="" 时 syncAccountConfig 直接 return——QMT 配置从不进入
+	// 待生效队列 QueueConfigUpdate，交易时段 ApplyPendingConfig 无可消费、executor
+	// 类型（Noop↔QMTClient）也无法切换，需要重启进程才生效（资损敏感缺口）。
+	// 语义：共享引擎的 QMT 控制器归属 primaryMember（FIX#11 契约），热同步按该账号
+	// 的 GetQMTConfigFor 读取——与构建期 registry.go:802 同源。
+	qmtCfgUserID string   // 空 = 独占引擎，用 e.userID；非空 = 共享引擎，按此账号热同步 QMT 配置
+	members      []string // §GAP2-W2 共享引擎服务的账号全集（registry 注入；私有消息/SSE 扇出依据）
+	// §P1-4 管理员判定函数（main 注入 auth.IsAdmin）：primaryMember 优先返回管理员成员，
+	// 确保 friends 共享引擎的实盘账本/QMT 控制器默认归属创建者/管理员，而非首个普通成员。
+	// English: P1-4 admin predicate (wired from main's auth.IsAdmin) — primaryMember prefers an admin.
+	isAdminFn    func(userID string) bool
+	accountsRoot string          // §GAP2-W2 <dataDir>/accounts 根（私有文件按账号寻址）
+	cfgMgr       *config.Manager // 配置管理器（按账号读取策略/D1/LLM/做多做空配置）（Config manager, reads per-account strategy/D1/LLM/long-short settings）
+	longEnabled  bool            // 利好开关（做多分支）
+	shortEnabled bool            // 利空开关（做空分支）
+
+	m8PeakTotal float64 // §GAP1.2 实盘组合市值峰值（M8 回撤兜底基线；e.mu 保护，平仓后归零重计）
+
+	asyncBusy int32 // 盘前异步引擎运行标记（忙锁，避免异步 run 重入）
+
+	clockFn func() time.Time // §可注入时钟：默认 time.Now；e2e 固定交易时段用（SetClock）
+
+	debugInfo    *newsagent.DebugInfo  // 最近一轮流水线的调试数据（/api/debug 展示）
+	stageRecords []newsagent.DebugInfo // 当日全量轮次记录（固化到磁盘）
+	stageRecPath string                // Stage 记录持久化文件路径
+	lastStageCap time.Time             // §LLM 面板：近实时循环最近一次 Stage 快照捕获时间（节流用）
+
+	signalRecords []combat_agent.SignalLog // 当日全量信号批次记录（固化到磁盘）
+	signalRecPath string                   // 信号批次记录持久化文件路径
+	signalStore   *signalStore             // 当日战法信号固化存储（code@strategy 最近一次 Pass，跨重启恢复）
+	// English: pinned per-day signal store (latest Pass per code@strategy, restored across restarts)
+	storeDay string // §修复 P2#23：signalStore/signalRecords 已加载的交易日（YYYMMDD），跨日即清空避免昨日信号残留
+
+	msgStore      *data.MessageStore            // 消息中心持久化存储
+	consultStore  *data.ConsultStore            // 股票咨询对话持久化存储（跨交易日清空；accountsRoot 未注入时的共享回退）
+	consultMu     sync.Mutex                    // §GAP2-W2 保护 consultByUser 懒加载
+	consultByUser map[string]*data.ConsultStore // §GAP2-W2 按账号隔离的咨询历史（accountsRoot/<uid>/consult_history.json）
+	confrontStore *data.ConfrontationStore      // 政策反制事件持久化存储（跨交易日清空）
+	notifier      *notify.Notifier              // 推送器（桌面/Webhook；P1 清仓强提醒用）
+	hotRecords    []data.HotRecord              // 当日热点板块轮次记录（固化到磁盘）
+	hotRecPath    string                        // 热点板块记录持久化文件路径
+
+	sectorEventTimes map[string]time.Time         // 板块事件时间戳（重复事件衰减状态）
+	emotionCfg       *config.EmotionConfig        // 情绪周期阈值（SSE 广播情绪阶段）
+	sectorConstTopN  int                          // 板块→个股传播每板块成分股数量（默认 20，扩大同板块强势股覆盖）
+	auctionStrengths map[string]float64           // 竞价强度分（§P1.2，code→[0,10]，开盘窗口确认/观察用）
+	impactTbl        *research.ImpactTable        // 新闻影响率表（§P2.1；Enhance.NewsImpact 开启时懒建，nil=关闭）
+	sectorLeaders    []sector_agent.LinkageLeader // §P2.2 龙头观察列表（Enhance.SectorLinkage 开启时刷新）
+	marketTracker    *research.StateTracker       // §P2.3 市场状态机跟踪器（Enhance.MarketState 开启时懒建，nil=关闭）
+	signalQuality    *research.SignalQualityTable // §P2.5 信号质量分桶表（Enhance.DynWeight 开启时懒建，nil=关闭）
+
+	fetcher          *data.Fetcher                   // 5s 实时行情采集器（近实时打分快照来源）
+	scoreStore       *scoreStore                     // 8a/8b 主循环打分持久化（scores.json）
+	fastScoreStore   *scoreStore                     // §P0-8 近实时 5s 循环打分持久化（scores_fast.json），与主循环分池避免互相覆盖
+	prevPass         map[string]map[string]bool      // 近实时信号状态翻转去重（code → strategy → 上次是否Pass）
+	prevBullBuy      map[string]map[string]bool      // 主循环 buy 信号状态翻转去重（龙头识别等仅在主循环产生的信号，防重复买入）
+	lastD1Scores     map[string]combat_agent.D1Score // 主循环最近一轮 D1 评分（近实时循环复用，不每 5s 调 LLM）
+	d1ScoredSig      map[string]string               // §信号速度 S1：主循环最近一轮评分时的事件签名（code → 签名），供增量 D1 复用判定
+	d1RetryQueue     map[string]bool                 // D1 LLM 失败待重试队列（失败股并入下轮打分池重新调 LLM，不兜底）
+	lastEmotionPhase string                          // 主循环最近一轮情绪阶段（近实时循环复用）
+	// §MARKET_RISK_GATE P2/F2：最近一轮市场状态机结果 + 仓位档，供 SSE 市场环境条展示与风险档合成消费。
+	// English: last market-state-machine result + position cap, surfaced via the SSE status bar (F2) and
+	// consumed by the risk-tier synthesizer (B3).
+	lastMarketState string  // bull/range/bear（状态机关闭时为空串=不展示）
+	lastMaxPosPct   float64 // 状态机建议最大仓位比例（0=未启用）
+	// §MARKET_RISK_GATE P3：最近一轮合成的市场风险档（空/Yellow/Red）+ 触发原因，供 SSE 徽标/自动买谨慎层/持仓预警。
+	// English: the latest synthesized risk tier (empty/Yellow/Red) + reasons, used by the SSE badge, the
+	// auto-buy caution layer, and held-position alerts.
+	lastRiskTier    string
+	lastRiskReasons []string
+	// §MARKET_RISK_GATE P6 日历校准：落盘缓存路径（dataDir 空则禁用校准）+ 当日已校准标记（每日一次）。
+	// English: P6 calendar calibration — cache-file path (empty dataDir disables it) + a daily-calibrated marker.
+	macroCalCachePath string
+	calibrateDay      string
+	lastBearReasons   map[string]string                                                                               // FIX#13 主循环最近一轮利空归因（code→原因，近实时实盘建议 BearishAttributionAlerts 复用）
+	d1MaxRetries      int                                                                                             // D1 评分 LLM 轮询重试次数（<=0 用默认2，§S5）
+	d1MaxTokens       int                                                                                             // D1 评分 LLM 单次调用推理长度上限（§S3，<=0 用默认2048）
+	lastTiming        *RunTiming                                                                                      // 最近一轮 Run 分段耗时（e2e 实速模拟观测）
+	factorMon         *factorMonitor                                                                                  // 因子战法效果监测（战法库触发信号前向收益结算）
+	paper             *paper.Engine                                                                                   // 模拟盘引擎（独立纸面交易，可空=未启用）
+	paperOnSignals    func(emit []combat_agent.Signal, exit []combat_agent.Signal, quotes map[string]*data.StockInfo) // 按账号分发 buy+卖出纪律信号撮合（registry 注入）
+	paperMarkFn       func(quotes map[string]*data.StockInfo)                                                         // 按账号分发估值/净值（registry 注入）
+	paperSellJudgeFn  func(feed sellJudgeFeed, sellMode string)                                                       // §SELLPOINT-UNIFY P3：按账号遍历模拟盘账本的统一卖出裁决（registry 注入；nil=回退全局 e.paper 单账本）；sellMode=§M9 轮首快照透传
+	paperHeldCodes    func() []string                                                                                 // 全账号模拟盘持仓代码聚合（registry 注入；nil=回退 e.paper 全局账本）
+	lastBaseLog       time.Time                                                                                       // §QUOTE_POOL_SPLIT 持仓池 base 构成观测日志节流点
+	lastTrim          time.Time                                                                                       // 盘后内存释放最近一次执行时间（节流用）
+	// §DAILY_REVIEW 盘后持仓综合复盘：reviewGuardDay 记录本引擎最近一次复盘的交易日（YYYY-MM-DD），
+	// 保证每日只自动跑一次（盘后休眠分支每 ~15min 唤醒亦触发，靠此去重）；reviewRunning 防自动/手动并发重入；
+	// reviewDailyK / reviewAsk 为可注入依赖（默认取 e.marketAPI.GetSinaKLine 与 e.llmClient.Chat），
+	// 单测注入桩数据即可离线跑通"事实→合并提示词→解析→写消息"全链路。
+	// English: §DAILY_REVIEW after-hours per-account LLM position review state. reviewGuardDay de-dupes
+	// one auto run per trading day; reviewRunning prevents auto/manual overlap; reviewDailyK/reviewAsk are
+	// injectable deps (default → marketAPI.GetSinaKLine / llmClient.Chat) so tests run fully offline.
+	reviewGuardDay   string                                    // 最近一次复盘交易日（YYYY-MM-DD，每日去重）
+	reviewRunning    bool                                      // 复盘执行中标志（防自动/手动并发）
+	reviewDailyK     func(code string) ([]data.KLine, error)   // 可注入日K源（nil→marketAPI.GetSinaKLine）
+	reviewAsk        func(system, user string) (string, error) // 可注入 LLM 调用（nil→llmClient.Chat）
+	reportTrimDone   map[string]string                         // FIX#15 report 账本减仓去重：code → 交易日（autoExitReportSells 半仓每日一次）
+	reportTrimDoneMu sync.Mutex                                // reportTrimDone 互斥（主循环独占写，SSE/HTTP 可能读，防御性）
+
+	// §SHORT-2 做空战法卖出标记：主循环命中持仓走弱的 sell 信号时记录（纯code → 标记），
+	// 近实时 pushRealAdvice 消费同交易日的标记生成实盘清仓级建议（Source=short_tactic），
+	// 复用 autoExecuteRealSells 的 mode=auto+auto_sell 门槛、幂等键与 syncLiveAdviceAlerts 强提醒。
+	// English: bear-tactic sell marks — the main loop records weak-holding sells; the near-realtime
+	// advice pass converts same-trading-day marks into 止损-class advices (Source=short_tactic) so the
+	// existing live auto-sell gates/idempotency/strong-reminders are reused wholesale.
+	shortSellMarks   map[string]shortSellMark
+	shortSellMarksMu sync.Mutex
+
+	// 实盘交易（AUTO_TRADING_PLAN M1）：QMT 控制器 + 实盘账本 store。独立于纸面账本。
+	// 仅 qmt.enabled=true 时参与 5s 分析循环（读 real_positions 生成持仓建议 / 熔断 / 自动下单）。
+	// English: live trading (AUTO_TRADING_PLAN M1) — QMT controller + real-book store, independent of the
+	// paper book. Only active when qmt.enabled=true: reads real_positions for position advice, circuit
+	// breaking and auto-orders each 5s cycle.
+	qmtCtrl   *trading.Controller // QMT 执行控制器（下单/熔断/健康探测，可空=未启用）
+	realStore *store.DB           // 实盘账本库（live.db：real_positions/orders/fills 存取）
+	d1Store   *store.DB           // D1 评分历史库（trading.db：d1_scores 落库，与研究数据同库）
+
+	// §SIGNAL_CONTROLLER 20260917：实盘买入确认状态机（原 buyConfirmReal + realBuyConfirmPass）
+	// 已迁到信号控制器（internal/signalctl）live 通道——战法白名单/黑名单/个股/板块黑名单/持续性
+	// 确认窗的裁定统一在控制器完成，引擎按裁定分发交易器与模拟盘（方案 docs/SIGNAL_CONTROLLER_PLAN_20260917.md）。
+	// sigCtl 按引擎装配（共享引擎组内实盘配置经 FIX#11 指纹保证一致，live 通道状态键含账号维度）。
+	// English: the real-buy-confirm state machine moved into the signal controller (live channel);
+	// the engine now dispatches to traders strictly by explicit verdicts.
+	sigCtl *signalctl.Controller
+	// liveDecisions 最近一轮 live 通道裁定（键=pureCode|strategyKey），供消息中心标注
+	// "待确认/被拦+原因"（§SIGNAL_CONTROLLER 裁决④：消息与下单解耦，全部翻转照常进消息、
+	// 带拦截原因，下单只走 pass）。每轮 dispatchLive 覆盖，读侧无锁竞态容忍（展示用途）。
+	liveDecisions map[string]signalctl.Decision
+	// disciplineTracker 实盘统一止盈止损纪律状态机（§统一纪律 B：pushRealAdvice 经 trading.Advise
+	// 注入）。pushRealAdvice 惰性初始化（避免 build 顺序耦合）；nil = 未接入纪律裁决。
+	// English: the live unified-discipline tracker (wired into trading.Advise by pushRealAdvice).
+	// Lazy-initialized in pushRealAdvice to avoid build-order coupling; nil = no discipline adjudication.
+	disciplineTracker *trading.DisciplineTracker
+	// realTrimDone 实盘纪律减仓去重：code → 交易日（同一交易日只响应一次"减仓"裁决，
+	// 防纪律状态机每轮重放 ActionTrim 把仓位反复减半）。e.mu 保护。
+	// English: live discipline-trim dedup — code → trading day (at most one 减仓 per code per day, so the
+	// discipline state machine's per-round ActionTrim can't keep halving the position). Guarded by e.mu.
+	realTrimDone map[string]string
+
+	// §SELLPOINT-UNIFY 边界⑥ / §H5（2026-09-22 修复批）：最近一轮做多打分（ScorePool/ScanLong）
+	// 的产出时刻，e.mu 保护。卖出裁决通道的做多信号新鲜度**兜底**基准——主判据已改为打分自身
+	// StockScores.UpdatedAt（见 sell_shadow.go judgeSellPositions）：旧口径只在 5s 近实时轮写入、
+	// 池空提前 return 即冻结时钟，5min 批量轮信号被误判过期；现批量轮同样推进本字段，且它只服务
+	// 无自带时刻的存量/测试装配，零值=尚无打分，兜底路径下做多信号一律不新鲜。
+	// English: timestamp of the latest bull scoring round — now only the FALLBACK freshness basis
+	// (§H5); per-signal StockScores.UpdatedAt is the primary basis, and both scoring loops advance it.
+	scoresAt time.Time
+
+	// §D1 护栏4（利空验证分级·生产侧）：纯6位代码 → 利空板块成分双源验证等级，主循环
+	// propagateSectorToStocks 每轮刷新——利空板块成分股同时命中「同花顺 ∩ 东财」两份真实成分名单
+	// → dual（触线可即时硬清）；仅单源命中 → single（只预警）。消费方（sell_shadow/P2 裁决）对
+	// 无记录/过期一律按 single 处理：缺数据只失去硬清资格，绝不误判"无利空"（护栏5口径）。
+	// English: verification tier of bearish attribution (pure code → dual/single), produced by
+	// sector propagation each round; consumers treat missing/stale entries as single (warn-only).
+	bearTier map[string]bearTierEntry
+	// §D1 护栏4：东财板块「名称→BK代码」映射（refreshSectors 每轮刷新），利空板块双源验证的第二源入口。
+	emBoardCodes map[string]string
+
+	// §A+B 信号→交易低延迟：异步下单分发器（事件驱动热路径）。
+	// autoPlace 完成同步守卫（模式/白名单/涨停封板/金额）后把 OrderRequest 投入 buyCh，
+	// 由独立 worker 调用 ctrl.PlaceOrder，避免网关 RTT 阻塞 5s 打分/检测循环。
+	buyCh   chan buyTask
+	buyStop chan struct{}
+	buyWg   sync.WaitGroup
+	// §M11（2026-09-22 修复批）停机队列落盘路径（<acctDir>/buy_queue_pending.json，dataDir 空=禁用）。
+	// buyCh 是 64 槽内存队列，停机时已排队未消费的买单随重启蒸发。StopBuyDispatcher 排空队列
+	// 原子落盘、StartBuyDispatcher 恢复入队（按 SignalID 去重）；恢复后与原链路共用 orders 表
+	// signal_id 唯一键幂等，不会重复下单。
+	// English: shutdown-drain persistence path for the in-memory buy queue (§M11).
+	buyQueuePath string
+	// §M10（2026-09-22 修复批）paper 账本移动止盈锚点跨重启持久化：裁决内核的持仓期最高价
+	// 锚点原是纯内存状态机「每轮自抬」（paper 账本不存 high），进程重启即清零 → 高点回落到
+	// 成本价、移动止盈重启后永不触发。引擎侧按账号维护 账号→代码→锚点 嵌套表 + 原子 JSON
+	// 文件（生命周期与裁决状态一致：平仓即删，见 syncPaperSellAnchors）。
+	// English: cross-restart persistence of the paper trailing-stop high anchor (kernel state was
+	// memory-only; a restart reset it to cost and the trail never fired again).
+	paperAnchorMu     sync.Mutex                    // 保护下面三字段（懒加载 + 轮次同步）
+	paperAnchorPath   string                        // <acctDir>/paper_sell_anchors.json（空=纯内存禁用落盘）
+	paperAnchors      map[string]map[string]float64 // 账号 → 持仓代码 → 持仓期最高价锚点
+	paperAnchorLoaded bool                          // 懒加载标记（首次访问读一次文件）
+	// §A+B 近实时打分循环间隔（默认 0 → 回退 5s），可配置为 1-2s 以加快信号翻转检出。
+	scoringInterval time.Duration
+}
+
+// buyTask §A+B 异步下单任务：守卫已过的 buy 信号 + 已折算的 OrderRequest。
+// English: A+B async order task — a buy signal that passed all synchronous guards, with its computed OrderRequest.
+type buyTask struct {
+	req trading.OrderRequest // 已通过同步守卫并折算好的下单请求（SignalID 幂等键）
+	sig combat_agent.Signal  // 触发本轮下单的买入信号（worker 日志与审计上下文）
+}
+
+// LastRunTiming 返回最近一轮 Run 的分段耗时（可能为 nil，Run 未执行过时）。
+func (e *Engine) LastRunTiming() *RunTiming {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	return e.lastTiming
+}
+
+// recordLLMDegrade 累计一次 LLM 降级事件并打出结构化告警（原因 + 影响条数 + 累计次数）。
+// 用于 sector 解码/归因或 D1 评分因 LLM 故障而默认中性占位时，保证日志可见、便于运维发现 LLM 异常。
+// （recordLLMDegrade records one LLM-degradation event and logs a structured alert (reason + affected count
+// + cumulative count), used when sector decode/attribution or D1 scoring silently falls back to neutral due
+// to LLM failure, keeping it visible to operators.）
+func (e *Engine) recordLLMDegrade(reason string, affected int) {
+	n := atomic.AddInt64(&llmDegradeCount, 1)
+	metrics.LLMDegraded() // §R4-9 LLM 降级计数进指标面
+	log.Printf("[engine][LLM降级#%d] %s, 影响条数=%d", n, reason, affected)
+}
+
+// LastD1Scores 返回主循环最近一轮 D1 评分结果（副本），含 RetryPending 标记，
+// 供 e2e/诊断断言"LLM 失败不兜底、走重试队列"语义。
+// English: returns a copy of the main loop's latest D1 scores (incl. RetryPending), for e2e/diagnostic
+// assertions of the "no LLM fallback, via retry queue" semantics.
+func (e *Engine) LastD1Scores() map[string]combat_agent.D1Score {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	out := make(map[string]combat_agent.D1Score, len(e.lastD1Scores))
+	for code, d := range e.lastD1Scores {
+		out[code] = d
+	}
+	return out
+}
+
+// D1RetryQueueCodes 返回当前 D1 LLM 重试队列中的个股代码（副本），
+// 供 e2e 断言失败股确实并入重试队列。
+// English: returns a copy of the current D1 LLM retry-queue codes, for e2e assertions that failed stocks
+// actually joined the retry queue.
+func (e *Engine) D1RetryQueueCodes() []string {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	out := make([]string, 0, len(e.d1RetryQueue))
+	for code := range e.d1RetryQueue {
+		out = append(out, code)
+	}
+	return out
+}
+
+// SetEmotionConfig 设置情绪周期阈值（线程安全），并把 C5 禁止开仓阶段列表同步给战法代理。
+// English: sets the emotion-cycle thresholds (thread-safe) and pushes the C5 block-buy phases to the
+// combat agent.
+func (e *Engine) SetEmotionConfig(cfg *config.EmotionConfig) {
+	e.mu.Lock()
+	e.emotionCfg = cfg
+	e.mu.Unlock()
+	if e.combatAgent != nil && cfg != nil {
+		e.combatAgent.SetEmotionBlockPhases(cfg.BlockBuyPhases)
+	}
+}
+
+// SetSectorConstituentTopN 设置板块→个股传播每板块纳入的成分股数量（>0 时生效）。
+// English: sets the per-sector constituent count for sector→stock propagation (effective when >0).
+func (e *Engine) SetSectorConstituentTopN(n int) {
+	e.mu.Lock()
+	if n > 0 {
+		e.sectorConstTopN = n
+	}
+	e.mu.Unlock()
+}
+
+// SetD1MaxRetries 设置 D1 评分 LLM 调用的轮询重试次数（含首次）。n<=0 使用默认2（§S5）。
+func (e *Engine) SetD1MaxRetries(n int) {
+	e.mu.Lock()
+	e.d1MaxRetries = n
+	e.mu.Unlock()
+}
+
+// SetD1MaxTokens 设置 D1 评分 LLM 单次调用的推理长度上限（§信号速度 S3）。n<=0 使用默认2048。
+// English: SetD1MaxTokens sets the per-call reasoning-length cap for D1 scoring (§speed S3); n<=0 uses 2048.
+func (e *Engine) SetD1MaxTokens(n int) {
+	e.mu.Lock()
+	e.d1MaxTokens = n
+	e.mu.Unlock()
+}
+
+// TrimAfterHoursIfDue 盘后内存释放：非活跃时段（盘后/休市）按节流间隔执行
+// runtime.GC()+debug.FreeOSMemory()，把常驻 Go 堆/缓存归还 OS。
+// 服务器物理内存仅 1.6GiB：quant 常驻服务盘后只展示数据快照、不跑全量性能，
+// 主动释放内存让给盘后 research 夜间作业，避免两者叠加触发 global_oom。
+// 由 main 的 5s 打分调度每轮调用；盘中（活跃时段）不触发，不影响性能。
+// English: after-hours memory trim — outside active sessions, periodically runs
+// runtime.GC()+debug.FreeOSMemory() (throttled) to return the resident Go heap/cache to the OS.
+// The 1.6GiB box can't afford quant + the nightly research job simultaneously; after hours the
+// engine only serves data snapshots, so it gives memory back to research. Called by the 5s scoring
+// dispatcher each round; never runs during active trading sessions.
+func (e *Engine) TrimAfterHoursIfDue(now time.Time) {
+	if e.cfgMgr == nil {
+		return
+	}
+	rc := e.cfgMgr.Rules.Runtime
+	// 仅盘后且开关开启时执行；交易时段内不触发。
+	if !rc.TrimAfterHours || data.IsActiveSession(now) {
+		return
+	}
+	interval := time.Duration(rc.TrimIntervalMin) * time.Minute
+	if interval <= 0 {
+		interval = 15 * time.Minute
+	}
+	// 节流：距上次释放不足 interval 则跳过（默认 15 分钟）。
+	e.mu.Lock()
+	due := now.Sub(e.lastTrim) >= interval
+	if due {
+		e.lastTrim = now
+	}
+	e.mu.Unlock()
+	if !due {
+		return
+	}
+	// 主动触发 GC 并归还空闲内存给 OS（长驻进程防内存膨胀）。
+	runtime.GC()
+	debug.FreeOSMemory()
+	log.Printf("[engine] 盘后内存释放完成 (trim_after_hours, 节流 %v)", interval)
+}
+
+// ReloadFactorRules 从战法库 applied_factors.json 重载全部启用规则并注入因子 runner（热生效）。
+// 战法库启用/禁用/删除/审批后由 server 调用，无需重启。
+// English: reloads all enabled rules from the strategy library and injects them into the factor
+// runner (hot-applied). Called by the server after library mutations; no restart needed.
+func (e *Engine) ReloadFactorRules(dataDir string) {
+	e.mu.RLock()
+	ca := e.combatAgent
+	e.mu.RUnlock()
+	if ca != nil {
+		ca.ReloadFactorRules(dataDir)
+	}
+}
+
+// FactorStats 返回因子 runner 的各规则运行统计（效果监测）。
+// English: returns per-rule run stats of the factor runner (effectiveness monitoring).
+func (e *Engine) FactorStats() []factorstrat.ActiveRule {
+	e.mu.RLock()
+	ca := e.combatAgent
+	e.mu.RUnlock()
+	if ca != nil {
+		return ca.FactorStats()
+	}
+	return nil
+}
+
+// RecordFactorForwardReturn 记录某条因子规则一条触发股的 Horizon 日前向收益（效果监测）。
+// English: records a rule's Horizon-day forward return for one triggered stock (effectiveness monitoring).
+func (e *Engine) RecordFactorForwardReturn(ruleID string, ret float64) {
+	e.mu.RLock()
+	ca := e.combatAgent
+	e.mu.RUnlock()
+	if ca != nil {
+		ca.RecordFactorForwardReturn(ruleID, ret)
+	}
+}
+
+// ReloadPatternRules 从形态战法库 applied_patterns.json 重载全部启用规则并注入形态 runner（热生效）。
+// English: reloads all enabled rules from the pattern library and injects them (hot-applied).
+func (e *Engine) ReloadPatternRules(dataDir string) {
+	e.mu.RLock()
+	ca := e.combatAgent
+	e.mu.RUnlock()
+	if ca != nil {
+		ca.ReloadPatternRules(dataDir)
+	}
+}
+
+// PatternStats 返回形态 runner 的各规则运行统计（效果监测）。
+// English: returns per-rule run stats of the pattern runner (effectiveness monitoring).
+func (e *Engine) PatternStats() []patternstrat.ActivePattern {
+	e.mu.RLock()
+	ca := e.combatAgent
+	e.mu.RUnlock()
+	if ca != nil {
+		return ca.PatternStats()
+	}
+	return nil
+}
+
+// RecordPatternForwardReturn 记录某条形态规则一条触发股的 Horizon 日前向收益（效果监测）。
+// English: records a pattern rule's Horizon-day forward return for one triggered stock (monitoring).
+func (e *Engine) RecordPatternForwardReturn(ruleID string, ret float64) {
+	e.mu.RLock()
+	ca := e.combatAgent
+	e.mu.RUnlock()
+	if ca != nil {
+		ca.RecordPatternForwardReturn(ruleID, ret)
+	}
+}
+
+// stageRecordFile Stage 记录磁盘持久化结构（按交易日分桶）。
+type stageRecordFile struct {
+	TradingDay string                `json:"trading_day"` // 交易日
+	Records    []newsagent.DebugInfo `json:"records"`     // Stage 调试记录
+}
+
+// hotRecordFile 热点板块记录磁盘持久化结构（按交易日分桶）。
+type hotRecordFile struct {
+	TradingDay string           `json:"trading_day"` // 交易日
+	Records    []data.HotRecord `json:"records"`     // 热点板块记录
+}
+
+// signalRecordFile 信号批次记录磁盘持久化结构（按交易日分桶）。
+type signalRecordFile struct {
+	TradingDay string                   `json:"trading_day"` // 交易日
+	Records    []combat_agent.SignalLog `json:"records"`     // 信号批次记录
+}
+
+// New 创建顶层编排引擎。
+// New 组装量化引擎主实例：注入行情/新闻/战法/板块/对抗等各子系统与展示聚合器，
+// 并按 dataDir 初始化各持久化文件路径（dataDir 为空时不落盘，纯内存模式）。
+func New(
+	marketAPI *data.MarketAPI,
+	newsAgent *newsagent.Agent,
+	strategy *strategy_engine.Engine,
+	sectorAgent *sector_agent.Agent,
+	combatAgent *combat_agent.Agent,
+	agg *display.Aggregator,
+	rpt *report.Report,
+	stockTracker *data.StockTracker,
+	wlMgr *data.WatchlistManager,
+	sse *server.SSEBroker,
+	llmClient *llm.Client,
+	ths *data.THSClient,
+	dataDir string,
+) *Engine {
+	// 根据 dataDir 计算各持久化文件路径（dataDir 为空时不落盘，纯内存模式）
+	stageRecPath := ""
+	msgPath := ""
+	scoreRecPath := ""
+	fastScoreRecPath := ""
+	// dataDir 非空时按各持久化文件名拼接落盘路径（纯内存模式下留空禁用落盘）。
+	if dataDir != "" {
+		stageRecPath = filepath.Join(dataDir, "stage_records.json")
+		msgPath = filepath.Join(dataDir, "messages.json")
+		scoreRecPath = filepath.Join(dataDir, "scores.json")
+		fastScoreRecPath = filepath.Join(dataDir, "scores_fast.json")
+	}
+	consultPath := ""
+	if dataDir != "" {
+		consultPath = filepath.Join(dataDir, "consult_history.json")
+	}
+	confrontPath := ""
+	if dataDir != "" {
+		confrontPath = filepath.Join(dataDir, "confrontation.json")
+	}
+	hotRecPath := ""
+	signalRecPath := ""
+	signalStorePath := ""
+	macroCalCachePath := "" // §MARKET_RISK_GATE P6 日历校准落盘缓存（dataDir 空则禁用）
+	// §M10/§M11（2026-09-22 修复批）：paper 移动止盈锚点文件与停机买单队列文件，
+	// 均落在账号数据目录下（per-acctDir 装配天然按账号隔离；dataDir 空=纯内存禁用）。
+	paperAnchorPath := ""
+	buyQueuePath := ""
+	if dataDir != "" {
+		hotRecPath = filepath.Join(dataDir, "hot_records.json")
+		signalRecPath = filepath.Join(dataDir, "signal_records.json")
+		signalStorePath = filepath.Join(dataDir, "signals_today.json")
+		macroCalCachePath = filepath.Join(dataDir, "macro_calendar_cache.json")
+		paperAnchorPath = filepath.Join(dataDir, "paper_sell_anchors.json")
+		buyQueuePath = filepath.Join(dataDir, "buy_queue_pending.json")
+	}
+	// 组装引擎结构体：注入各数据源依赖 + 预加载历史持久化文件 + 初始化空容器。
+	e := &Engine{
+		marketAPI:         marketAPI,
+		newsAgent:         newsAgent,
+		strategy:          strategy,
+		sectorAgent:       sectorAgent,
+		combatAgent:       combatAgent,
+		agg:               agg,
+		rpt:               rpt,
+		stockTracker:      stockTracker,
+		wlMgr:             wlMgr,
+		sse:               sse,
+		llmClient:         llmClient,
+		ths:               ths,
+		longEnabled:       true,
+		shortEnabled:      false,
+		stageRecords:      loadStageRecords(stageRecPath),
+		stageRecPath:      stageRecPath,
+		signalRecords:     loadSignalRecords(signalRecPath),
+		signalRecPath:     signalRecPath,
+		signalStore:       newSignalStore(signalStorePath),
+		storeDay:          data.TradingDayDate(time.Now()), // 启动日即视为已加载日（新库只装当日），跨日才触发滚动清空
+		msgStore:          data.NewMessageStore(msgPath),
+		consultStore:      data.NewConsultStore(consultPath),
+		consultByUser:     make(map[string]*data.ConsultStore),
+		confrontStore:     data.NewConfrontationStore(confrontPath),
+		hotRecords:        loadHotRecords(hotRecPath),
+		hotRecPath:        hotRecPath,
+		macroCalCachePath: macroCalCachePath,
+		sectorEventTimes:  make(map[string]time.Time),
+		sectorConstTopN:   20,
+		auctionStrengths:  make(map[string]float64),
+		scoreStore:        newScoreStore(scoreRecPath),
+		fastScoreStore:    newScoreStore(fastScoreRecPath),
+		prevPass:          make(map[string]map[string]bool),
+		sigCtl:            signalctl.New(),
+		liveDecisions:     make(map[string]signalctl.Decision),
+		prevBullBuy:       make(map[string]map[string]bool),
+		lastD1Scores:      make(map[string]combat_agent.D1Score),
+		d1ScoredSig:       make(map[string]string),
+		d1RetryQueue:      make(map[string]bool),
+		factorMon:         newFactorMonitor(dataDir, 5),
+		paperAnchorPath:   paperAnchorPath, // §M10 paper 移动止盈锚点文件（空=纯内存不落盘）
+		buyQueuePath:      buyQueuePath,    // §M11 停机买单队列落盘路径（空=禁用）
+	}
+	// §D-2（GAP_VERIFY_20260917_PM）裁定留痕落盘：JSONL 按日轮转 + 启动回灌当日环，
+	// quant 重启不再丢"为何没成交"的拦截原因。dataDir 空（纯内存测试路径）自动跳过；
+	// 绑定失败仅日志——审计是旁路观测面，绝不阻断引擎主装配。
+	if dataDir != "" {
+		if err := e.sigCtl.AttachAudit(filepath.Join(dataDir, "verdicts")); err != nil {
+			log.Printf("[engine] 裁定留痕落盘绑定失败（降级纯内存环）: %v", err)
+		}
+	}
+	e.syncMessages(nil, nil, nil, nil, nil) // 首次同步：把历史持仓/止盈止损提示并入消息中心（First sync: merge historical holdings/profit-loss notices into the message center）
+	// 启动时回填上次持久化的 8a/8b 打分与当日固化信号（重启后前端立即可见）
+	// English: on startup, backfill the last persisted 8a/8b scores and the day's pinned signals so the
+	// frontend shows them immediately after a restart.
+	loadedScores := e.scoreStore.Load()
+	if persisted := e.signalStore.List(); len(persisted) > 0 || len(loadedScores) > 0 {
+		e.agg.UpdateFast(loadedScores, persisted, e.rpt)
+	}
+	return e
+}
+
+// SetUserID 设置账号 ID（多账号独占引擎模式；Run/打分循环前应调用 syncAccountConfig 同步账号配置）。
+// English: sets the account ID for a per-account (non-shared) engine; call syncAccountConfig
+// before Run/scoring to apply that account's config.
+func (e *Engine) SetUserID(userID string) {
+	e.mu.Lock()
+	e.userID = userID
+	e.mu.Unlock()
+}
+
+// §WMQ-1 SetQMTCfgSource 设置共享引擎的 QMT 配置热同步源账号（registry 在装配 QMT
+// 控制器时调用，取共享组的首建/管理员成员）。空值维持旧的"跳过热同步"语义。
+// English: WMQ-1 — pins the shared engine's QMT hot-sync source account (primary member,
+// injected by the registry when the engine is built with a QMT controller).
+func (e *Engine) SetQMTCfgSource(uid string) {
+	e.mu.Lock()
+	e.qmtCfgUserID = uid
+	e.mu.Unlock()
+}
+
+// §GAP2-W2 账户隔离：共享引擎的成员账号列表与私有状态根目录。
+// 指纹相同的多个账号复用同一计算引擎（战法只算一遍），但"谁的持仓提醒/咨询历史"必须按账号隔离——
+// members 由 registry.registerUser 注入（去重后的服务账号全集），是私有消息生成与 SSE 定向扇出的依据；
+// accountsRoot（<dataDir>/accounts）用于把咨询历史等私有文件寻址到各自账号目录，
+// 根除"共享组全部状态落首建者目录"的历史缺陷（I-1/I-2）。
+// English: §GAP2-W2 — members are the accounts served by this (possibly shared) engine, injected by
+// the registry; they drive per-user private alert generation and targeted SSE fan-out. accountsRoot
+// addresses private files (consult history) into each account's own directory, fixing the legacy
+// "everything lands in the first builder's folder" defect.
+func (e *Engine) SetMembers(ids []string) {
+	e.mu.Lock()
+	cp := append([]string(nil), ids...)
+	sort.Strings(cp)
+	e.members = cp
+	// 单成员引擎同时固定 userID：恢复 syncAccountConfig / 定向推送的账号语义
+	// （此前 SetUserID 从未被调用，账号级配置热同步永不生效）。
+	if len(cp) == 1 {
+		e.userID = cp[0]
+	}
+	e.mu.Unlock()
+}
+
+// SetAccountsRoot 注入 <dataDir>/accounts 根目录（私有状态按账号寻址）。
+func (e *Engine) SetAccountsRoot(dir string) {
+	e.mu.Lock()
+	e.accountsRoot = dir
+	e.mu.Unlock()
+}
+
+// memberIDs 返回本引擎服务的账号列表（快照）；无成员时回退 userID（兼容独占引擎旧路径）。
+func (e *Engine) memberIDs() []string {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	if len(e.members) > 0 {
+		return append([]string(nil), e.members...)
+	}
+	if e.userID != "" {
+		return []string{e.userID}
+	}
+	// 无成员且无 userID（旧装配/e2e）：回退单 "" 账号，保持 ListFor("") 的全局语义
+	return []string{""}
+}
+
+// primaryMember 返回主账号（首个成员）：实盘账本/QMT 控制器等"单一归属"资源的默认主体。
+// §P1-4 多成员时优先返回管理员成员（friends 共享引擎里主账号应是创建者/管理员），
+// 无管理员时回退首个成员，单成员/独占引擎回退 userID。
+// English: primaryMember returns the default owner for single-owner resources (live book / QMT
+// controller). P1-4 prefers an admin member when present; falls back to the first member, then userID.
+func (e *Engine) primaryMember() string {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	// 优先返回管理员成员（主账号）；无成员信息时回退 userID（独占引擎旧语义）。
+	if len(e.members) > 0 {
+		if e.isAdminFn != nil {
+			for _, m := range e.members {
+				if e.isAdminFn(m) {
+					return m
+				}
+			}
+		}
+		return e.members[0]
+	}
+	return e.userID
+}
+
+// SetIsAdminFn 注入管理员判定函数（main 用 auth.IsAdmin 装配），供 primaryMember 优先选择管理员成员。
+// English: wires the admin predicate (from main's auth.IsAdmin) so primaryMember can prefer an admin.
+func (e *Engine) SetIsAdminFn(fn func(userID string) bool) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.isAdminFn = fn
+}
+
+// UserID 返回本引擎所属账号 ID。
+// English: returns the account ID this engine belongs to.
+func (e *Engine) UserID() string {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	return e.userID
+}
+
+// SetCfgMgr 设置配置管理器（账号级配置读取来源）。
+// English: sets the config manager (source of per-account settings).
+func (e *Engine) SetCfgMgr(m *config.Manager) {
+	e.mu.Lock()
+	e.cfgMgr = m
+	e.mu.Unlock()
+}
+
+// SetCoordinator 注入多源协调器并设置风险盘口主源开关（§MARKET_RISK_GATE P0）。
+// hithinkPrimary=true 时涨停池等盘口走 hithink 主源+东财兜底；false（应急回退阀）走旧的东财直连。
+// 幂等，可在启动时安全调用；nil dc 时仅落开关、fetch 自动回落东财。
+// English: injects the multi-source coordinator and the risk-board primary switch (P0). When
+// hithinkPrimary, board stats route via hithink+EastMoney fallback; otherwise the old EastMoney-direct
+// path is kept. Idempotent at startup; a nil dc only stores the flag and fetches fall back to EastMoney.
+func (e *Engine) SetCoordinator(dc *data.DataCoordinator, hithinkPrimary bool) {
+	e.mu.Lock()
+	e.coordinator = dc
+	e.riskHithink = hithinkPrimary
+	e.mu.Unlock()
+}
+
+// fetchRiskPool 取当日涨停池（P0 路由）：命中开关且注入了协调器→hithink 主源+东财兜底；
+// 否则走旧的东财直连。附带每日一次双跑一致性观测（两源数量背离 >5% 记 opslog）。
+// 返回池子、命中源名、错误。任何路径都不 panic，错误由调用方按空池降级处理。
+// English: fetches today's limit-up pool with P0 routing — when the switch is on and a coordinator is
+// injected, hithink primary + EastMoney fallback; otherwise the old EastMoney-direct call. Includes a
+// once-per-day dual-run consistency probe (>5% divergence → opslog). Returns (pool, source, err);
+// never panics — callers degrade to an empty pool on error.
+func (e *Engine) fetchRiskPool() ([]data.LimitUpStock, string, error) {
+	e.mu.RLock()
+	dc, useHithink := e.coordinator, e.riskHithink
+	e.mu.RUnlock()
+	if !useHithink || dc == nil {
+		pool, err := e.marketAPI.GetLimitUpPool("")
+		return pool, "eastmoney", err
+	}
+	res, err := dc.PoolLimitUp("")
+	if err != nil {
+		return nil, res.Source, err
+	}
+	// 每日一次双跑背离观测：hithink 命中时对照东财计数，>5% 差异落 opslog（不改行为，仅告警）。
+	// English: once-per-day dual-run probe — when hithink serves, compare with the EastMoney count and
+	// log a >5% divergence to opslog (warn-only, no behavior change).
+	if res.Source == "hithink" {
+		opslog.DayOnce("risk-pool-dual-run", func() {
+			if em, emErr := e.marketAPI.GetLimitUpPool(""); emErr == nil {
+				e.reportPoolDivergence(len(res.Stocks), len(em))
+			}
+		})
+	}
+	return res.Stocks, res.Source, nil
+}
+
+// reportPoolDivergence 双跑背离记录（hithink vs 东财涨停数差异 >5% 时告警，供切换期观测）。
+// English: records a >5% divergence between the hithink and EastMoney limit-up counts during the switch-over.
+func (e *Engine) reportPoolDivergence(thsCount, emCount int) {
+	base := emCount
+	if thsCount > base {
+		base = thsCount
+	}
+	if base == 0 {
+		return
+	}
+	diff := thsCount - emCount
+	if diff < 0 {
+		diff = -diff
+	}
+	if float64(diff)/float64(base) > 0.05 {
+		opslog.Logf("risk_pool", "涨停池双跑背离超5%% hithink=%d eastmoney=%d", thsCount, emCount)
+	}
+}
+
+// emotionConfigured 报告情绪相位是否已配置（emotionCfg 非空即可能产出纠偏/硬闸，需拉涨跌家数）。
+// English: whether the emotion phase is configured (a non-nil cfg means breadth may feed correction/gates).
+func (e *Engine) emotionConfigured() bool {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	return e.emotionCfg != nil
+}
+
+// riskBreadth 取全市场涨/跌家数（§P1）：注入协调器且主源开时走降级链（东财主源→hithink 兜底→弃权），
+// 否则直接东财 GetBreadth。valid=false 表示两源皆不可用，调用方必须弃权（不把失败当涨跌各半）。
+// English: fetches market-wide up/down counts (P1) — via the coordinator fallback chain when hithink
+// primary is on, else EastMoney GetBreadth directly. valid=false means both sources failed, so callers
+// must abstain rather than treat a failure as a neutral 50/50.
+func (e *Engine) riskBreadth() (up, down int, valid bool) {
+	e.mu.RLock()
+	dc, useHithink := e.coordinator, e.riskHithink
+	e.mu.RUnlock()
+	if useHithink && dc != nil {
+		u, d, _, ok := dc.MarketBreadth(nil) // universe=nil：EM 失败且无全市场清单时直接弃权（THS 全量统计由上层按需传）
+		return u, d, ok
+	}
+	if e.marketAPI == nil {
+		return 0, 0, false
+	}
+	u, d, err := e.marketAPI.GetBreadth()
+	if err != nil {
+		return 0, 0, false
+	}
+	return u, d, true
+}
+
+// riskBreakRate 真实炸板率（§P2）：炸板池数/(涨停池+炸板池)*100。炸板池仅 hithink 提供，
+// 无协调器或取数失败时返回 NaN 弃权（绝不用 V1 的近似口径冒充实测）。
+// English: true break rate = break/(limitUp+break)*100. The break pool is hithink-only; NaN abstain when
+// no coordinator or on failure (never passing off the V1 approximation as measured).
+func (e *Engine) riskBreakRate(limitUpCount int) float64 {
+	e.mu.RLock()
+	dc, useHithink := e.coordinator, e.riskHithink
+	e.mu.RUnlock()
+	if !useHithink || dc == nil {
+		return math.NaN()
+	}
+	brk, err := dc.PoolLimitBreak("")
+	if err != nil {
+		return math.NaN()
+	}
+	denom := limitUpCount + len(brk.Stocks)
+	if denom <= 0 {
+		return math.NaN()
+	}
+	return float64(len(brk.Stocks)) / float64(denom) * 100
+}
+
+// indexMASlopes 指数 MA20/MA60 斜率（§P2，日级缓存：跨交易日才重算，避免每轮拉指数日K）。
+// 取数失败/无源时缓存保持 NaN（弃权），不影响状态机其余维度投票。
+// English: index MA20/MA60 slopes (P2) with a daily cache (recompute only on a new trading day). On
+// failure/no-source the cached NaN persists (abstain), leaving the other state votes unaffected.
+func (e *Engine) indexMASlopes() (float64, float64) {
+	today := data.TradingDayDate(time.Now())
+	e.mu.RLock()
+	cached := e.maSlopeDay == today && e.maSlope20 == e.maSlope20 // 非 NaN 才算已缓存
+	m20, m60 := e.maSlope20, e.maSlope60
+	market := e.marketAPI
+	e.mu.RUnlock()
+	if cached {
+		return m20, m60
+	}
+	if market == nil {
+		return math.NaN(), math.NaN()
+	}
+	s20, s60 := market.GetIndexMASlopes()
+	e.mu.Lock()
+	e.maSlopeDay, e.maSlope20, e.maSlope60 = today, s20, s60
+	e.mu.Unlock()
+	return s20, s60
+}
+
+// SetLongShortConfig 固化本引擎的做多/做空开关（共享引擎在构建时由注册表按共享组配置设置）。
+// English: pins this engine's long/short toggles at build time (the registry sets them from the
+// shared group's config so the engine doesn't need to re-read a specific account at runtime).
+func (e *Engine) SetLongShortConfig(longEnabled, shortEnabled bool) {
+	e.mu.Lock()
+	e.longEnabled = longEnabled
+	e.shortEnabled = shortEnabled
+	e.mu.Unlock()
+	if e.combatAgent != nil {
+		e.combatAgent.SetShortEnabled(shortEnabled)
+	}
+}
+
+// syncAccountConfig 将账号级配置应用到本引擎（仅独占引擎使用）：
+//   - 做多/做空开关：按账号持久化的状态覆盖引擎内存开关
+//   - 战法参数：热更新到本账号的 combat_agent（runner 按账号读取）
+//
+// 共享引擎（userID 为空）跳过——其配置已在构建时按共享组固化，所有共享账号配置一致，
+// 因此任何设备读到同一份结果。
+// English: applies this account's config to the engine (per-account non-shared engines only) — the
+// account-persisted long/short toggles override the in-memory switches, and the account's strategy
+// params are hot-reloaded into this account's combat agent. Shared engines (empty userID) skip this:
+// their config was pinned at build time from the shared group, whose members all share one config.
+func (e *Engine) syncAccountConfig() {
+	e.mu.RLock()
+	cfgMgr, userID := e.cfgMgr, e.userID
+	// §WMQ-1：共享引擎(空 userID)热同步源回退 qmtCfgUserID（首建账号）；
+	// 仍为空（无 QMT 控制器的表内共享）则维持旧跳过语义。
+	qmtSrc := userID
+	if qmtSrc == "" {
+		qmtSrc = e.qmtCfgUserID
+	}
+	e.mu.RUnlock()
+	if cfgMgr == nil || (userID == "" && qmtSrc == "") {
+		return
+	}
+	// 账号级作战配置（多空开关/战法参数）仍仅独占引擎应用：共享引擎各成员配置在
+	// 构建期固化，运行期混入任何单成员的账号级配置都会污染其他成员（保持原语义）。
+	if userID != "" {
+		ls := cfgMgr.GetLongShortConfigFor(userID)
+		e.mu.Lock()
+		e.longEnabled = ls.LongEnabled
+		e.shortEnabled = ls.ShortEnabled
+		e.mu.Unlock()
+		// 把多空开关、D1 配置、仓位风控与战法参数同步到战斗代理（含止损/ATR 停损参数）。
+		if e.combatAgent != nil {
+			e.combatAgent.SetShortEnabled(ls.ShortEnabled)
+			e.combatAgent.SetD1Config(cfgMgr.GetD1ConfigFor(userID))
+			pos := cfgMgr.GetRulesFor(userID).Position
+			e.combatAgent.SetPositionDailyDropPct(pos.DailyDropAlertPct)
+			e.combatAgent.SetATRStop(pos.ATREnabled, pos.ATRStopMult)
+			sc := cfgMgr.GetStrategyConfigFor(userID)
+			if sc != nil {
+				e.combatAgent.HotReload(sc)
+			}
+		}
+	}
+	// QMT 实盘配置热同步：每轮从配置管理器读取，控制器据此切换 enabled/mode/参数（5s 生效）。
+	// 必须用账号级 GetQMTConfigFor（而非全局 GetRulesFor().QMT）：账号级覆盖优先，且可避免
+	// Watch/Load 重置全局 m.Rules 后，把已开启的实盘链路短暂关掉（开关"秒关"的潜在根因）。
+	// §GAP1.7 黑名单接线：Theme.BlackList 一并同步进下单守卫（此前仅死代码 risk.go 消费）。
+	// English: hot-sync the per-user QMT config each cycle (GetQMTConfigFor, not the global
+	// GetRulesFor().QMT) so a Load()-reset of the global rules can't transiently disable a live link.
+	if c := e.QMTController(); c != nil && qmtSrc != "" {
+		q := *cfgMgr.GetQMTConfigFor(qmtSrc)
+		// §F-9（20260917 缺陷修复批）不再把 Theme.BlackList（板块名）并进个股黑名单：
+		// 板块名永远匹配不到纯代码（CodeInBlacklist 无命中），实际拦截由 signalctl 两通道的
+		// SectorBlacklist 独立生效（liveSignalPolicy/paperSignalPolicy 直读 Theme.BlackList）。
+		// 旧并线只污染下单守卫黑名单语义（§GAP1.7 的历史补偿，风控死代码删除后失去意义）。
+		// §QMT-PENDING 开关队列：普通配置变更只入队不立即生效，交易时段由 scoreCycle 的
+		// ApplyPendingConfig 消费（重建 executor）。防止休市时配置立即翻转实盘行为。
+		c.QueueConfigUpdate(q)
+	}
+	// §GAP5.1→§FIX-7(20260919)：日预算同步已从打分循环移除——LLM 客户端是进程级共享实例，
+	// 各引擎按自己的 userRules 反复 SetBudgets 会互相覆盖（谁最后刷分谁说了算，且咨询/
+	// 共享路径可能整体跳过，见旧守卫 engine.go:858）。预算现由配置装配（llmcfg.Resolve→New）
+	// 与热更新（main.go SetLLMRecreate→SetBudgets）两条必经路径统一写入。
+}
+
+// SetNotifier 设置推送器（P1 清仓/止损强提醒走桌面/Webhook）。
+func (e *Engine) SetNotifier(n *notify.Notifier) {
+	e.mu.Lock()
+	e.notifier = n
+	e.mu.Unlock()
+}
+
+// SetPaper 注入模拟盘引擎（nil 表示未启用）。
+// English: injects the paper-trading engine (nil = disabled).
+func (e *Engine) SetPaper(p *paper.Engine) {
+	e.mu.Lock()
+	e.paper = p
+	e.mu.Unlock()
+}
+
+// SetPaperDispatch 注入按账号的模拟盘分发回调（多账号模式；注入后优先于全局 e.paper）。
+// English: injects the per-account paper dispatch callbacks (multi-account mode; take precedence over
+// the global e.paper when set).
+func (e *Engine) SetPaperDispatch(onSignals func(emit []combat_agent.Signal, exit []combat_agent.Signal, quotes map[string]*data.StockInfo), mark func(quotes map[string]*data.StockInfo)) {
+	e.mu.Lock()
+	e.paperOnSignals = onSignals
+	e.paperMarkFn = mark
+	e.mu.Unlock()
+}
+
+// SetPaperSellJudge 注入 §SELLPOINT-UNIFY P3 的按账号纸面账本卖出裁决回调：
+// 裁决必须每 5s 推进（观察窗窗长/结算栅格以真实时钟为准），不能依附"本轮恰好有信号"的
+// paperSignals 分发时机，故独立于撮合分发单设注入口。
+// English: injects the P3 per-account paper sell-judge callback — the adjudicator must advance
+// every 5s (its windows are wall-clock based), independent of whether a round has fillable signals.
+// §M9：回调签名带本轮 sell_unified_mode 快照（registry 闭包透传给 runPaperUnifiedJudge），
+// 禁止回调内部再独立读配置——轮中翻转会造成同一轮半新半旧。
+func (e *Engine) SetPaperSellJudge(judge func(feed sellJudgeFeed, sellMode string)) {
+	e.mu.Lock()
+	e.paperSellJudgeFn = judge
+	e.mu.Unlock()
+}
+
+// SetPaperHeldCodesFn 注入"全账号模拟盘持仓代码"聚合函数（多账号模式由注册表注入，
+// 用于 5s 监控池 base 重建时把纸面持仓永久钉入行情监控；nil=回退全局 e.paper 账本）。
+// English: injects the all-accounts paper-held-codes aggregator (wired by the registry in
+// multi-account mode; nil falls back to the global e.paper book).
+func (e *Engine) SetPaperHeldCodesFn(fn func() []string) {
+	e.mu.Lock()
+	e.paperHeldCodes = fn
+	e.mu.Unlock()
+}
+
+// SetQMT 注入 QMT 实盘执行控制器与实盘账本 store（AUTO_TRADING_PLAN M1）。
+// qmtCtrl 可空（未启用）；realStore 为实盘账本库（live.db：real_positions/orders/fills 存取）。
+// English: injects the QMT live-trading controller and the real-book store (AUTO_TRADING_PLAN M1).
+// qmtCtrl may be nil (disabled); realStore is the live-book DB handle (real_positions/orders/fills access).
+func (e *Engine) SetQMT(qmtCtrl *trading.Controller, realStore *store.DB) {
+	e.mu.Lock()
+	e.qmtCtrl = qmtCtrl
+	e.realStore = realStore
+	e.mu.Unlock()
+}
+
+// SetD1Store 注入 D1 评分历史库（trading.db：d1_scores 落库，与研究数据同库；可空）。
+// 与实盘账本库（realStore）分离——live.db 隔离后 d1_scores 仍留研究库，避免跨库双写。
+// English: injects the D1-score history store (trading.db; may be nil). Kept separate from the live
+// book store — after the live.db split, d1_scores stay in the research DB to avoid cross-DB dual writes.
+func (e *Engine) SetD1Store(d1Store *store.DB) {
+	e.mu.Lock()
+	e.d1Store = d1Store
+	e.mu.Unlock()
+}
+
+// QMTEnabled 实盘链路是否启用（qmt.enabled 热加载）。
+// English: QMTEnabled reports whether the live-trading chain is on (qmt.enabled hot-reloaded).
+func (e *Engine) QMTEnabled() bool {
+	e.mu.RLock()
+	c := e.qmtCtrl
+	e.mu.RUnlock()
+	return c != nil && c.Enabled()
+}
+
+// QMTController 返回 QMT 执行控制器（HTTP 层读取熔断/配置用，可空）。
+// English: QMTController returns the QMT controller for the HTTP layer (breaker/config reads; may be nil).
+func (e *Engine) QMTController() *trading.Controller {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	return e.qmtCtrl
+}
+
+// paperSignals 把本轮翻转信号 + 卖出侧纪律信号（止损/止盈/移动止盈）送入模拟盘撮合。
+// 优先按账号分发，回退全局引擎。仅交易时段执行（盘后停自动撮合，省内存）。
+// exit 为卖出侧纪律信号（CheckPositionsExits/CheckPositionAlerts 产出），并入撮合，
+// 让模拟盘能因止损/止盈/移动止盈线自动离场（此前只发消息不执行——-11.55% 未止损根因）。
+// §SELLPOINT-UNIFY P3：sell_unified_mode=on 时探测器卖出信号（做多向）降级为证据、不再直达
+// 撮合——纸面账处置唯一出口=统一裁决层（runPaperUnifiedJudge→ApplyUnifiedSell，双账一口径）；
+// 做空方向信号（融券空单开/平仓流程）不在本次并轨范围，原样透传。
+// 纸面账裁决本身不在本函数执行——观察窗以真实时钟推进，裁决必须每轮无条件跑，
+// 不能依附"本轮恰好有信号"的分发时机（见 judgePaperLedgers，主循环每轮调用）。
+// English: feeds flipped + sell-side discipline signals into paper filling; with the P3 gate on,
+// long-side detector sells become evidence only (the unified adjudicator is the sole exit) while
+// short-book signals pass through. The judge itself runs every round via judgePaperLedgers, not here.
+// §M9：sellMode 为轮首快照（调用方在轮首读一次配置后逐层透传），本函数内不再现读配置，
+// 避免轮中 shadow→on 翻转导致同一轮前半用旧口径、后半用新口径的「保护空窗」。
+func (e *Engine) paperSignals(emit []combat_agent.Signal, exit []combat_agent.Signal, quotes map[string]*data.StockInfo, sellMode string) {
+	e.mu.RLock()
+	dispatch := e.paperOnSignals
+	pe := e.paper
+	e.mu.RUnlock()
+	unifiedOn := sellMode == "on"
+	if unifiedOn {
+		emit = unifiedSellGateSigs(emit)
+		exit = unifiedSellGateSigs(exit)
+	}
+	combined := make([]combat_agent.Signal, 0, len(emit)+len(exit))
+	combined = append(combined, emit...)
+	combined = append(combined, exit...)
+	if dispatch != nil {
+		dispatch(combined, nil, quotes)
+		return
+	}
+	if pe != nil && pe.Enabled() && data.IsFullTradingHours(time.Now()) {
+		// §SIGNAL_CONTROLLER：全局回退账本同样先过控制器 paper 通道（多账号 registry 路径已裁定，
+		// 此回退供无 registry 单引擎场景，准入语义一致、不留旁路）。
+		pe.OnSignals(e.filterPaperAdmitted(e.primaryMember(), combined, time.Now()), quotes)
+	}
+}
+
+// unifiedSellGateSigs §SELLPOINT-UNIFY P3 卖出证据闸：剔除"做多向且 SellAction 命中（close/trim）"
+// 的探测器卖出信号（切闸后它们只是证据，供裁决层内核与展示消费），买入信号与做空方向信号
+// （融券空单的开/平流程不经统一卖出通道）原样保留。
+// English: P3 evidence gate — drops long-side detector sells (close/trim) once the unified gate is on;
+// buys and short-book signals pass through.
+func unifiedSellGateSigs(sigs []combat_agent.Signal) []combat_agent.Signal {
+	if len(sigs) == 0 {
+		return sigs
+	}
+	out := make([]combat_agent.Signal, 0, len(sigs))
+	for _, s := range sigs {
+		if s.Direction != "做空" && combat_agent.SellAction(s) != "" {
+			continue
+		}
+		out = append(out, s)
+	}
+	return out
+}
+
+// ── §SIGNAL_CONTROLLER 信号控制器接线（20260917，方案 docs/SIGNAL_CONTROLLER_PLAN_20260917.md）──
+//
+// 原实盘买入确认状态机（realBuyConfirmPass/pruneRealBuyConfirm/buyConfirmReal）已整体迁入
+// internal/signalctl：战法白名单、个股/板块黑名单、持续性确认窗（探针+扳机）统一在控制器
+// live 通道裁定；引擎按裁定分发 autoPlace。原"双入口各自比对白名单"（autoPlace 内联 +
+// risk.Gate）收敛为控制器唯一实现（gate 保留同源的成员判定作执行侧最后防线）。
+
+// SignalCtl 返回本引擎的信号控制器（registry/server 编排与审计端点消费）。
+// 惰性初始化：正常经 New() 装配；直接构造 Engine 的测试/旧路径也保证可用（不留 nil 旁路）。
+// English: returns this engine's signal controller, lazily initialized so no code path (including
+// struct-literal test engines) can bypass admission.
+func (e *Engine) SignalCtl() *signalctl.Controller {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.sigCtl == nil {
+		e.sigCtl = signalctl.New()
+	}
+	if e.liveDecisions == nil {
+		e.liveDecisions = make(map[string]signalctl.Decision)
+	}
+	return e.sigCtl
+}
+
+// liveSignalPolicy 装配 live 通道准入策略快照：战法白名单/个股黑名单取实盘控制器**已生效**配置
+// （§QMT-PENDING 语义保持——休市变更不入裁定），板块黑名单取账号规则 Theme.BlackList（实盘侧
+// 此前只把板块名并进个股黑名单死匹配代码，现由控制器按 Sector 字段正确生效），
+// 持续性参数取 Discipline。
+// English: builds the live-channel policy from the controller's EFFECTIVE config (pending-queue
+// semantics preserved), theme sector blacklist and discipline.
+func (e *Engine) liveSignalPolicy() signalctl.Policy {
+	pol := signalctl.Policy{Discipline: config.DefaultDisciplineConfig()}
+	e.mu.RLock()
+	ctrl, cfgMgr, uid := e.qmtCtrl, e.cfgMgr, e.userID
+	e.mu.RUnlock()
+	if ctrl != nil {
+		q := ctrl.Config()
+		pol.Strategies = q.Strategies
+		pol.CodeBlacklist = q.Blacklist
+		pol.Discipline = q.Discipline
+	}
+	if cfgMgr != nil {
+		rules := cfgMgr.GetRulesFor(uid)
+		if rules != nil {
+			pol.SectorBlacklist = rules.Theme.BlackList
+			pol.ShadowBlacklist = rules.SignalCtl.BlacklistShadow()
+		}
+	}
+	return pol
+}
+
+// paperSignalPolicy 装配 paper 通道准入策略：账号级 rules.paper.strategies 白名单 +
+// rules.paper.blacklist 个股黑名单 + 全局主题板块黑名单 + 影子标志 + 账号级 paper 纪律。
+// 供 registry 分发前逐账号裁定（paper 引擎不再持有确认状态机）。
+// English: builds the paper-channel policy per account (whitelist/pools-following strategies,
+// blacklists, discipline) — the paper engine no longer holds any confirmation state.
+func (e *Engine) paperSignalPolicy(uid string) signalctl.Policy {
+	pol := signalctl.Policy{Discipline: config.DefaultDisciplineConfig(), ShadowBlacklist: true}
+	if uid == "" {
+		e.mu.RLock()
+		uid = e.userID
+		e.mu.RUnlock()
+	}
+	if cm := e.cfgMgr; cm != nil {
+		if rules := cm.GetRulesFor(uid); rules != nil {
+			pol.Strategies = rules.Paper.Strategies
+			pol.CodeBlacklist = rules.Paper.Blacklist
+			pol.SectorBlacklist = rules.Theme.BlackList
+			pol.ShadowBlacklist = rules.SignalCtl.BlacklistShadow()
+			pol.Discipline = rules.Paper.Discipline
+		}
+	}
+	return pol
+}
+
+// dispatchLive 实盘交易分发唯一入口（§SIGNAL_CONTROLLER 编排收口）：把本轮做多买入信号集交给
+// 信号控制器 live 通道裁定，pass 私送 autoPlace（纯执行守卫），hold/block 仅留痕（消息中心
+// 照常记录翻转信号并标注原因——消息与下单解耦，裁决④）。
+//   - prune=true：按本轮活跃集清理消失探针（近实时 5s 循环的全量喂入方）；
+//   - prune=false：只推进不清理（主循环等子集喂入方，清理权归全量方，防跨喂入方误清探针）。
+//
+// English: the single live dispatch entry — Evaluate on the live channel, autoPlace the passed
+// buys; hold/block are annotated into message decisions. Only the full-feed caller prunes probes.
+func (e *Engine) dispatchLive(buys []combat_agent.Signal, live map[string]*data.StockInfo, prune bool, now time.Time) {
+	if len(buys) == 0 {
+		return
+	}
+	ctl := e.SignalCtl()
+	acct := e.primaryMember()
+	pol := e.liveSignalPolicy()
+	var decisions []signalctl.Decision
+	if prune {
+		decisions = ctl.Evaluate(signalctl.ChannelLive, acct, buys, pol, now)
+	} else {
+		decisions = make([]signalctl.Decision, 0, len(buys))
+		for _, s := range buys {
+			decisions = append(decisions, ctl.Admit(signalctl.ChannelLive, acct, s, pol, now))
+		}
+	}
+	e.mu.Lock()
+	if e.liveDecisions == nil {
+		e.liveDecisions = map[string]signalctl.Decision{}
+	}
+	for i, d := range decisions {
+		if d.Verdict != signalctl.VerdictPass || d.Shadow {
+			e.liveDecisions[liveDecisionKey(buys[i].Code, d.SKey)] = d
+		} else {
+			delete(e.liveDecisions, liveDecisionKey(buys[i].Code, d.SKey))
+		}
+	}
+	e.mu.Unlock()
+	for i, d := range decisions {
+		if d.Verdict != signalctl.VerdictPass {
+			continue
+		}
+		e.autoPlace(buys[i], live)
+	}
+}
+
+// liveDecisionKey 裁定注解键：纯代码+规范战法键（消息标注与分发对齐用）。
+func liveDecisionKey(code, strategyKey string) string {
+	return pureTsCode(code) + "|" + strategyKey
+}
+
+// liveDecisionOf 查某买入信号的最近 live 裁定（消息中心标注"为何没下单"）；无记录=pass/未裁定。
+// English: looks up the latest live decision for annotation purposes (nil = admitted/silent).
+func (e *Engine) liveDecisionOf(sig combat_agent.Signal) *signalctl.Decision {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	if d, ok := e.liveDecisions[liveDecisionKey(sig.Code, signalctl.StrategyKeyOf(sig))]; ok {
+		dd := d
+		return &dd
+	}
+	return nil
+}
+
+// filterPaperAdmitted 模拟盘通道的按账号准入过滤（registry 分发前调用）：信号集送信号控制器
+// paper 通道 Evaluate（白名单/黑名单/持续性确认窗，账号级参数），仅保留 pass 信号下发撮合。
+// 卖出/提醒信号在控制器恒 pass（拦退出=强迫扛单），本过滤零侵入。返回可直接 OnSignals 的集合。
+// English: per-account paper-channel admission filter used by the registry dispatch — only
+// controller-passed signals reach the (now execution-only) paper engine.
+func (e *Engine) filterPaperAdmitted(uid string, sigs []combat_agent.Signal, now time.Time) []combat_agent.Signal {
+	if len(sigs) == 0 {
+		return sigs
+	}
+	decisions := e.SignalCtl().Evaluate(signalctl.ChannelPaper, uid, sigs, e.paperSignalPolicy(uid), now)
+	out := make([]combat_agent.Signal, 0, len(sigs))
+	for i, s := range sigs {
+		if decisions[i].Verdict == signalctl.VerdictPass {
+			out = append(out, s)
+		}
+	}
+	return out
+}
+
+// SignalVerdicts 返回本引擎信号控制器的最近裁定留痕（审计端点用）。
+// English: recent controller verdict tail for the audit endpoint.
+func (e *Engine) SignalVerdicts(limit int) []signalctl.Decision {
+	return e.SignalCtl().Recent(limit)
+}
+
+// IgnoreSignal §F-1（20260917 缺陷修复批）：用户手动忽略信号——对该 code@strategy 打
+// 失效墓碑并同步移除消息中心条目（与引擎自动失效墓碑同口径，见 scoring_loop 失效墓碑）。
+// strategy 为空时忽略该 code 当日全部活跃固化信号。返回实际打墓碑的信号条数。
+// English: user-driven signal ignore — tombstone the pinned signal (code@strategy) and delete
+// the matching message-center item, same mechanism as engine-side invalidation tombstones.
+// Empty strategy tombstones every pinned signal of the code for today; returns tombstoned count.
+func (e *Engine) IgnoreSignal(code, strategy string) int {
+	if code == "" {
+		return 0
+	}
+	if strategy != "" {
+		e.signalStore.Invalidate(code, strategy)
+		e.msgStore.Delete(code + "@交易信号@" + strategy)
+		log.Printf("[engine] 用户忽略信号: %s(%s) 已打墓碑并移除消息", code, strategy)
+		return 1
+	}
+	n := 0
+	for _, s := range e.signalStore.List() {
+		if s.Code != code {
+			continue
+		}
+		e.signalStore.Invalidate(code, s.Strategy)
+		e.msgStore.Delete(code + "@交易信号@" + s.Strategy)
+		n++
+	}
+	log.Printf("[engine] 用户忽略信号: %s 全部战法, 墓碑 %d 条", code, n)
+	return n
+}
+
+// autoPlace AUTO_TRADING_PLAN M1：qmt.enabled + mode=auto 时把做多买入信号直连网关下单。
+// 幂等：signal_id 唯一键（Orders 表 UNIQUE），熔断中跳过；现价缺省时用信号触发价。
+// 金额按 fixed_amount（受 max_positions 预检约束）；code 补后缀便于网关识别交易所。
+// §SIGNAL_CONTROLLER 20260917：本函数只负责执行（模式/涨停封板/整手/资金降档/幂等/下单），
+// 战法白名单与买入确认状态机已迁出——调用方必须先经信号控制器 pass 裁定（dispatchLive 收口，
+// 本函数包私不可外部直调，防绕过准入的后门）。
+// English: AUTO_TRADING_PLAN M1 — pure execution (mode/sealed-board/lot/cash/idempotency); strategy
+// whitelist & confirm moved to the signal controller; unexported so no path bypasses admission.
+func (e *Engine) autoPlace(sig combat_agent.Signal, live map[string]*data.StockInfo) {
+	e.mu.RLock()
+	ctrl := e.qmtCtrl
+	e.mu.RUnlock()
+	if ctrl == nil || !ctrl.Enabled() || ctrl.Mode() != "auto" {
+		// §DIAG-0921 静默门插桩（2026-09-01 实录：fac_1 buy 信号进主循环却全程零下单/零日志，
+		// 无法定位是哪个静默门吞掉的）：每个静默跳过点打一条 DayOnce 节流日志（每码每天一次），
+		// 不刷屏但让"信号为何没下单"一眼可见。
+		reason := "ctrl-nil"
+		if ctrl != nil {
+			if !ctrl.Enabled() {
+				reason = "qmt-disabled"
+			} else if ctrl.Mode() != "auto" {
+				reason = "mode-" + ctrl.Mode()
+			}
+		}
+		log.Printf("[qmt-gate] %s(%s) %s/%s 自动下单跳过: %s", sig.Code, sig.Name, sig.StrategyID, sig.Strategy, reason)
+		opslog.DayOnce("auto-gate:"+reason+":"+sig.Code, func() {
+			opslog.Logf("quant", "auto下单跳过 %s(%s) 策略=%s/%s 原因=%s", sig.Code, sig.Name, sig.StrategyID, sig.Strategy, reason)
+		})
+		return
+	}
+	cfg := ctrl.Config()
+	// §SIGNAL_CONTROLLER 20260917：此处原内联白名单（含 §20260917 热修键统一）已删除——
+	// 战法准入统一由信号控制器 live 通道裁定（dispatchLive 唯一喂入），执行层不再比对名单，
+	// 双写漂移（autoPlace 一份、risk.Gate 一份）就此终结。
+	price := sig.Price
+	var si *data.StockInfo
+	if q := live[sig.Code]; q != nil && q.Price > 0 {
+		si = q
+		price = q.Price
+	}
+	if price <= 0 {
+		// §DIAG-0921 价格无效静默跳过节流日志（触发价缺失且无实时行情时的无声丢弃点）
+		log.Printf("[qmt-gate] %s(%s) %s/%s 价格无效跳过: price=%.2f", sig.Code, sig.Name, sig.StrategyID, sig.Strategy, price)
+		opslog.DayOnce("auto-price:"+sig.Code, func() {
+			opslog.Logf("quant", "auto价格无效跳过 %s(%s) 策略=%s/%s price=%.2f", sig.Code, sig.Name, sig.StrategyID, sig.Strategy, price)
+		})
+		return
+	}
+	// §GAP1.5 涨停封板拒买（与模拟盘 paper.LimitUpPct 同款分板块守卫）：
+	// 封板股买单现实中几乎无法排队成交，auto 模式直接报单只会买在炸板瞬间或制造虚假成交。
+	// English: §GAP1.5 sealed-board buy guard (same board-aware rule as the paper book) — a buy order
+	// against a sealed limit-up board is practically unfillable; skip instead of firing at the blast.
+	if si := live[sig.Code]; si != nil && si.ChangePct >= paper.LimitUpPct(sig.Code, sig.Name) {
+		log.Printf("[qmt] %s(%s) 涨停封板 %.1f%%≥%.1f%% 拒买跳过", sig.Code, sig.Name,
+			si.ChangePct, paper.LimitUpPct(sig.Code, sig.Name))
+		// §DAILY_OPSLOG 按天/按股去重（同一封板股每 5s 循环都会触达，全记会刷屏）
+		opslog.DayOnce("limitup:"+sig.Code, func() {
+			opslog.Logf("quant", "涨停封板拒买 %s(%s) 涨幅=%.1f%% 策略=%s/%s", sig.Code, sig.Name, si.ChangePct, sig.StrategyID, sig.Strategy)
+		})
+		return
+	}
+	amount := cfg.FixedAmount
+	// §QUANT-TAB 每战法仓位大小：该战法配置了正数金额则覆盖全局 fixed_amount（量化交易页可配）。
+	// §UAT-FIX 2026-08-31：面板按战法 ID（fac_1…）配置金额，同键优先，回退显示名，再回退全局。
+	if v := cfg.StrategyAmounts[sig.StrategyID]; v > 0 {
+		amount = v
+	} else if v := cfg.StrategyAmounts[sig.Strategy]; v > 0 {
+		amount = v
+	}
+	if amount <= 0 {
+		amount = 10000
+	}
+	// §MARKET_RISK_GATE P4 auto-buy 谨慎层（默认关闭，裁决④）：真金白银下单层的第二道风险闸——
+	// Red 当日拒开新仓（DayOnce+opslog 留痕）；Yellow 按仓位档缩放买入金额（优先状态机 MaxPosPct，回退
+	// YellowPosScale；缩后仍走下方整手/现金降档）。与信号侧 P3 降级独立叠加。
+	// English: the P4 auto-buy caution layer (default off, ruling ④) — a second risk gate on the money path:
+	// reject new opens on Red (DayOnce+opslog), scale the buy amount on Yellow (state-machine MaxPosPct first,
+	// YellowPosScale fallback; still passes the lot/cash degradation below). Stacks independently with P3.
+	if cfg.AutoCautionOn() {
+		e.mu.RLock()
+		tier, maxPos := e.lastRiskTier, e.lastMaxPosPct
+		e.mu.RUnlock()
+		switch tier {
+		case combat_agent.RiskTierRed:
+			log.Printf("[qmt] %s(%s) 风险档Red 拒开新仓（auto 谨慎层）", sig.Code, sig.Name)
+			opslog.DayOnce("auto-risk-red:"+sig.Code, func() {
+				opslog.Logf("quant", "风险档Red拒开新仓 %s(%s) 策略=%s/%s", sig.Code, sig.Name, sig.StrategyID, sig.Strategy)
+			})
+			return
+		case combat_agent.RiskTierYellow:
+			scale := cfg.YellowScale()
+			if maxPos > 0 && maxPos < scale {
+				scale = maxPos // 状态机给出更严的仓位档时以其为准
+			}
+			if scale > 0 && scale < 1 {
+				orig := amount
+				amount = amount * scale
+				log.Printf("[qmt] %s(%s) 风险档Yellow 降额买入 %.0f→%.0f（系数%.2f）", sig.Code, sig.Name, orig, amount, scale)
+				opslog.Logf("quant", "风险档Yellow降额 %s 预算=%.0f→%.0f 系数=%.2f 策略=%s/%s", sig.Code, orig, amount, scale, sig.StrategyID, sig.Strategy)
+			}
+		}
+	}
+	qty := int(amount/price/100) * 100
+	// §R0.7 修复：高价股不足一手时不再强凑 1 手（旧逻辑 qty=100 导致订单金额超预算数倍）
+	if qty <= 0 {
+		log.Printf("[qmt] %s 金额不足以买一手，跳过下单", sig.Code)
+		opslog.DayOnce("one-lot:"+sig.Code, func() {
+			opslog.Logf("quant", "金额不足一手跳过 %s 现价=%.2f 预算=%.0f 策略=%s/%s", sig.Code, price, amount, sig.StrategyID, sig.Strategy)
+		})
+		return
+	}
+	// §UAT-CASH 2026-08-31 → §M12-A 2026-09-22（owner 裁决 A：三态 fail-close）：
+	// fixed_amount 是预算上限而非死数——最近上报的可用资金（网关每分钟对账）不足以按预算整手
+	// 买入时，降到现金可负担的最大整手数；连一手都买不起才放弃。三态化改的是「口径不可得」的
+	// 处置：未接账本/查询失败/回报超 30 分钟时**不自动买**（手动通道不受影响，前端按
+	// /api/qmt/state 的 cash_stale 显示降级横幅）。旧两态口径把「真 0」与「不可得」混写成同一个 0：
+	// 不可得→调用方视为不设限=毫无资金约束地放行，真 0→cash>0 不成立同样跳过门控——H-4 事故
+	// （账本冻结在碎钱 0.03 把当日买入全拦 / 若冻结值是 0 则完全放行）证明两头都是事故。
+	// 如今新鲜真 0 与真资金不足走同一个「买不起一手」拒单出口，不再被当成"不设限"。
+	// English: §M12-A — three-state cash basis, fail-CLOSED: unknown/stale basis (fresh=false) skips
+	// auto-buy entirely (manual path unaffected); a fresh true 0 now falls into the same
+	// "cannot afford one lot" rejection as real insufficient cash instead of silently bypassing the cap.
+	cash, cashFresh := ctrl.AvailableCash()
+	if !cashFresh {
+		log.Printf("[qmt] %s 资金口径不可得（§M12-A 自动买入 fail-close），本轮跳过", sig.Code)
+		opslog.DayOnce("cashstale:auto-buy", func() {
+			opslog.Logf("quant", "资金口径不可得，自动买入 fail-close 暂停（对账回报超30分钟未更新或账本未接入），最近原始值=%.0f；资金数据回鲜后自动恢复", cash)
+		})
+		return
+	}
+	{
+		// 预留 0.6% 佣金/过户费余量，避免贴着可用资金下单被柜台以"资金不足"废单
+		affordable := int(cash*0.994/price/100) * 100
+		if affordable < qty {
+			if affordable <= 0 {
+				log.Printf("[qmt] %s 可用资金 %.0f 不足以买一手(现价 %.2f)，跳过下单", sig.Code, cash, price)
+				opslog.DayOnce("nocash:"+sig.Code, func() {
+					opslog.Logf("quant", "资金不足跳过 %s 现价=%.2f 可用=%.0f 策略=%s/%s", sig.Code, price, cash, sig.StrategyID, sig.Strategy)
+				})
+				return
+			}
+			log.Printf("[qmt] %s 可用资金 %.0f 不足按预算 %d 股买入，自动降档为 %d 股(约 %.0f 元)",
+				sig.Code, cash, qty, affordable, float64(affordable)*price)
+			opslog.Logf("quant", "资金降档 %s 预算=%d股→%d股 可用=%.0f 现价=%.2f", sig.Code, qty, affordable, cash, price)
+			qty = affordable
+		}
+	}
+	// §GAP2-W1 确定性幂等键（资损级修复）：实盘买入 signal_id 改为 buy:<纯代码>:<稳定战法键>:<交易日>。
+	// 旧实现直接用 sig.ID（seqID="SIG"+UnixNano，每轮扫描重新生成）——主循环每 ~5 分钟重扫一次，
+	// 同一股票只要持续满足条件就会拿到全新 signal_id 反复真实下单，直到烧满 daily_max_buys/预算；
+	// 且 prevBullBuy 去重状态是纯内存态，盘中重启首轮把全部当前 Pass 信号当"新翻转"重放。
+	// 新键与卖出键 sell:<码>:<类>:<日> 同构：orders 表 signal_id 唯一键天然防重——
+	// 跨轮次重复触发、近实时+主循环双通道叠加、进程重启重放，全部被数据库唯一约束拦截；
+	// 同股同战法当日至多一笔买单，与单日笔数/预算纪律的语义一致。
+	// §修复 P2#14：战法分量用"稳定键"而非显示名——库规则改名（PanelStrategyName 显示名可变）
+	// 会让 buy:<码>:<旧名>:<日> 与 buy:<码>:<新名>:<日> 成为两个互不拦截的键，
+	// 盘中改名后同一信号可再下一单（重复下单敞口）；两库规则重名则键碰撞合并（本应两单变一单）。
+	// 优先用 StrategyID（fac_1/pat_2 稳定且唯一），内置战法无 ID 时回退规范显示名（龙头/N形…不可改）。
+	// English: §P2#14 — the strategy component of the deterministic buy key now uses a stable key instead
+	// of the display name. Renaming a library rule changed buy:<code>:<old>:<day> → buy:<code>:<new>:<day>
+	// (two non-colliding keys → the same signal could re-fire a real order intraday), and duplicate display
+	// names across rules collapsed distinct buys into one. Prefer StrategyID (fac_1/pat_2, stable & unique);
+	// built-ins without an ID fall back to their canonical display name (龙头/N形, immutable).
+	// §C6（2026-09-22 PM 批清扫）：幂等键与准入探针**必须同键空间**。
+	// 旧派生是 StrategyID?:Strategy，而 signalctl 准入探针用 StrategyKeyOf（StrategyType 优先）——
+	// 同一 StrategyType 换 StrategyID（库规则重建 fac_old→fac_new）时探针视为同一战法合并准入，
+	// 幂等键却不同，同日同股同战法理论上可放行两单（重复下单敞口）。现两键统一由
+	// StrategyKeyOf 单点派生：改一处两把闸同步漂移，永不再分叉。
+	// English: §C6 — the idempotent buy key now derives from signalctl.StrategyKeyOf (the same single
+	// source the admission probe uses), closing the fork where same-Type-but-different-ID rules passed
+	// one merged admission yet carried two distinct buy keys (theoretical double-order per day).
+	stratKey := signalctl.StrategyKeyOf(sig)
+	id := fmt.Sprintf("buy:%s:%s:%s", pureTsCode(sig.Code), stratKey, data.TradingDayDate(time.Now()))
+	// 组装买入订单请求：金额按数量×价格计算，幂等键随信号 ID 传递。
+	// §WS-C 行情上下文装配：StalenessMs（fetcher 快照陈旧度）/ CurrentPrice / PrevClose 供
+	// risk.Gate 的行情新鲜度、集中度与涨跌停不可追单闸消费（缺失时对应闸 fail-open）。
+	// English: §WS-C quote context for the risk gate (staleness / live price / prev close); gates
+	// fail open when the fields are missing.
+	req := trading.OrderRequest{
+		SignalID:     id,
+		Code:         withSuffix(sig.Code),
+		Name:         sig.Name,
+		Strategy:     sig.Strategy,
+		StrategyID:   sig.StrategyID,
+		StrategyType: sig.StrategyType,
+		Side:         trading.SideBuy,
+		PriceType:    cfg.PriceType,
+		Price:        price,
+		Qty:          qty,
+		Amount:       float64(qty) * price,
+		CreatedAt:    time.Now().Format(time.RFC3339),
+		StalenessMs:  e.quoteStalenessMs(sig.Code),
+	}
+	if si != nil {
+		req.CurrentPrice = si.Price
+		// §P1-5（2026-09-15）：昨收优先用显式 PrevClose 字段（各行情源已逐点填充）；
+		// 未改造源回退旧 Close 字段（语义"依数据源而定"，仍是历史口径）。
+		req.PrevClose = si.PrevClose
+		if req.PrevClose <= 0 {
+			req.PrevClose = si.Close
+		}
+	}
+	// （兼容未启动分发器的调用方，如测试与直调；保持原有行为）。
+	// §修复 FIX#8（2026-09-04）：满队不再静默丢弃——旧实现 select default 直接 drop，
+	// 开盘首轮/重启重放瞬间几十个信号打满 64 缓冲即丢，且 prevPass 已置位使该股当日不再
+	// 翻转重发，买入信号永久丢失（资损方向）。满队时回落同步 PlaceOrder，宁可当前轮阻塞
+	// 也不丢单；并发保护由 ctrl.PlaceOrder 自身的 orderMu 串行化保证。
+	// English: §FIX#8 — a full buy queue no longer drops the order. The old select-default silently
+	// discarded signals once 64 queued (burst at open / replay), and prevPass already set meant the
+	// stock would never re-fire that day. Fall back to a synchronous PlaceOrder instead (the
+	// controller's own orderMu serializes concurrent callers).
+	// §P2#23 锁内快照 buyCh：与 StartBuyDispatcher/StopBuyDispatcher 的锁内写构成竞态
+	// （旧实现直读 e.buyCh，与创建/停止并发构成 data race）。快照后使用同一引用。
+	// English: P2#23 snapshot buyCh under lock — the old direct read raced with the locked writes in
+	// StartBuyDispatcher/StopBuyDispatcher. Use the snapshot for the send below.
+	e.mu.RLock()
+	buyCh := e.buyCh
+	e.mu.RUnlock()
+	if buyCh != nil {
+		select {
+		case buyCh <- buyTask{req: req, sig: sig}:
+			// §AUDIT-PM 2026-09-15 队列深度量规：崩溃丢单的观测面（深度逼近容量即预警风暴）。
+			// §M11（2026-09-22 修复批）推翻旧口径「重启后同 signal_id 自愈重发、不做持久化」——
+			// 自愈依赖战法当日重新翻转，重启后条件变化即不再翻转发单；排队单现随停机排空落盘
+			// （见 buy_queue_persist.go），下单侧幂等仍由 orders 表 signal_id 唯一键兜底。
+			metrics.SetGauge("buy_queue_depth", int64(len(buyCh)))
+			log.Printf("[trading] auto order queued %s(%s) qty=%d price=%.2f (async)", sig.Code, sig.Name, qty, price)
+		default:
+			log.Printf("[trading] auto order QUEUE FULL → 同步下单兜底 %s(%s) qty=%d price=%.2f", sig.Code, sig.Name, qty, price)
+			opslog.Logf("quant", "auto 买单队列满回落同步 %s(%s) qty=%d price=%.2f", sig.Code, sig.Name, qty, price)
+			if res, err := ctrl.PlaceOrder(req); err != nil {
+				log.Printf("[trading] auto order(同步兜底) %s(%s): %v", sig.Code, sig.Name, err)
+			} else {
+				log.Printf("[trading] auto order(同步兜底) %s(%s) qty=%d price=%.2f → %+v", sig.Code, sig.Name, qty, price, res)
+			}
+		}
+	} else {
+		res, err := ctrl.PlaceOrder(req)
+		if err != nil {
+			log.Printf("[trading] auto order %s(%s): %v", sig.Code, sig.Name, err)
+			return
+		}
+		log.Printf("[trading] auto order %s(%s) qty=%d price=%.2f → %+v", sig.Code, sig.Name, qty, price, res)
+	}
+}
+
+// StartBuyDispatcher §A+B 启动异步下单 worker 池（事件驱动热路径）。在 RunScoringLoop 启动时调用一次。
+// §M11（2026-09-22 修复批）：启动时先恢复上次停机落盘的排队买单（SignalID 去重后重新入队），
+// 修复旧行为——buyCh 是 64 槽纯内存队列，停机时已排队未消费的买单随重启蒸发、当日无人重放。
+// English: A+B — starts the async order worker pool; §M11 restores the shutdown-drained queue first.
+func (e *Engine) StartBuyDispatcher(n int) {
+	if n <= 0 {
+		n = 4
+	}
+	e.mu.Lock()
+	if e.buyCh != nil {
+		e.mu.Unlock()
+		return // 已启动，避免重复
+	}
+	e.buyCh = make(chan buyTask, 64)
+	e.buyStop = make(chan struct{})
+	ch := e.buyCh
+	e.mu.Unlock()
+	// §M11 恢复停机排队买单（worker 启动前先入队，恢复单与原单同走幂等键链路）。
+	e.restoreBuyQueue(ch)
+	for i := 0; i < n; i++ {
+		e.buyWg.Add(1)
+		go func() {
+			defer e.buyWg.Done()
+			// 加锁读取，避免与 StopBuyDispatcher 写 e.buyStop=nil 形成数据竞争
+			// English: read under lock to avoid a data race with StopBuyDispatcher.
+			// §M11：buyCh 同样锁内快照取局部引用——Stop 现在会在排空后把字段置 nil 支持
+			// 原地重启，worker 事件循环不得再直读 e.buyCh。
+			e.mu.RLock()
+			stop := e.buyStop
+			queue := e.buyCh
+			e.mu.RUnlock()
+			if stop == nil || queue == nil {
+				return
+			}
+			// 事件循环：收到投递则下单，收到停止信号则退出 worker。
+			for {
+				select {
+				case t := <-queue:
+					metrics.SetGauge("buy_queue_depth", int64(len(queue))) // §AUDIT-PM 出队侧同步深度
+					e.placeOrderNow(t.req, t.sig)
+				case <-stop:
+					return
+				}
+			}
+		}()
+	}
+}
+
+// StopBuyDispatcher 停止 worker 池（进程退出时）。
+// §M11（2026-09-22 修复批）：worker 退出（buyWg.Wait 已等其完成在途 PlaceOrder）后把队列中
+// 已排队未消费的买单排空原子落盘（<acctDir>/buy_queue_pending.json），下次 StartBuyDispatcher
+// 恢复入队。语义边界：已出队、PlaceOrder 进行中的在途单不在落盘范围——worker 会先完成该单
+// 再退出，且 orders 表 signal_id 唯一键幂等兜底，恢复链路不会造成重复下单。
+// English: stops the worker pool and (M11) drains the still-queued tasks to an atomic JSON file
+// for restore on next start; in-flight dequeued tasks complete before the drain, and the
+// orders-table signal_id key dedupes any overlap.
+func (e *Engine) StopBuyDispatcher() {
+	// 交换取走 stop 信号通道（置空避免二次停止时重复 close panic）。
+	e.mu.Lock()
+	stop := e.buyStop
+	e.buyStop = nil
+	e.mu.Unlock()
+	if stop == nil {
+		return
+	}
+	select {
+	case <-stop:
+	default:
+		close(stop)
+	}
+	e.buyWg.Wait()
+	// §M11 排空残余队列：在锁内取出队列引用并清空（此刻无 worker 消费；持锁排空把
+	// 「autoPlace 快照旧 ch 后又塞单」的窗口压到最小——该残余竞态窗口与 §P2#23 快照
+	// 语义同源，orders 表幂等键 + 当日信号重发兜底，不追求零窗口）。排空结果锁外落盘。
+	e.mu.Lock()
+	ch := e.buyCh
+	var pending []buyTask
+	if ch != nil {
+	drain:
+		for {
+			select {
+			case t := <-ch:
+				pending = append(pending, t)
+			default:
+				break drain
+			}
+		}
+		// 仅当字段仍指向本队列才置 nil（期间若有新 Start 装配了新队列，绝不误清）。
+		if e.buyCh == ch {
+			e.buyCh = nil
+		}
+	}
+	e.mu.Unlock()
+	e.persistBuyQueue(pending)
+}
+
+// placeOrderNow §A+B worker 实际下单：每次读取最新 qmtCtrl（配置热重载安全），调用网关。
+// English: A+B worker — performs the actual order via the latest qmtCtrl (config hot-reload safe).
+func (e *Engine) placeOrderNow(req trading.OrderRequest, sig combat_agent.Signal) {
+	e.mu.RLock()
+	ctrl := e.qmtCtrl
+	e.mu.RUnlock()
+	if ctrl == nil {
+		return
+	}
+	res, err := ctrl.PlaceOrder(req)
+	if err != nil {
+		log.Printf("[trading] auto order %s(%s): %v", sig.Code, sig.Name, err)
+		return
+	}
+	log.Printf("[trading] auto order %s(%s) qty=%d price=%.2f → %+v", sig.Code, sig.Name, req.Qty, req.Price, res)
+	// §DAILY_OPSLOG auto 实际下单结果（受理/业务拒单由 controller 侧另记，此处补策略上下文）
+	opslog.Logf("quant", "auto 下单 %s(%s) 策略=%s/%s qty=%d price=%.2f → ok=%v order=%s err=%s",
+		sig.Code, sig.Name, req.StrategyID, req.Strategy, req.Qty, req.Price, res.OK, res.OrderID, res.Err)
+}
+
+// SetScoringInterval §A+B 设置近实时打分循环间隔（0 → 回退 5s）。
+// English: A+B — sets the near-realtime scoring-loop interval (0 → fallback 5s).
+func (e *Engine) SetScoringInterval(d time.Duration) {
+	e.mu.Lock()
+	e.scoringInterval = d
+	e.mu.Unlock()
+}
+
+// withSuffix 为纯数字股票代码补交易所后缀（600000 → 600000.SH；000001 → 000001.SZ；4/8 开头 → .BJ）。
+// §P1-6（2026-09-15）：实现收口到 data.ExchangeSuffix（旧内联 switch 把 `9` 前缀一律 .SH，
+// 920xxx 北交所新股被发错交易所——与 data.LimitUpPct 的 92=北交所口径矛盾）。
+// English: withSuffix appends the exchange suffix to a bare digit code; implementation delegates to
+// data.ExchangeSuffix (§P1-6) so the 920 BJ segment is no longer misrouted to .SH.
+func withSuffix(code string) string {
+	return data.ExchangeSuffix(code)
+}
+
+// paperMark 用实时快照刷新模拟盘估值与净值：优先按账号分发，回退全局引擎。
+// 仅交易时段执行（盘后停估值，省内存）；盘后落库由注册表盘后导出 hook 负责。
+// English: refreshes paper marks and equity from the live snapshot — per-account dispatch first, global
+// engine as the fallback. Runs only during trading hours (no after-hours marking to save memory); the
+// post-close research export is handled by the registry's day-close hook.
+func (e *Engine) paperMark(quotes map[string]*data.StockInfo) {
+	e.mu.RLock()
+	mark := e.paperMarkFn
+	pe := e.paper
+	e.mu.RUnlock()
+	if mark != nil {
+		mark(quotes)
+		return
+	}
+	if pe != nil && pe.Enabled() && data.IsFullTradingHours(time.Now()) {
+		// §纸面估值修复：持仓不在 5s 快照池时用最近收盘价回填估值价，避免 Mark 恒 0 → 现价0/浮亏-100%。
+		// English: backfill marks from the last daily close for held codes missing from the live snapshot,
+		// so a held position never displays 0.00 / -100%.
+		pe.MarkToMarket(backfillPaperQuotes(e, pe, quotes))
+		pe.Snapshot(time.Now())
+	}
+}
+
+// backfillPaperQuotes 为模拟盘持仓中缺失实时价的代码用最近日K收盘价补齐估值行情。
+// 仅对 MarkToMarket 生效，不改动快照本身。无法取到收盘价时保持原样（该持仓沿用旧 Mark）。
+// English: fills in last-close prices for held paper codes missing a live quote, so MarkToMarket can
+// re-mark them. Only affects this valuation pass — the snapshot itself is untouched. Codes with no
+// close available are left as-is (their existing Mark is kept).
+func backfillPaperQuotes(e *Engine, pe *paper.Engine, quotes map[string]*data.StockInfo) map[string]*data.StockInfo {
+	backed := make(map[string]*data.StockInfo, len(quotes)+8)
+	for k, v := range quotes {
+		backed[k] = v
+	}
+	if pe == nil || e == nil || e.strategy == nil {
+		return backed // 缺依赖时原样返回
+	}
+	for _, p := range pe.Positions() {
+		if p.Code == "" {
+			continue
+		}
+		// 快照已有有效价则跳过，避免覆盖实时行情
+		q, ok := backed[p.Code]
+		if ok && q != nil && q.Price > 0 {
+			continue
+		}
+		// 缺失时用最近收盘价补估值（仅本估值轮次生效，不改快照本身）
+		if c := e.strategy.LastClose(p.Code); c > 0 {
+			backed[p.Code] = &data.StockInfo{Code: p.Code, Name: p.Name, Price: c}
+		}
+	}
+	return backed
+}
+
+// syncMonitorBase 重建 5s 监控池的 base（持仓池）：自选 ∪ 实盘持仓 ∪ 全部账号模拟盘持仓。
+// base 无上限、永不轮换——持仓/自选从此永远有 5s 实时行情（纸面估值、实盘建议 RefPrice、
+// 自动卖出行情依赖全部恒可用）；与"监控池 hot（≤60）只管潜在机会、可任意淘汰"彻底分离。
+// 每一轮近实时循环调用一次，覆盖盘中新买入/手动加仓（含手动录入模拟持仓）。
+// English: rebuilds the monitor-pool base ("held pool"): watchlist ∪ real held ∪ every account's
+// paper held. Base is uncapped and never rotated — held/watchlist codes always carry a live 5s quote
+// (paper valuation, live-advice RefPrice, auto-sell guards all stay warm), decoupled from the ≤60 hot
+// pool that only serves speculative candidates and may evict freely. Runs once per near-realtime cycle,
+// so intraday buys and manual entries are pinned the next tick.
+func (e *Engine) syncMonitorBase() {
+	e.mu.RLock()
+	f := e.fetcher
+	rpt := e.rpt
+	wl := e.wlMgr
+	paper := e.paper
+	heldFn := e.paperHeldCodes
+	e.mu.RUnlock()
+	if f == nil {
+		return
+	}
+	set := make(map[string]bool)
+	wlN, rptN, paperN := 0, 0, 0
+	if wl != nil {
+		for _, c := range wl.All() {
+			if c != "" {
+				set[c] = true
+				wlN++
+			}
+		}
+	}
+	if rpt != nil {
+		for _, c := range rpt.HeldPositionCodes() {
+			if c != "" {
+				set[c] = true
+				rptN++
+			}
+		}
+	}
+	if heldFn != nil {
+		for _, c := range heldFn() {
+			if c != "" {
+				set[c] = true
+				paperN++
+			}
+		}
+	}
+	if paper != nil {
+		for _, p := range paper.Positions() {
+			if p.Code != "" {
+				set[p.Code] = true
+				paperN++
+			}
+		}
+	}
+	if len(set) == 0 {
+		return
+	}
+	codes := make([]string, 0, len(set))
+	for c := range set {
+		codes = append(codes, c)
+	}
+	sort.Strings(codes)
+	f.SetBaseStocks(codes)
+	// §QUOTE_POOL_SPLIT 观测：节流打印 base 构成（自选/实盘/纸面），线上确认持仓钉仓生效。
+	// English: throttled observation log — base composition (watchlist/real/paper) so ops can confirm pinning.
+	if time.Since(e.lastBaseLog) >= 60*time.Second {
+		e.lastBaseLog = time.Now()
+		log.Printf("[pool] 持仓池 base=%d (自选%d 实盘%d 纸面%d)", len(codes), wlN, rptN, paperN)
+	}
+}
+
+// SyncMonitorBase 导出持仓池 base 重建（供 main 盘后/休眠分支调用，保证盘后持仓变化亦即时入池；
+// 近实时打分循环被会话门禁拦截时，由主循环休眠分支每轮驱动）。
+// English: exported held-pool base rebuild — driven from main's after-hours sleep branch so holding
+// changes stay pinned even while the session-gated near-realtime loop is idle.
+func (e *Engine) SyncMonitorBase() { e.syncMonitorBase() }
+
+// ensureBuyQuotes 在本轮撮合前把"缺实时行情"的买入信号代码纳入监控并给本轮供价。
+// 时序修正（§QUOTE_POOL_SPLIT）：信号第一次进入买入确认窗那一刻即被 EnsureStock 永久钉入
+// base + 单查 + 合并快照，确认窗（高置信30s/低置信5min）内该股持续有真实行情，窗满后按快照
+// 实时价撮合。此前信号可以在打分池（fallback 单查行情）产生、撮合要求的快照池却无此股，
+// 导致"信号稳定却行情缺失"整轮拒绝（实盘/模拟盘同病）。已监控但本轮快照无有效价的再单查一次，
+// 仍取不到则保持缺失——由撮合侧"行情缺失跳过(不伪造成交)"守卫正常拒绝，不伪造价格。
+// English: before this round's fills, bring buy-signal codes lacking a live quote into the monitor
+// and price them this round: the moment a signal enters its confirm window it is permanently ensured
+// into base (single fetch + snapshot merge), so the confirm window (30s high / 5min low) observes real
+// quotes and the fill prices from the fresh snapshot — inverting the old timing where a signal could
+// originate in the scoring pool (fallback quote) yet be rejected at fill for the snapshot pool not
+// carrying it. If still unpriccable (upstream outage), the existing "missing-quote skip (never
+// fabricate)" guard rejects normally; no price is invented.
+func (e *Engine) ensureBuyQuotes(buys []combat_agent.Signal, quotes map[string]*data.StockInfo) {
+	if len(buys) == 0 {
+		return
+	}
+	e.mu.RLock()
+	f := e.fetcher
+	e.mu.RUnlock()
+	if f == nil {
+		return
+	}
+	for _, sig := range buys {
+		if q := quotes[sig.Code]; q != nil && q.Price > 0 {
+			continue
+		}
+		if !f.Monitoring(sig.Code) {
+			f.EnsureStock(sig.Code)
+		}
+		if si := f.SnapshotQuote(sig.Code); si != nil && si.Price > 0 {
+			quotes[sig.Code] = si
+			continue
+		}
+		if si, err := f.Quote(sig.Code); err == nil && si != nil && si.Price > 0 {
+			quotes[sig.Code] = si
+		}
+	}
+}
+
+// SetFetcher 设置 5s 实时行情采集器（近实时打分循环的快照来源）。
+func (e *Engine) SetFetcher(f *data.Fetcher) {
+	e.mu.Lock()
+	e.fetcher = f
+	e.mu.Unlock()
+}
+
+// quoteStalenessMs §WS-C 行情新鲜度（毫秒）：fetcher 未配置时返回 -1（对应风险闸 fail-open）。
+// English: §WS-C quote staleness in ms; -1 when no fetcher is configured (the risk gate fails open).
+func (e *Engine) quoteStalenessMs(code string) int64 {
+	if e.fetcher == nil {
+		return -1
+	}
+	return e.fetcher.StalenessMs(code)
+}
+
+// snapshotQuotes 返回 fetcher 最近一轮 5s 实时行情快照（map: code → quote），
+// 供 syncMessages 等服务直接把最新价/涨跌幅带进消息中心；fetcher 未配置时返回 nil。
+func (e *Engine) snapshotQuotes() map[string]*data.StockInfo {
+	e.mu.RLock()
+	f := e.fetcher
+	e.mu.RUnlock()
+	if f == nil {
+		return nil
+	}
+	if snap := f.Snapshot(); snap != nil {
+		return snap.Stocks
+	}
+	return nil
+}
+
+// updateHotPool 将验证通过的板块成分股并入 5s 实时监控池。
+// 热点股随板块轮换替换（上限 60 由 Fetcher 内部裁剪），缺失板块验证结果时保留原热点。
+func (e *Engine) updateHotPool(bull, bear []sector_agent.VerifiedSector) {
+	e.mu.RLock()
+	f := e.fetcher
+	e.mu.RUnlock()
+	if f == nil {
+		return
+	}
+	// 把做多/做空板块的成分股并入热点池（供后续行情轮询与现价刷新）。
+	set := make(map[string]bool)
+	for _, sec := range bull {
+		for _, code := range sec.Stocks {
+			set[code] = true
+		}
+	}
+	for _, sec := range bear {
+		for _, code := range sec.Stocks {
+			set[code] = true
+		}
+	}
+	if len(set) == 0 {
+		return // 本轮无验证通过的板块，保持原热点不变
+	}
+	// 去重后整池替换写入监控池（UpdateHotStocks 内部保证 5s 轮询窗口一致）。
+	stocks := make([]string, 0, len(set))
+	for code := range set {
+		stocks = append(stocks, code)
+	}
+	f.UpdateHotStocks(stocks)
+	log.Printf("[engine] 热点池更新: %d 只板块成分股入 5s 实时池", len(stocks))
+}
+
+// syncSignalPool 把本轮展示的做多/做空/提醒信号代码并入 5s 实时监控池（与板块热点池取并集，上限 60）。
+// 否则信号股不在"自选+持仓"监控池时，/api/signals、/api/snapshot/hot 等展示接口读不到实时行情，
+// 涨跌幅显示 0.00%、现价停留在信号触发时的陈旧值。
+// （English: merges the current round's long/short/alert signal codes into the 5s live monitor
+// pool (union with the sector hot pool, capped at 60). Without this, signal stocks outside the
+// watchlist+positions pool show 0.00% change and a stale trigger price on the display endpoints
+// such as /api/signals and /api/snapshot/hot.）
+func (e *Engine) syncSignalPool(bull, bear, alert []combat_agent.Signal) {
+	e.mu.RLock()
+	f := e.fetcher
+	e.mu.RUnlock()
+	if f == nil {
+		return
+	}
+	// 与现有热点池取并集，避免覆盖掉板块入池个股
+	cur := f.HotStocks()
+	set := make(map[string]bool, len(cur)+len(bull)+len(bear)+len(alert))
+	// 现有池 + 做多/做空/提醒三类信号代码全部并入同一集合。
+	for _, c := range cur {
+		set[c] = true
+	}
+	for _, s := range bull {
+		if s.Code != "" {
+			set[s.Code] = true
+		}
+	}
+	for _, s := range bear {
+		if s.Code != "" {
+			set[s.Code] = true
+		}
+	}
+	for _, s := range alert {
+		if s.Code != "" {
+			set[s.Code] = true
+		}
+	}
+	// 当日固化信号也持续展示（看板 FinalSignals 包含它们），一并入池保证现价/涨跌幅真实
+	if e.signalStore != nil {
+		for _, s := range e.signalStore.List() {
+			if s.Code != "" {
+				set[s.Code] = true
+			}
+		}
+	}
+	if len(set) == 0 {
+		return
+	}
+	// 汇总去重后一次写入监控池（上限由 fetcher 内部控制）。
+	stocks := make([]string, 0, len(set))
+	for c := range set {
+		stocks = append(stocks, c)
+	}
+	f.UpdateHotStocks(stocks)
+}
+
+// pushFreshHotspots 新热点立马进池：把归因产出的有效事件立即归因出板块 → 板块验真 → 并入 5s 实时监控池。
+// 与 Run 尾部 9b 的 updateHotPool 幂等。strategy 或 sectorAgent 未初始化时优雅跳过（不 panic）。
+// （pushFreshHotspots immediately attributes valid events into sectors, verifies them, and merges the
+// constituents into the 5s watch pool. Idempotent with the updateHotPool at the end of Run.）
+func (e *Engine) pushFreshHotspots(valid []newsagent.NewsEvent) {
+	if len(valid) == 0 || e.strategy == nil || e.sectorAgent == nil {
+		return
+	}
+	_stepHot := time.Now()
+	bullCand, bearCand := e.strategy.BuildHotSectors(valid)
+	var vb, vbr []sector_agent.VerifiedSector
+	if e.LongEnabled() {
+		vb = e.sectorAgent.Verify(bullCand)
+	}
+	if e.ShortEnabled() {
+		vbr = e.sectorAgent.Verify(bearCand)
+	}
+	e.updateHotPool(vb, vbr)
+	_hotPoolT := time.Since(_stepHot)
+	if _hotPoolT > 500*time.Millisecond {
+		log.Printf("[engine] 新热点立即进池: %d利好板块 %d利空板块, 耗时 %v", len(vb), len(vbr), _hotPoolT)
+	}
+}
+
+// mergeSectorStocksIntoScores 板块→个股归因：把验证通过的板块 top 成分股并入打分行情/D1/PE，
+// 使 ScanLong/ScanShort 遍历 sector.Stocks 时 MarketData[code] 有值（否则 evalAll md==nil 丢弃，
+// 板块利好永远落不到个股）。
+// D1 沿用板块事件分（sector.Score 0~1 → LLMD1Score，仅做多板块种子），不额外调 LLM；
+// 只对没有专属 D1 的成分股打底，避免覆盖个股自己的评分。
+// mergeSectorStocksIntoScores 板块→个股归因：把已验证利好板块的成分股并入 打分池 + 行情数据，
+// 返回"代码→板块事件标题"映射供 D1 评分注入上下文。
+// 不做 D1 打分（D1 已与板块利好/利空事件分完全解耦，只由 D1Scorer LLM 独立核定）——
+// 板块成分股并入 sr.ScoringPool 后，由随后运行的 D1 batch 统一打分。
+// English: sector→stock attribution — merges verified-bull sector constituents into the scoring pool +
+// market data, and returns a code→sector-event-title map for D1 scoring context. It does NOT assign D1
+// (D1 is fully decoupled from the sector bull/bear event score and graded independently by the D1Scorer
+// LLM); constituents are added to sr.ScoringPool so the following D1 batch scores them uniformly.
+func (e *Engine) mergeSectorStocksIntoScores(ctx context.Context, sr *strategy_engine.StrategyResult, verifiedBull, verifiedBear []sector_agent.VerifiedSector, peScores map[string]float64) map[string]string {
+	// 1. 收拢全部板块成分股（去重），并记录每个 code 所属板块的事件标题（做多板块种子）
+	type secInfo struct {
+		eventTitle string // 该成分股所属利好板块的事件标题（做多板块种子，D1 上下文注入用）
+	}
+	secOf := make(map[string]secInfo)
+	// 遍历验证通过的做多板块：取正分板块的事件标题/板块名作为该板块成分股的归因事件标题。
+	for _, vs := range verifiedBull {
+		if vs.Score <= 0 {
+			continue
+		}
+		title := vs.Reason
+		if title == "" {
+			title = vs.Name
+		}
+		for _, c := range vs.Stocks {
+			if _, ok := secOf[c]; !ok {
+				secOf[c] = secInfo{eventTitle: title}
+			}
+		}
+	}
+	var extras []string
+	for c := range secOf {
+		if _, ok := sr.MarketData[c]; ok {
+			continue // 已在打分池（新闻/持仓/自选）
+		}
+		extras = append(extras, c)
+	}
+	// 板块→个股 D1 上下文：所有 verifiedBull 成分股（含已在打分池的自选/持仓）
+	// 都映射到所属板块事件标题，使 D1 评分覆盖"属利好板块但未被新闻点名"的池内个股。
+	// D1 仍是个股分——板块标题只作为 LLM 评分上下文，由 LLM 对每只个股独立核定受益程度。
+	eventMap := make(map[string]string, len(secOf))
+	for c, si := range secOf {
+		if si.eventTitle != "" {
+			eventMap[c] = si.eventTitle
+		}
+	}
+	if e.strategy == nil || e.marketAPI == nil {
+		log.Printf("[engine] 板块→个股归因跳过: 策略引擎/行情API未配置")
+		return eventMap
+	}
+
+	// 2. 补拉成分股行情（K线/实时/资金流，走缓存），merge 进 sr.MarketData 与打分池
+	extraMD := e.strategy.BuildScoringData(ctx, extras, nil)
+	// 打分池去重集合（ScoringPool 为无序切片，用 map 判重）
+	poolSet := make(map[string]bool, len(sr.ScoringPool))
+	for _, c := range sr.ScoringPool {
+		poolSet[c] = true
+	}
+	for c, md := range extraMD {
+		if _, ok := sr.MarketData[c]; !ok {
+			sr.MarketData[c] = md
+		}
+		// 并入打分池，使板块成分股进入 D1 batch 的统一打分范围
+		if !poolSet[c] {
+			sr.ScoringPool = append(sr.ScoringPool, c)
+			poolSet[c] = true
+		}
+		// 3. 补 PE（N 形 D3 超跌评分；§S2 传现价，当日首取后盘中按现价推算）
+		peScores[c] = e.marketAPI.GetStockPEAt(c, md.Price)
+	}
+
+	log.Printf("[engine] 板块→个股归因: 补 %d 只成分股行情并入打分池, 板块=%d", len(extras), len(secOf))
+	return eventMap
+}
+
+// loadStageRecords 从磁盘加载当日 Stage 记录；跨交易日自动重置。
+func loadStageRecords(path string) []newsagent.DebugInfo {
+	if path == "" {
+		return nil
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return nil
+	}
+	var f stageRecordFile
+	if err := json.Unmarshal(raw, &f); err != nil {
+		log.Printf("[engine] stage_records 解析失败: %v", err)
+		return nil
+	}
+	if f.TradingDay != data.TradingDayDate(time.Now()) {
+		return nil
+	}
+	return f.Records
+}
+
+// persistStageRecords 将当日 Stage 记录写入磁盘。
+func (e *Engine) persistStageRecords() {
+	if e.stageRecPath == "" {
+		return
+	}
+	// §E6 RLock 内值级快照：此前只拷切片头，锁外 Marshal 遍历与写方共享的底层数组（一触即溃模式）
+	e.mu.RLock()
+	recs := make([]newsagent.DebugInfo, len(e.stageRecords))
+	copy(recs, e.stageRecords)
+	e.mu.RUnlock()
+	f := stageRecordFile{TradingDay: data.TradingDayDate(time.Now()), Records: recs}
+	raw, err := json.MarshalIndent(f, "", "  ")
+	if err != nil {
+		log.Printf("[engine] stage_records 序列化失败: %v", err)
+		return
+	}
+	mustAtomicWrite("stage_records", e.stageRecPath, raw)
+}
+
+// GetStageRecords 返回当日全量 Stage 轮次记录（供复盘 / 策略侧实时调取）。
+func (e *Engine) GetStageRecords() []newsagent.DebugInfo {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	out := make([]newsagent.DebugInfo, len(e.stageRecords))
+	copy(out, e.stageRecords)
+	return out
+}
+
+// loadSignalRecords 从磁盘加载当日信号批次记录；跨交易日自动重置。
+func loadSignalRecords(path string) []combat_agent.SignalLog {
+	if path == "" {
+		return nil
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return nil
+	}
+	var f signalRecordFile
+	if err := json.Unmarshal(raw, &f); err != nil {
+		log.Printf("[engine] signal_records 解析失败: %v", err)
+		return nil
+	}
+	if f.TradingDay != data.TradingDayDate(time.Now()) {
+		return nil
+	}
+	return f.Records
+}
+
+// persistSignalRecords 将当日信号批次记录写入磁盘。
+func (e *Engine) persistSignalRecords() {
+	if e.signalRecPath == "" {
+		return
+	}
+	// §E6 同上：值级快照
+	e.mu.RLock()
+	recsSig := make([]combat_agent.SignalLog, len(e.signalRecords))
+	copy(recsSig, e.signalRecords)
+	e.mu.RUnlock()
+	f := signalRecordFile{TradingDay: data.TradingDayDate(time.Now()), Records: recsSig}
+	raw, err := json.MarshalIndent(f, "", "  ")
+	if err != nil {
+		log.Printf("[engine] signal_records 序列化失败: %v", err)
+		return
+	}
+	mustAtomicWrite("signal_records", e.signalRecPath, raw)
+}
+
+// GetSignalLogs 返回当日全量信号批次记录（供前端"信号日志"弹窗按批次展示）。
+func (e *Engine) GetSignalLogs() []combat_agent.SignalLog {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	out := make([]combat_agent.SignalLog, len(e.signalRecords))
+	copy(out, e.signalRecords)
+	return out
+}
+
+// captureSignalRecords 收集本轮全部信号为一条批次快照，固化到当日信号记录。
+// §REQ-20260902：LLM/战法近实时后轮次大幅增加，改为保留全天、不再截断 20 条；
+// 空批次（无任何信号，无实际内容）直接不落库，前端也不再出现「0 信号」的空轮次。
+// English: keeps the whole trading day of signal batches instead of the old 20-round cap
+// (near-realtime rounds multiply the volume); batches with no signals are dropped entirely
+// so the log UI never shows empty rounds.
+func (e *Engine) captureSignalRecords(rawCount int, signals []combat_agent.Signal) {
+	if len(signals) == 0 {
+		return // 无信号批次不入日志，避免空轮次刷屏
+	}
+	e.mu.Lock()
+	rec := combat_agent.SignalLog{
+		ProcessTime: time.Now(),
+		RawCount:    rawCount,
+		Signals:     make([]combat_agent.Signal, len(signals)),
+	}
+	copy(rec.Signals, signals) // 深拷贝，避免外部修改影响历史快照
+	e.signalRecords = append(e.signalRecords, rec)
+	e.mu.Unlock()
+	e.persistSignalRecords()
+}
+
+// RolloverDayStores 交易日切巡查：跨 00:00 清空当日固化信号库与信号批次记录，
+// 防止昨日未再触发的 code@strategy 信号残留到新交易日（带旧时间戳继续展示，乃至被
+// 误当当日信号参与去重/下单幂等）。进程 24h 常驻，仅启动时按日加载不够，需每轮巡检。
+// English: trading-day rollover check — on midnight crossover, clears the pinned-signal store and the
+// batch log so yesterday's no-longer-refreshed code@strategy signals can't leak into the new day with
+// stale timestamps (or feed idempotency/dedup). The 24/7 process only loads per-day at startup, so the
+// day boundary needs per-round vigilance, not just init.
+func (e *Engine) RolloverDayStores() {
+	td := data.TradingDayDate(time.Now())
+	e.mu.Lock()
+	if e.storeDay == td {
+		e.mu.Unlock()
+		return
+	}
+	e.storeDay = td
+	e.mu.Unlock()
+	if e.signalStore != nil {
+		e.signalStore.ClearDay()
+	}
+	e.mu.Lock()
+	e.signalRecords = nil
+	e.mu.Unlock()
+}
+
+// GetAllNewsEvents 返回持久化到本地的全部已打标新闻事件，供 /api/news?all=true 展示。
+func (e *Engine) GetAllNewsEvents() []newsagent.NewsEvent {
+	e.mu.RLock()
+	na := e.newsAgent
+	e.mu.RUnlock()
+	if na == nil {
+		return nil
+	}
+	return na.AllEvents()
+}
+
+// SetNewsShowAll 设置"资讯显示全部"开关：开启时落盘过滤分降到 0，
+// 弱档/中性事件也出现在 /api/news；关闭时恢复默认 0.25。
+func (e *Engine) SetNewsShowAll(v bool) {
+	e.mu.RLock()
+	na := e.newsAgent
+	e.mu.RUnlock()
+	if na == nil {
+		return
+	}
+	if v {
+		na.SetMinScore(0)
+	} else {
+		na.SetMinScore(0.25)
+	}
+	log.Printf("[engine] 资讯显示全部开关: %v (落盘最低分=%v)", v, na.MinScore())
+}
+
+// NewsShowAll 返回"资讯显示全部"开关当前状态。
+func (e *Engine) NewsShowAll() bool {
+	e.mu.RLock()
+	na := e.newsAgent
+	e.mu.RUnlock()
+	if na == nil {
+		return false
+	}
+	return na.MinScore() == 0
+}
+
+// ── 热点板块记录 ──
+
+// loadHotRecords 从磁盘加载当日热点板块记录；跨交易日自动重置。
+func loadHotRecords(path string) []data.HotRecord {
+	if path == "" {
+		return nil
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return nil
+	}
+	var f hotRecordFile
+	if err := json.Unmarshal(raw, &f); err != nil {
+		log.Printf("[engine] hot_records 解析失败: %v", err)
+		return nil
+	}
+	if f.TradingDay != data.TradingDayDate(time.Now()) {
+		return nil
+	}
+	return f.Records
+}
+
+// persistHotRecords 将当日热点板块记录写入磁盘。
+func (e *Engine) persistHotRecords() {
+	if e.hotRecPath == "" {
+		return
+	}
+	// §E6 同上：值级快照
+	e.mu.RLock()
+	recsHot := make([]data.HotRecord, len(e.hotRecords))
+	copy(recsHot, e.hotRecords)
+	e.mu.RUnlock()
+	f := hotRecordFile{TradingDay: data.TradingDayDate(time.Now()), Records: recsHot}
+	raw, err := json.MarshalIndent(f, "", "  ")
+	if err != nil {
+		log.Printf("[engine] hot_records 序列化失败: %v", err)
+		return
+	}
+	mustAtomicWrite("hot_records", e.hotRecPath, raw)
+}
+
+// GetHotRecords 返回当日全量热点板块轮次记录（供前端展示）。
+func (e *Engine) GetHotRecords() []data.HotRecord {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	out := make([]data.HotRecord, len(e.hotRecords))
+	copy(out, e.hotRecords)
+	return out
+}
+
+// captureHotRecord 将本轮热点板块（匹配同花顺 top-20 行情表后）固化为记录。
+// 无板块归因或匹配不到真实板块时跳过。
+func (e *Engine) captureHotRecord(sr *strategy_engine.StrategyResult) {
+	if sr == nil || len(sr.HotSectors) == 0 {
+		return
+	}
+	e.mu.RLock()
+	ths := e.ths
+	e.mu.RUnlock()
+	if ths == nil {
+		return
+	}
+	boards, err := ths.GetTopBoards()
+	if err != nil {
+		log.Printf("[engine] 热点记录: 同花顺板块行情获取失败: %v", err)
+		return
+	}
+	// 板块名→详情映射，供下方按名称回填代码/涨幅/涨停数等指标。
+	sectorMap := make(map[string]data.SectorInfo, len(boards))
+	for _, b := range boards {
+		sectorMap[b.Name] = b
+	}
+	// 组装当日热点记录：热度榜板块+行情快照字段合并为可展示/落盘的快照行。
+	rec := data.HotRecord{ProcessTime: time.Now()}
+	for _, sec := range sr.HotSectors {
+		si, ok := sectorMap[sec.Name]
+		if !ok {
+			continue
+		}
+		rec.Sectors = append(rec.Sectors, data.HotSectorRecord{
+			Name:       sec.Name,
+			Code:       si.Code,
+			Score:      sec.Score,
+			ChangePct:  si.ChangePct,
+			D1:         0,
+			Direction:  sec.Direction,
+			LimitupCnt: si.LimitupCnt,
+			NetInflow:  si.NetInflow,
+			Reason:     sec.Reason,
+			NewsTitles: sec.NewsTitles,
+		})
+	}
+	if len(rec.Sectors) == 0 {
+		return
+	}
+	// 追加进内存环形队列（保留最近 50 轮），随后异步落盘。
+	e.mu.Lock()
+	e.hotRecords = append(e.hotRecords, rec)
+	if len(e.hotRecords) > 50 {
+		e.hotRecords = e.hotRecords[len(e.hotRecords)-50:]
+	}
+	e.mu.Unlock()
+	e.persistHotRecords()
+}
+
+// ── 消息中心 ──
+
+// GetMessages 返回消息中心全部消息（按生成时间倒序）——引擎内部/调试用，含他人私有消息，
+// HTTP 展示一律走 GetMessagesFor(uid)（§GAP2-W2 账户隔离读侧）。
+func (e *Engine) GetMessages() []data.MessageItem {
+	if e.msgStore == nil {
+		return nil
+	}
+	return e.msgStore.List()
+}
+
+// GetMessagesFor 返回指定账号可见的消息（公共 ∪ 本人私有）——§GAP2-W2 消息中心读侧收口，
+// 朋友看不到 owner 的持仓止盈止损提醒，反之亦然；交易信号等公共消息全员共享（决策 D3）。
+// English: §GAP2-W2 read-side isolation — public ∪ own-private messages for the requesting account.
+func (e *Engine) GetMessagesFor(userID string) []data.MessageItem {
+	if e.msgStore == nil {
+		return nil
+	}
+	return e.msgStore.ListVisible(userID)
+}
+
+// ClearMessages 清空消息中心全部消息。
+func (e *Engine) ClearMessages() {
+	if e.msgStore != nil {
+		e.msgStore.ClearAll()
+	}
+}
+
+// DeleteMessage 手工删除单条消息。
+func (e *Engine) DeleteMessage(id string) {
+	if e.msgStore != nil {
+		e.msgStore.Delete(id)
+	}
+}
+
+// RefreshMessageName 按代码刷新消息中心的股票名称为最新权威名。
+// 由前端加自选等入口调用，用于把消息里旧名/空名同步成 quote 权威名。
+func (e *Engine) RefreshMessageName(code, name string) {
+	if e.msgStore != nil {
+		e.msgStore.RefreshNameByCode(code, name)
+	}
+}
+
+// authoritativeName 尝试从行情接口取该股权威名称；失败或为空时返回 ""。
+// 仅用于持仓消息 Name 为空的兜底，避免消息中心出现空名。
+func (e *Engine) authoritativeName(code string) string {
+	if e.marketAPI == nil || code == "" {
+		return ""
+	}
+	si, err := e.marketAPI.GetRealtimeQuote(code)
+	if err != nil || si == nil || si.Name == "" {
+		return ""
+	}
+	return si.Name
+}
+
+// orName 依次返回第一个非空名称，全部为空时返回 ""。
+func orName(names ...string) string {
+	for _, n := range names {
+		if n != "" {
+			return n
+		}
+	}
+	return ""
+}
+
+// ── 股票咨询（多轮对话）──
+
+// consultHistoryLimit 送入模型的多轮历史上限（最近 N 条消息，约 3 组问答）。
+// 只带近期上下文，避免历史劣质回复持续污染后续判断，也降低小模型长上下文注意力漂移。
+const consultHistoryLimit = 6
+
+// ConsultLLM 以多轮对话方式调用 LLM 生成咨询回复（股票咨询页使用）。
+// 组装顺序：唯一一条 system（角色提示词，专业模式时并入实时行情数据）→ 历史最近 N 条 → 当前提问。
+// LLM 未配置时返回错误提示前端引导配置；回复生成后同步追加到当日对话历史（跨交易日自动清空）。
+// §FIX-4(20260919)：首参改为请求 ctx（handleConsult 传 r.Context()）——用户断开/超时取消后，
+// 出呼链（退避→流式读→HTTP）随之中止，不再悬空计费。
+func (e *Engine) ConsultLLM(ctx context.Context, userID, userMsg string, proMode bool) (string, error) {
+	e.mu.RLock()
+	client := e.llmClient
+	e.mu.RUnlock()
+	if client == nil {
+		return "", fmt.Errorf("未配置 LLM_API_KEY，请先在股票咨询页配置 API Key")
+	}
+
+	// §FIX-10(20260919 批四)：出呼前先确认账号隔离存储可用——不可用（nil）时整轮咨询
+	// 无法落盘，历史会静默丢失且跨账号有串号风险，直接拒绝（上层映射 503）。
+	// 放在数据块抓取与付费调用**之前**：拒绝即零外呼、零计费。
+	store := e.consultStoreFor(userID)
+	if store == nil {
+		return "", fmt.Errorf("咨询: %w", data.ErrStoreUnavailable)
+	}
+
+	// system 起始即角色提示词。§生产 20260916 翻转：带数据上下文改为**无条件注入**——
+	// 数据是咨询的默认构成（用户实录"AI 顾问空口谈逻辑"是缺陷），不再由开关决定有无；
+	// proMode 仅追加更定量化/结构化的深度分析风格要求。未识别到个股时给 noStock 提示词，
+	// 引导模型如实说明无数据、不编造。
+	// §FIX-2(20260919 批三)：数据块用 ⟦DATA⟧/⟦/DATA⟧ 边界包裹后注入——边界让模型能区分
+	// "实测数据"与"角色指令"，更重要的是 trusted 白名单从此**只采边界内数据块 + 用户消息 +
+	// 历史**，提示词模板彻底出局（旧实现连 system 一起抽，"错误示范"假数字 2383万/1.2亿
+	// 被模型原样复现即放行，守卫自击穿）。
+	system := llm.ConsultSystemPrompt()
+	dataCtx := e.buildConsultContext(userMsg)
+	if dataCtx != "" {
+		system += "\n\n⟦DATA⟧\n" + dataCtx + "\n⟦/DATA⟧"
+	} else {
+		system += "\n\n" + consultNoStockPrompt
+	}
+	if proMode {
+		system += "\n\n（专业模式：请在回答中给出更定量化、结构化的深度分析，明确列出数据依据与风险点。）"
+	}
+
+	// 历史：仅取最近 consultHistoryLimit 条（正序）。store 可用性已在函数入口校验（§FIX-10）。
+	messages := make([]llm.Message, 0, consultHistoryLimit+2)
+	if hist := store.List(); len(hist) > 0 {
+		if len(hist) > consultHistoryLimit {
+			hist = hist[len(hist)-consultHistoryLimit:]
+		}
+		for _, m := range hist {
+			messages = append(messages, llm.Message{Role: m.Role, Content: m.Content})
+		}
+	}
+	messages = append(messages, llm.Message{Role: "user", Content: userMsg})
+
+	// 完整消息序列：system 在最前，后接历史与当前提问。
+	msgs := append([]llm.Message{{Role: "system", Content: system}}, messages...)
+
+	reply, err := client.ChatMessagesCtx(ctx, msgs)
+	if err != nil {
+		// %w 保留错误链：handleConsult 用 errors.Is(err, llm.ErrBudgetExceeded) 区分"额度用尽(429)"
+		// 与上游故障(500)。用 %v 会截断链路，429 语义静默退化为 500。
+		return "", fmt.Errorf("咨询调用失败: %w", err)
+	}
+
+	// 数字审计：剔除模型编造、没有任何可信出处的金钱/数量类数字（金额、成交量、笔数等）。
+	// 可信来源=注入的实时行情数据块 + 用户自己的描述 + 此前已落盘的历史（已在此前被审计过）。
+	// §FIX-2：来源清单里**没有** system——提示词模板（含反面教材假数字）不参与白名单采集。
+	histTexts := make([]string, 0, len(messages))
+	for _, m := range messages {
+		histTexts = append(histTexts, m.Content)
+	}
+	trusted := collectTrustedNumbers(append([]string{dataCtx, userMsg}, histTexts...)...)
+	// §FIX-5(4)：提示词允许模型用现价/昨收推算涨跌幅，推算值按 ±0.5pp 容差放行。
+	trusted.addDerivedPct(dataCtx)
+	reply = auditNumbers(reply, trusted)
+
+	// 对话历史落盘：一轮"提问+回复"合并为一次落盘（§FIX-10：fsync 减半、无半轮窗口；
+	// §GAP2-W2 写入本人账号目录）。
+	store.AppendPair(data.ConsultMessage{Role: "user", Content: userMsg},
+		data.ConsultMessage{Role: "assistant", Content: reply})
+	return reply, nil
+}
+
+// auditedNumberRe 匹配带金融单位的数字：金额（万元/亿元/元）、成交量（万股/亿股）、笔数/手数，
+// 及百分比与倍数（% / 倍）——这些同样是模型幻觉的高发区。
+// 支持"万/亿"紧邻 笔/手/股 的组合（如 2.3万笔、1.2亿股）。
+// §FIX-5(20260919 批三)：数字与单位之间允许空白（模型常写"净流出 2.22 亿元"），否则漏审。
+// 刻意不匹配：时间、股票代码、时长、日期，以及"点/个"等无单位口径字段——避免误伤，
+// 数据块里的无单位复述（如"12个点"）天然不进白名单也不被审，后人勿再加宽单位表。
+// English: matches unit-bearing finance numbers (space between digits and unit allowed);
+// deliberately skips times/codes/dates and unit-less phrasings.
+var auditedNumberRe = regexp.MustCompile(`[-+]?\d+(?:\.\d+)?\s*(?:万元|亿元|元|万股|亿股|万|亿|手|笔|[%％]|倍)`)
+
+// numCat §FIX-5：带单位数字的量纲类别。金额/股数/笔数/百分比/倍数互不等价，
+// 只在同类内做单位换算归一（万元↔亿元）；catAmbiguous 专治裸"万/亿"（"2.3万笔"
+// 会被正则截成 "2.3万"，量纲未知），允许命中任意类别的基础量。
+type numCat int
+
+const (
+	catAmbiguous numCat = iota // 裸"万/亿"，量纲未知
+	catMoney                   // 元/万元/亿元
+	catShares                  // 万股/亿股
+	catCount                   // 手/笔
+	catPct                     // % / ％
+	catMult                    // 倍
+)
+
+// numUnitTable token 后缀 →（量纲类别, 归一到基础量的乘数）。长后缀必须排在前，
+// 保证 "万元" 先于 "万" 命中（HasSuffix 顺序扫描）。
+var numUnitTable = []struct {
+	suffix string
+	cat    numCat
+	mult   float64
+}{
+	{"万元", catMoney, 1e4}, {"亿元", catMoney, 1e8},
+	{"万股", catShares, 1e4}, {"亿股", catShares, 1e8},
+	{"元", catMoney, 1}, {"万", catAmbiguous, 1e4}, {"亿", catAmbiguous, 1e8},
+	{"手", catCount, 1}, {"笔", catCount, 1},
+	{"%", catPct, 1}, {"％", catPct, 1}, {"倍", catMult, 1},
+}
+
+// parseAuditedNumberToken 把 "-22200.00 万元" 这类 token 拆成（量纲类别, 基础量纲数值）。
+// 换算归一是 FIX-5 的核心："-22200万元" 与 "2.22亿元" 落到同一个基础值 -2.22e8，
+// 模型换口径复述不再被当成编造。
+func parseAuditedNumberToken(tok string) (numCat, float64, bool) {
+	// 数字与单位间的空白先剥掉（正则允许 \s*）。
+	trimmed := strings.TrimRight(tok[:strings.LastIndexAny(tok, "0123456789.")+1], " ")
+	suffix := strings.TrimSpace(tok[len(trimmed):])
+	for _, u := range numUnitTable {
+		if suffix == u.suffix {
+			f, err := strconv.ParseFloat(trimmed, 64)
+			if err != nil {
+				return 0, 0, false
+			}
+			return u.cat, f * u.mult, true
+		}
+	}
+	return 0, 0, false
+}
+
+// trustedNumbers §FIX-5：可信数字集合——按量纲分组的"有出处"基础量 + 推算涨跌幅容差清单。
+type trustedNumbers struct {
+	vals       map[numCat]map[float64]bool // 类别 → 集合（保留正负号）
+	derivedPct []float64                   // 现价/昨收推算值，±0.5pp 容差放行（FIX-5(4)）
+}
+
+// derivedPctTolerance 推算涨跌幅的放行容差（百分点）：模型按现价/昨收手算常四舍五入到 1~2 位小数。
+const derivedPctTolerance = 0.5
+
+// collectTrustedNumbers 从可信文本（数据块边界内原文、用户描述、历史消息）收集"有出处的数字"。
+// §FIX-2(20260919 批三)：调用方**严禁**再把 system 提示词模板传进来——模板"错误示范"里的
+// 假数字（2383万/1.2亿）一旦入白名单，守卫即被模型原样复现击穿。
+func collectTrustedNumbers(texts ...string) *trustedNumbers {
+	t := &trustedNumbers{vals: map[numCat]map[float64]bool{}}
+	for _, text := range texts {
+		for _, tok := range auditedNumberRe.FindAllString(text, -1) {
+			cat, val, ok := parseAuditedNumberToken(tok)
+			if !ok {
+				continue
+			}
+			if t.vals[cat] == nil {
+				t.vals[cat] = map[float64]bool{}
+			}
+			t.vals[cat][val] = true
+		}
+	}
+	return t
+}
+
+// isEmpty 无任何可信数字：审计整体跳过（维持历史语义——无锚点时宁可放行不误伤）。
+func (t *trustedNumbers) isEmpty() bool {
+	return len(t.vals) == 0 && len(t.derivedPct) == 0
+}
+
+// consultDerivedPairRe 在数据块同一行内配对"现价 X元 … 昨收 Y元"，供推算涨跌幅白名单。
+var consultDerivedPairRe = regexp.MustCompile(`现价\s*([-+]?\d+(?:\.\d+)?)\s*元[^\n]*?昨收\s*([-+]?\d+(?:\.\d+)?)\s*元`)
+
+// addDerivedPct §FIX-5(4)：提示词明确允许模型用现价/昨收推算涨跌幅，推算值天然不在
+// 白名单——从数据块抽出（现价,昨收）对算出推算锚点，审计按 ±0.5pp 容差放行。
+func (t *trustedNumbers) addDerivedPct(dataCtx string) {
+	for _, m := range consultDerivedPairRe.FindAllStringSubmatch(dataCtx, -1) {
+		price, err1 := strconv.ParseFloat(m[1], 64)
+		prevClose, err2 := strconv.ParseFloat(m[2], 64)
+		if err1 != nil || err2 != nil || prevClose <= 0 {
+			continue
+		}
+		t.derivedPct = append(t.derivedPct, (price/prevClose-1)*100)
+	}
+}
+
+// reverseWordAnchors §FIX-5(3)：反向措辞保守锚——仅当模型用**正数**复述、数据侧存在同绝对值
+// **负数**、且数字前文含下列词时才放行（数据"-22200万元" ↔ 回复"净流出2.22亿元"）。
+// 反向（负数复述正数锚点）刻意不放行：数据里"涨5.67%"配"跌5.67%"的表述更可能是方向性编造。
+var reverseWordAnchors = []string{"跌", "流出", "下降", "回落", "减少", "亏损", "下挫", "下滑"}
+
+// hasReverseAnchor 只看数字前 10 个字符的近邻上下文，避免远距离词误配。
+func hasReverseAnchor(prefix string) bool {
+	r := []rune(prefix)
+	if len(r) > 10 {
+		r = r[len(r)-10:]
+	}
+	s := string(r)
+	for _, w := range reverseWordAnchors {
+		if strings.Contains(s, w) {
+			return true
+		}
+	}
+	return false
+}
+
+// approxEqual 浮点相等（相对容差 1e-6）：吸收 万↔亿 换算噪声（2.22×1e8 与 22200×1e4 尾差）。
+func approxEqual(a, b float64) bool {
+	d := a - b
+	if d < 0 {
+		d = -d
+	}
+	return d <= 1e-6*math.Max(1, math.Abs(b))
+}
+
+// setHit 集合内是否有与 val 近似相等的成员（集合规模只有几十，线性扫描即可）。
+func setHit(set map[float64]bool, val float64) bool {
+	for v := range set {
+		if approxEqual(v, val) {
+			return true
+		}
+	}
+	return false
+}
+
+// allows 判定回复中一个数字 token（类别+基础量）是否有可信出处；prefix 为该数字之前的回复文本。
+func (t *trustedNumbers) allows(cat numCat, val float64, prefix string) bool {
+	// 1) 同量纲精确命中（含单位换算归一后的相等）。
+	if setHit(t.vals[cat], val) {
+		return true
+	}
+	// 2) 裸"万/亿"量纲未知：任意类别命中即放行（"2.3万笔"截自 "2.3万" 的兼容路径）。
+	if cat == catAmbiguous {
+		for _, set := range t.vals {
+			if setHit(set, val) {
+				return true
+			}
+		}
+	}
+	// 3) 同号相反 + 反向措辞锚（保守规则，见 reverseWordAnchors 注释）。
+	if val > 0 && setHit(t.vals[cat], -val) && hasReverseAnchor(prefix) {
+		return true
+	}
+	// 4) 百分比推算容差：现价/昨收推算值 ±0.5pp 内放行（正负两种措辞都按绝对值比对）。
+	if cat == catPct {
+		for _, d := range t.derivedPct {
+			if math.Abs(val-d) <= derivedPctTolerance || math.Abs(math.Abs(val)-math.Abs(d)) <= derivedPctTolerance {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// auditNumbers 扫描模型回复中的金融数字，凡数值无可信出处（不在 trusted 集合中）即替换为数据缺失标注。
+// 仅替换带单位的金钱/数量类数字，避免误伤百分比、时间、代码等。
+func auditNumbers(reply string, trusted *trustedNumbers) string {
+	if trusted == nil || trusted.isEmpty() {
+		return reply
+	}
+	// 用正则定位全部候选数字片段；无候选则原样返回。
+	idx := auditedNumberRe.FindAllStringIndex(reply, -1)
+	if len(idx) == 0 {
+		return reply
+	}
+	// 逐段扫描：命中可信集合保留原文，否则替换为数据缺失标注。
+	var sb strings.Builder
+	sb.Grow(len(reply))
+	last := 0
+	for _, m := range idx {
+		tok := reply[m[0]:m[1]]
+		cat, val, ok := parseAuditedNumberToken(tok)
+		if ok && trusted.allows(cat, val, reply[:m[0]]) {
+			sb.WriteString(reply[last:m[1]])
+		} else {
+			sb.WriteString(reply[last:m[0]])
+			sb.WriteString("[数据缺失]")
+		}
+		last = m[1]
+	}
+	sb.WriteString(reply[last:])
+	return sb.String()
+}
+
+// consultCodeRe 从文本中提取 6 位股票代码。
+var consultCodeRe = regexp.MustCompile(`\b\d{6}\b`)
+
+// consultNoStockPrompt 专业模式下未能从消息中解析出股票时注入的提示词。
+// 引导模型：无个股数据时做定性判断＋明确数据缺口，绝不编造个股/板块的任何具体数字。
+const consultNoStockPrompt = `当前消息中未识别到明确的股票名称或 6 位代码，因此我这边没有任何该股的实时行情数据（现价/涨跌幅/主力净流入/大单明细/均线/MACD/策略信号都没有）。请你：
+1. 先向用户说明：如果要我结合实时数据做分析，需要你指明具体股票（如：卧龙电驱 600580）。
+2. 若用户是在问板块/情绪这类开放问题，你可以基于A股的一般规律做定性框架分析（例如"尾盘急拉回落常见于情绪资金抢跑""板块集体冲高回落要防情绪退潮"），也可以引用用户在问题里描述的现象来分析，但要明确标注这是"一般规律/经验判断"。
+3. 严禁编造任何个股或板块的具体数字（成交额、净流入、撤单、振幅、持仓、涨幅、收益率、期货合约价、板块内具体个股名等），数据里没有就如实说"没有数据，无法确认"。
+4. 措辞审慎，不承诺收益、不给绝对化的买卖指令。`
+
+// consultMaxStocks §FIX-6(20260919 批四)：单条咨询最多处理的股票数。
+// 每只股票至多 4 类行情外呼，且东财报价/资金流走**进程级全局 3/s 令牌桶**
+// （与实盘主行情循环共用）——不设上限时一条含数百代码的消息=阻塞行情配额数百秒
+// + 数百 KB 文本进付费 prompt。超出部分只处理前 5 只并在数据块尾部如实注明。
+const consultMaxStocks = 5
+
+// buildConsultContext 从用户消息解析提到的股票，拉取真实实时行情组装为上下文文本。
+// 返回空串表示未解析出任何股票（调用方应提示用户指明股票）。
+// 数据来源：东财 push2 实时价（含主力净流入 F162）+ 东财资金流明细 + 新浪日K/分钟K + 引擎战法信号。
+func (e *Engine) buildConsultContext(userMsg string) string {
+	// §FIX-6：按**出现顺序**收集代码并截断至前 consultMaxStocks 只（map 无序，旧实现
+	// 逐 code 全量外呼是行情配额与 prompt 体积的放大器）。
+	var order []string           // 出现顺序（截断后 ≤consultMaxStocks）
+	codes := map[string]string{} // code → name（仅用于去重与名称回查）
+	dropped := 0                 // 因超限被丢弃的代码数
+	addCode := func(code, name string) {
+		if code == "" {
+			return
+		}
+		if _, dup := codes[code]; dup {
+			return
+		}
+		if len(order) >= consultMaxStocks {
+			dropped++
+			return
+		}
+		codes[code] = name
+		order = append(order, code)
+	}
+
+	// 1. 名称 → 代码：解析文本中出现的股票名称，再清洗为代码
+	var names []string
+	if e.newsAgent != nil {
+		names = e.newsAgent.FindStocksInText(userMsg)
+		for _, c := range e.newsAgent.CleanStocks(names) {
+			parts := strings.SplitN(c, "|", 2)
+			if len(parts) != 2 || parts[0] == "" {
+				continue
+			}
+			addCode(parts[1], parts[0])
+		}
+	}
+	// 2. 文本中的纯 6 位代码
+	for _, m := range consultCodeRe.FindAllString(userMsg, -1) {
+		addCode(m, "")
+	}
+
+	if len(order) == 0 {
+		return ""
+	}
+
+	var sb strings.Builder
+	// §生产 20260916 头部语义强化：明确"本块=本次提问时刻实时抓取的最新数据"，杜绝模型把
+	// 对话历史里的旧数据误当成"手头只有的批次"（18:00 咨询实录）。
+	// §FIX-9f(20260919)：新鲜度口径必须诚实——"实时抓取"只说明取数动作发生在此刻；
+	// 非交易时段（夜间/周末/节假日）交易所返回的是最近收盘价，让模型说"最新盘中数据"
+	// 就是误导。按交易日历判定，非盘中改口"最近收盘口径"，模型据此措辞。
+	now := e.nowTime() // §FIX-9f：走引擎时钟（测试/演练可注入固定时刻），盘中判定同样受控
+	freshness := "即最新盘中实测数据，直接引用作答即可"
+	if !data.IsTradeTime(now) {
+		freshness = "当前非交易时段，以下为最近收盘/最后更新口径——请向用户说明数据截止口径，勿表述为实时盘口"
+	}
+	sb.WriteString("以下是本次提问时刻【实时抓取】的股票行情实测数据（抓取时间 " +
+		now.Format("2006-01-2 15:04:05") + "，" + freshness + "）：\n")
+	sb.WriteString("【要求】仅可引用下列提供的数据与对话历史；未提供的信息（如同板块个股、期指贴水、撤单、盘口等）如实说明" +
+		"无法获取，严禁编造净流入/成交量/涨跌/触发等任何具体数字；净流入口径=主力(超大单+大单)，东方财富；" +
+		"资金明细/净流入均为抓取当日累计口径（非盘中即时增量），引用时须带【当日累计】限定；" +
+		"如有『历史同类事件』段，其中的数字与走向均属往日发生，引用必须带发生日期，且不得当作今日行情。\n")
+
+	for _, code := range order {
+		sb.WriteString(e.buildStockBlock(code, codes[code]))
+	}
+	// §FIX-6：截断必须对用户可见——否则模型以为全量、用户以为全答。
+	if dropped > 0 {
+		sb.WriteString(fmt.Sprintf("\n（注意：本条消息共提到 %d 只股票，本轮仅处理前 %d 只，其余 %d 只未取数据，请提示用户分次提问。）\n",
+			len(order)+dropped, consultMaxStocks, dropped))
+	}
+
+	// 大盘实测块（2026-09-16 补）：上证点位+全市场涨跌家数——用户口语里的"普涨/普跌"
+	// 从此有实测依据，模型不必再说"我没有今天大盘的数据"。
+	// §修复 BREADTH-FAKE(20260920)：涨跌家数改走 GetBreadth（真实弃权语义）。GetIndexData 在
+	// 接口失败时会**伪造 1500/1500 中性值**（该函数注释已声明此设计，风险因子侧正是为此另立
+	// GetBreadth），而本块开头已声明"仅可引用下列提供的数据"——把伪造值当"大盘实测"喂给模型，
+	// 等于诱导它据假数据下"涨跌基本持平"的结论（实测 2026-09-20 东财不可达时即输出 1500/1500）。
+	// 取不到就整段不写（宁缺勿假），与全仓 GetBreadth 的口径一致。
+	// English: breadth now goes through GetBreadth (true abstention). GetIndexData deliberately
+	// fabricates a neutral 1500/1500 when its endpoint fails, and feeding that to the model as
+	// "measured market breadth" would make it reason from a fake number; when unavailable we emit
+	// no breadth clause at all instead.
+	if e.marketAPI != nil {
+		if idx, _, _, _, err := e.marketAPI.GetIndexData(); err == nil && idx > 0 {
+			sb.WriteString(fmt.Sprintf("\n—— 大盘实测 ——\n上证指数 %.2f 点", idx))
+			if up, down, berr := e.marketAPI.GetBreadth(); berr == nil {
+				sb.WriteString(fmt.Sprintf("；全市场 上涨 %d 家 / 下跌 %d 家（上涨家数显著占优=普涨）\n", up, down))
+			} else {
+				// 措辞刻意避开"数据源未返回"——该短语是 §FIX-9e 净流入守卫（e2e
+				// TestConsultNetInflowTrueZero）在全段上下文中独占的断言词，复用会让
+				// "真 0 不得误报缺数"用例假红。这里只需表达"没有就别编"。
+				sb.WriteString("；全市场涨跌家数本次未取得（请勿编造具体家数）\n")
+			}
+		}
+	}
+	// §ENH-3(20260919 批B) RAG：历史同类事件注入——此前 news_events 跨日清空，顾问没有任何
+	// "上次类似情况后来怎样"的记忆。检索严格早于本交易日、命中本轮个股代码的归档事件 top4，
+	// 总长限 600 rune 防 prompt 膨胀；仍在 ⟦DATA⟧ 边界内，反幻觉白名单自动覆盖（§FIX-2 语义不变）。
+	if e.newsAgent != nil {
+		if hits := e.newsAgent.SearchEventHistory(order, data.TradingDayDate(now), 4); len(hits) > 0 {
+			sb.WriteString("\n—— 历史同类事件（往日发生，引用必须带日期，非今日数据）——\n")
+			histBudget := 600 // rune 预算：超限即截断剩余条目（宁少注入不可撑爆上下文）
+			for _, h := range hits {
+				stocks := strings.Join(h.Event.CleanedStocks, "、")
+				if stocks == "" {
+					stocks = strings.Join(h.Event.RelatedStocks, "、")
+				}
+				line := fmt.Sprintf("- %s-%s-%s %s(%.2f) [%s]「%s」关联:%s 来源:%s\n",
+					h.Day[0:4], h.Day[4:6], h.Day[6:8],
+					h.Event.Direction, h.Event.Score, h.Event.Level,
+					h.Event.Title, stocks, h.Event.Source)
+				if n := utf8.RuneCountInString(line); n > histBudget {
+					break
+				}
+				histBudget -= utf8.RuneCountInString(line)
+				sb.WriteString(line)
+			}
+		}
+	}
+	return sb.String()
+}
+
+// consultBlockCacheTTL 咨询数据块缓存有效期（60s）：收敛外部行情调用频次，
+// 替代此前"盘中 15 分钟 429 拒绝"的粗暴限流（§生产 20260916）。
+const consultBlockCacheTTL = 60 * time.Second
+
+// consultBlockEntry 单股数据块缓存项。
+type consultBlockEntry struct {
+	text string    // 缓存的单股行情数据块文本（注入咨询 system 用）（cached quote context text）
+	at   time.Time // 写入时间（距 now < consultBlockCacheTTL 时命中缓存）（write time for TTL check）
+}
+
+// consultBlockFlight §FIX-6(20260919 批四)：同代码 single-flight 通道——并发首查时
+// 只有第一个请求穿透行情源，其余等同一个结果（旧实现 10 路并发=10 组外呼，
+// 每组至多 4 次东财请求，全挤进程级 3/s 令牌桶，把实盘行情链路一起拖慢）。
+type consultBlockFlight struct {
+	done chan struct{} // 关闭=结果就绪
+	text string        // 就绪后的数据块文本（close(done) 前写入，读方经通道同步可见）
+}
+
+// consultBlockCacheMax §FIX-6：缓存条目上限。超限写入时先清过期项，仍超限则淘汰最旧一条
+// （自用场景 50 只覆盖日常轮询面，map 无界增长问题就此封死）。
+const consultBlockCacheMax = 50
+
+// buildStockBlock 组装单只股票的实时行情数据块（含 60s 缓存 + §FIX-6 single-flight/条数上限）。
+func (e *Engine) buildStockBlock(code, name string) string {
+	e.consultBlockMu.Lock()
+	if e.consultBlockCache == nil {
+		e.consultBlockCache = map[string]consultBlockEntry{}
+	}
+	if ent, ok := e.consultBlockCache[code]; ok && time.Since(ent.at) < consultBlockCacheTTL {
+		e.consultBlockMu.Unlock()
+		return ent.text
+	}
+	// 已有同代码在途构建：挂等其结果，绝不重复穿透（single-flight）。
+	if fl, ok := e.consultFlight[code]; ok {
+		e.consultBlockMu.Unlock()
+		<-fl.done
+		return fl.text
+	}
+	fl := &consultBlockFlight{done: make(chan struct{})}
+	if e.consultFlight == nil {
+		e.consultFlight = map[string]*consultBlockFlight{}
+	}
+	e.consultFlight[code] = fl
+	e.consultBlockMu.Unlock()
+
+	load := e.buildStockBlockUncached // 生产默认：直调行情源组装
+	if e.consultBlockLoad != nil {
+		load = e.consultBlockLoad // §FIX-6 测试缝
+	}
+	text := load(code, name) // 慢调用在锁外，行情挂死不影响其他代码
+
+	e.consultBlockMu.Lock()
+	delete(e.consultFlight, code)
+	e.evictConsultBlocksLocked()
+	e.consultBlockCache[code] = consultBlockEntry{text: text, at: time.Now()}
+	e.consultBlockMu.Unlock()
+	fl.text = text
+	close(fl.done)
+	return text
+}
+
+// evictConsultBlocksLocked 缓存条数治理（调用方持 consultBlockMu）：先清 TTL 过期项，
+// 仍在上限外则按写入时间淘汰最旧。
+func (e *Engine) evictConsultBlocksLocked() {
+	for k, ent := range e.consultBlockCache {
+		if time.Since(ent.at) >= consultBlockCacheTTL {
+			delete(e.consultBlockCache, k)
+		}
+	}
+	for len(e.consultBlockCache) >= consultBlockCacheMax {
+		oldestKey, oldestAt := "", time.Now()
+		for k, ent := range e.consultBlockCache {
+			if ent.at.Before(oldestAt) {
+				oldestKey, oldestAt = k, ent.at
+			}
+		}
+		if oldestKey == "" {
+			return
+		}
+		delete(e.consultBlockCache, oldestKey)
+	}
+}
+
+// buildStockBlockUncached 组装单只股票的实时行情数据块（无缓存，直调行情源）。
+func (e *Engine) buildStockBlockUncached(code, name string) string {
+	var b strings.Builder
+	b.WriteString(fmt.Sprintf("\n—— 股票 %s", code))
+	if name != "" {
+		b.WriteString(" " + name)
+	}
+	b.WriteString(" ——\n")
+
+	// 实时报价（东财优先，含主力净流入 f62；主循环高频路径仍走 GetRealtimeQuote 的 S4 新浪→腾讯→东财链）
+	// English: consult prefers EastMoney so the main-force net-inflow (f62) is injected; the hot main loop
+	// keeps the §S4 Sina→Tencent→EastMoney chain via GetRealtimeQuote.
+	if e.marketAPI == nil {
+		b.WriteString("实时行情数据源未初始化。\n")
+		return b.String()
+	}
+	si, err := e.marketAPI.GetRealtimeQuoteWithFlow(code)
+	if err == nil && si != nil && si.Price > 0 {
+		if si.Name != "" {
+			name = si.Name
+		}
+		// §FIX-5(1)：今开/最高/最低/昨收统一带"元"单位（旧格式无单位，模型规范复述
+		// "今开 36.10 元"反被审计当编造替换）；涨跌幅同时输出带符号叙述锚"（即下跌5.67%）"，
+		// 让"涨跌幅-5.67%"与"跌幅5.67%"两种常见复述形态天然进白名单。
+		dirWord := "上涨"
+		if si.ChangePct < 0 {
+			dirWord = "下跌"
+		}
+		b.WriteString(fmt.Sprintf("现价 %.2f元 涨跌幅%.2f%%（即%s%.2f%%） 今开%.2f元 最高%.2f元 最低%.2f元 昨收%.2f元\n",
+			si.Price, si.ChangePct, dirWord, math.Abs(si.ChangePct), si.Open, si.High, si.Low, si.Close))
+		// §CONSULT-UX(20260921)：成交量同时给"股"与"手"双口径。auditNumbers 只认白名单里的
+		// 原样数字——模型把"股"改写成"手"会被判为编造、整段隐成"[数据缺失]"。给双口径后模型
+		// 任选其一原样照抄即可过关（与 llm.go 的"数字引用铁律"提示词配套）。
+		b.WriteString(fmt.Sprintf("成交量 %.0f股（约%.0f手） 成交额%.0f元 换手率 %.2f%%\n",
+			si.Volume, si.Volume/100, si.Amount, si.Turnover))
+		// §FIX-9e(20260919)：判"缺数"必须看 HasFlow——东财真返回 0（买卖完全对冲）是合法
+		// 实测值，旧口径 NetInflow==0 一律说"数据源未返回"，诱导模型答"没有数据"。
+		if si.HasFlow {
+			b.WriteString(fmt.Sprintf("主力净流入 %.2f万元\n", si.NetInflow/1e4))
+		} else {
+			b.WriteString("主力净流入: 数据源未返回（无法获取该字段，请勿编造）\n")
+		}
+	} else {
+		b.WriteString("实时行情获取失败。\n")
+	}
+
+	// 所属行业（东财 f127）§修复 SECTOR-CTX(20260920)：此前数据块完全不含行业/板块字段，
+	// 模型被问"这股票什么板块"时只能凭自身记忆作答——实测 2026-09-20 光智科技(300489)被答成
+	// "智能驾驶、光伏"（实际东财行业=光学光电子），且这类错误是本块内唯一不被 auditNumbers
+	// 拦下的编造形态（审计只查数字，不查板块名）。补实测依据后模型有据可依、无需猜测。
+	if ind := e.marketAPI.GetStockIndustry(code); ind != "" {
+		b.WriteString(fmt.Sprintf("所属行业: %s（东方财富行业分类；如需概念板块请说明该口径未提供）\n", ind))
+	}
+
+	// 资金流明细（超大/大/中/小单，均以万元计）
+	// §修复 EM-FFLOW(20260920)：必须读 **净额字段**（*Net）而非 In−Out——东财 fflow 只返回
+	// 净额、In/Out 恒为 0，按 In−Out 算会恒得 0.00 万（这一行此前就是恒 0 的）。
+	if cf, err := e.marketAPI.GetStockMoneyFlow(code); err == nil && cf != nil {
+		b.WriteString(fmt.Sprintf("资金明细: 超大单净流入%.0f万 大单净流入%.0f万 中单净流入%.0f万 小单净流入%.0f万\n",
+			cf.SuperLargeNet/1e4, cf.LargeNet/1e4, cf.MediumNet/1e4, cf.SmallNet/1e4))
+	}
+
+	// 日K：当日振幅、MA5/MA10、近5日量能
+	if kl, err := e.marketAPI.GetSinaKLine(code, 30); err == nil && len(kl) > 0 {
+		last := kl[len(kl)-1]
+		amp := 0.0
+		if last.Close > 0 {
+			amp = (last.High - last.Low) / last.Close * 100
+		}
+		b.WriteString(fmt.Sprintf("日K(最新一根 %s): 振幅%.2f%% 收%.2f 高%.2f 低%.2f\n",
+			last.Date.Format("2006-01-02"), amp, last.Close, last.High, last.Low))
+		if len(kl) >= 10 {
+			b.WriteString(fmt.Sprintf("MA5=%.2f MA10=%.2f %s\n",
+				consultMA(kl[len(kl)-5:]), consultMA(kl[len(kl)-10:]), consultMATrend(kl)))
+		}
+		// 近5日量能
+		avg5 := consultMAVolume(kl)
+		// §CONSULT-UX(20260921)：近5日量能同样给双口径，与上一条成交量口径一致，避免模型复述时单位改写触发"[数据缺失]"。
+		b.WriteString(fmt.Sprintf("近5日平均成交量 %.0f股（约%.0f手），最新一根量 %.0f股（约%.0f手）\n", avg5, avg5/100, last.Volume, last.Volume/100))
+	}
+
+	// 分钟K（5分钟）MACD 状态
+	if minKL, err := e.marketAPI.GetSinaMinuteKLine(code, 5, 48); err == nil && len(minKL) >= 2 {
+		macd := data.CalcMACD(minKL)
+		status := "空头"
+		if macd.Bar > 0 {
+			status = "多头(红柱)"
+		} else if macd.Bar == 0 {
+			status = "零轴"
+		}
+		b.WriteString(fmt.Sprintf("5分钟MACD: DIF=%.4f DEA=%.4f BAR=%.4f(%s)\n",
+			macd.DIF, macd.DEA, macd.Bar, status))
+	}
+
+	// 引擎战法信号（该股是否已触发某战法）
+	sigFound := false
+	if e.agg != nil {
+		if dash := e.agg.Current(); dash != nil {
+			for _, sig := range dash.FinalSignals {
+				if sig.Code == code {
+					b.WriteString(fmt.Sprintf("策略信号: [%s] %s %s %s 触发价%.2f 理由:%s\n",
+						sig.Strategy, sig.Direction, sig.Action, sig.Name, sig.Price, sig.Reason))
+					sigFound = true
+				}
+			}
+		}
+	}
+	// 该股当日信号批次（含触发时间），供模型据实判断"今天是否触发过量化信号、几点、什么性质"。
+	if !sigFound {
+		e.mu.RLock()
+		records := e.signalRecords
+		e.mu.RUnlock()
+		for _, rec := range records {
+			for _, sg := range rec.Signals {
+				if sg.Code == code {
+					b.WriteString(fmt.Sprintf("今日信号批次: %s触发 [%s] %s %s %s 触发价%.2f\n",
+						rec.ProcessTime.Format("15:04"), sg.Strategy, sg.Direction, sg.Action, sg.Name, sg.Price))
+				}
+			}
+		}
+	}
+
+	return b.String()
+}
+
+// consultMA 计算一段收盘价的简单平均。
+func consultMA(kl []data.KLine) float64 {
+	if len(kl) == 0 {
+		return 0
+	}
+	var sum float64
+	for _, k := range kl {
+		sum += k.Close
+	}
+	return sum / float64(len(kl))
+}
+
+// consultMAVolume 计算最近5根日K的平均成交量（不足则取全部）。
+func consultMAVolume(kl []data.KLine) float64 {
+	if len(kl) == 0 {
+		return 0
+	}
+	n := 5
+	if len(kl) < n {
+		n = len(kl)
+	}
+	var sum float64
+	for _, k := range kl[len(kl)-n:] {
+		sum += k.Volume
+	}
+	return sum / float64(n)
+}
+
+// consultMATrend 判断 MA5 相对 MA10 的多头/空头排列。
+func consultMATrend(kl []data.KLine) string {
+	if len(kl) < 10 {
+		return ""
+	}
+	ma5 := consultMA(kl[len(kl)-5:])
+	ma10 := consultMA(kl[len(kl)-10:])
+	if ma5 > ma10 {
+		return "均线多头排列"
+	}
+	return "均线空头排列"
+}
+
+// consultStoreFor 返回指定账号的咨询历史存储（§GAP2-W2 I-1 私有状态按账号寻址）：
+// accountsRoot 注入时落 accounts/<uid>/consult_history.json（各自目录互不可见）。
+// §FIX-10(20260919 批四)：登录用户遇 accountsRoot 未注入时**返回 nil 拒绝服务**，
+// 不再回退引擎级共享 store——共享回退=A 的提问会出现在 B 的历史里（串号），
+// 宁可 503 不可串号。匿名（userID==""，旧单机形态）仍走共享 store 保持兼容。
+// English: returns nil (caller must refuse) instead of silently sharing one store
+// across logged-in users when accountsRoot is missing; anonymous legacy mode keeps the shared store.
+func (e *Engine) consultStoreFor(userID string) *data.ConsultStore {
+	if userID == "" {
+		return e.consultStore
+	}
+	e.mu.RLock()
+	root := e.accountsRoot
+	e.mu.RUnlock()
+	if root == "" {
+		return nil // §FIX-10：隔离不可用 → 拒绝，不共享
+	}
+	// 懒加载：每个账号首次访问时创建独立咨询存储并缓存（锁内完成建目录+初始化）。
+	e.consultMu.Lock()
+	defer e.consultMu.Unlock()
+	if st, ok := e.consultByUser[userID]; ok {
+		return st
+	}
+	if e.consultByUser == nil {
+		e.consultByUser = map[string]*data.ConsultStore{}
+	}
+	dir := filepath.Join(root, userID)
+	_ = os.MkdirAll(dir, 0755)
+	st := data.NewConsultStore(filepath.Join(dir, "consult_history.json"))
+	e.consultByUser[userID] = st
+	return st
+}
+
+// GetConsultHistory 返回指定账号的当日咨询对话历史（§GAP2-W2 账户隔离）。
+// §FIX-10：隔离不可用（nil store）时返回空列表——读不到别人的，也读不到自己的，宁缺不漏。
+func (e *Engine) GetConsultHistoryFor(userID string) []data.ConsultMessage {
+	st := e.consultStoreFor(userID)
+	if st == nil {
+		return nil
+	}
+	return st.List()
+}
+
+// ClearConsultHistory 清空指定账号的当日咨询对话历史（§GAP2-W2 只清本人的）。
+// §FIX-10：nil store（隔离不可用）时为空操作（无历史可清，也绝不触碰共享存储）。
+func (e *Engine) ClearConsultHistoryFor(userID string) {
+	if st := e.consultStoreFor(userID); st != nil {
+		st.Clear()
+	}
+}
+
+// buildPolicyRetaliationSignals 将政策反制事件转为可展示信号：
+//  1. 事件去重后持久化到 confrontationStore（仅当日首次出现）；
+//  2. 生成消息中心"政策反制"提示（利空方向，提醒关注受影响板块）；
+//  3. 返回合成后的 NewsEvent（Source="政策反制"，供事件流/资讯展示）。
+func (e *Engine) buildPolicyRetaliationSignals(events []data.ConfrontationEvent) []newsagent.NewsEvent {
+	if len(events) == 0 {
+		return nil
+	}
+	var out []newsagent.NewsEvent
+	for _, ev := range events {
+		if e.confrontStore != nil {
+			if e.confrontStore.HasTitle(ev.Title) {
+				continue // 当日已处理过，跳过避免重复提醒
+			}
+			e.confrontStore.Append(ev)
+		}
+		// 方向转带符号分数：利空 -0.75 / 利好 +0.75（高强度涉外政策事件）
+		score := 0.75
+		if ev.Direction == "利空" {
+			score = -0.75
+		}
+		newsEv := newsagent.NewsEvent{
+			Title:       ev.Title,
+			Content:     ev.Content,
+			Datetime:    ev.Datetime,
+			Source:      "政策反制",
+			Level:       "宏观",
+			Direction:   ev.Direction,
+			Score:       score,
+			Sectors:     ev.Sectors,
+			ImpactLevel: ev.Impact,
+			EventType:   "政策",
+			Urgency:     "紧急",
+			Reason:      "涉外政策反制事件，直接影响相关板块",
+		}
+		out = append(out, newsEv)
+
+		// 消息中心提示：提醒关注受影响板块（利空/利好方向由事件决定）
+		if e.msgStore != nil {
+			e.msgStore.Sync([]data.MessageItem{{
+				ID:          "confront@" + ev.Title,
+				Code:        "",
+				Name:        "",
+				Level:       "政策反制",
+				Action:      "提示",
+				Strategy:    "政策反制",
+				Time:        nowTimeString(),
+				Title:       "政策反制事件",
+				Body:        ev.Title + "（影响板块：" + strings.Join(ev.Sectors, "、") + "）",
+				Direction:   ev.Direction,
+				GeneratedAt: time.Now(),
+			}})
+		}
+	}
+	return out
+}
+
+// nowTimeString 返回当前时间的 HH:MM:SS 字符串，用于消息中心提示的时间戳。
+func nowTimeString() string {
+	return time.Now().Format("15:04:05")
+}
+
+// syncMessages 汇总本轮交易信号（做多/做空）、止盈止损告警与持仓提示，合并进消息存储（按稳定键去重）。
+// （syncMessages merges this round's trade signals (long/short), profit-loss alerts and holding notices into the
+// message store, deduplicated by stable keys.)）
+// bearSectors/bearStocks 为本轮利空板块与利空个股，用于扫出"命中利空板块的持仓"并提醒卖出。
+// quotes 为调用方可复用的实时行情（5s fetcher 快照），trade 信号优先取用，缺失走 新浪批量→单查 回退。
+func (e *Engine) syncMessages(bull, bear, alertSignals []combat_agent.Signal, sr *strategy_engine.StrategyResult, quotes map[string]*data.StockInfo) {
+	if e.msgStore == nil {
+		return
+	}
+	items := make([]data.MessageItem, 0, len(bull)+len(bear)+len(alertSignals)+2)
+	// 交易信号：做多/做空，消息中心级别为"交易信号"，Action 按其方向定为 买入/卖出
+	// （Trade signals: long/short, message level is "交易信号", Action mapped to 买入/卖出 by direction）
+	trade := make([]combat_agent.Signal, 0, len(bull)+len(bear))
+	trade = append(trade, bull...)
+	trade = append(trade, bear...)
+	// 预取 trade 信号的实时行情：5s 快照 → 新浪批量（一次请求）→ 实时单查回退，避免单查被限流时消息里"现价:0.00/无涨跌幅"。
+	// English: prefetch live quotes for trade signals once — 5s snapshot → Sina batch (one call) → per-code fallback,
+	// so rate-limited single lookups can't leave messages with 现价:0.00 or a missing 涨跌幅.
+	// 快照已有行情直接采用，未命中的代码列入待查队列。
+	live := make(map[string]*data.StockInfo, len(trade))
+	if len(trade) > 0 && e.marketAPI != nil {
+		var miss []string
+		if quotes != nil {
+			for _, sig := range trade {
+				if si := quotes[sig.Code]; si != nil && si.Price > 0 {
+					live[sig.Code] = si
+				} else {
+					miss = append(miss, sig.Code)
+				}
+			}
+		} else {
+			for _, sig := range trade {
+				miss = append(miss, sig.Code)
+			}
+		}
+		// 批量接口优先；仍缺的代码单查兜底。
+		if len(miss) > 0 {
+			for code, si := range e.marketAPI.GetSinaQuotes(miss) {
+				if si != nil && si.Price > 0 {
+					live[code] = si
+				}
+			}
+			for _, sig := range trade {
+				if _, ok := live[sig.Code]; ok {
+					continue
+				}
+				if si, err := e.marketAPI.GetRealtimeQuote(sig.Code); err == nil && si != nil && si.Price > 0 {
+					live[sig.Code] = si
+				}
+			}
+		}
+	}
+	for _, sig := range trade {
+		direction := sig.Direction
+		if direction == "" {
+			if sig.Action == "买入" || sig.Action == "buy" {
+				direction = "做多"
+			} else {
+				direction = "做空"
+			}
+		}
+		action := "买入"
+		if direction == "做空" {
+			action = "卖出"
+		} else if sig.Action != "" {
+			action = sig.Action
+		}
+		// C3 自动纸面开仓已由「两本账合一」镜像取代（阶段1.2）：模拟盘 fillLocked 成交后经
+		// SetMirror 回调写 report 持仓账（registry.paperMirror），paper 为唯一真实账本，
+		// rpt 由镜像保持一致 → CheckPositionsExits 离场路径照常激活，且不再双账本漂移。
+		// English: C3 auto-paper-open is superseded by the unified-book mirror (unified books): after a
+		// paper fillLocked, the SetMirror callback writes the report holding book (registry.paperMirror);
+		// paper is the single source of truth and rpt stays consistent via mirroring — the exit path
+		// activates as before, with no more dual-book drift.
+		// §SIGNAL_CONTROLLER 20260917（裁决④，docs/SIGNAL_CONTROLLER_PLAN_20260917.md）：
+		// 实盘下单不再从消息链路触发——流程引擎在本消息落盘前经 dispatchLive 让信号控制器
+		// live 通道统一裁定（战法白名单/个股·板块黑名单/持续性确认窗），仅 pass 进 autoPlace。
+		// 消息中心照常记录全部翻转信号并在正文标注非 pass 原因，"提醒了为何没成交"同屏可见
+		// （此前 §DIAG-0921 的静默门节流日志就此升级为结构化裁定）。
+		// English: live ordering moved out of the messaging path — only controller-passed buys are
+		// placed (upstream dispatchLive); messages always record, annotated with hold/block reason.
+		gateNote := ""
+		if direction == "做多" && action == "买入" {
+			if d := e.liveDecisionOf(sig); d != nil && d.Verdict != signalctl.VerdictPass {
+				tag := "拦截"
+				if d.Verdict == signalctl.VerdictHold {
+					tag = "待确认"
+				}
+				gateNote = fmt.Sprintf(" ｜⛔%s:%s", tag, d.Reason)
+			}
+		}
+		// 现价与涨跌幅：优先实时行情（比信号触发价更新），行情失败则回退信号触发价，避免消息里"现价:0.00"
+		// English: prefer the live quote for the price and change% (fresher than the trigger price); fall
+		// back to the trigger price when the quote fails, so the message never reads "现价:0.00".
+		price := sig.Price
+		changePct := 0.0
+		hasQuote := false
+		if si := live[sig.Code]; si != nil && si.Price > 0 {
+			price = si.Price
+			changePct = si.ChangePct
+			hasQuote = true
+		}
+		body := fmt.Sprintf("%s 战法:%s 置信度:%.0f%% 现价:%.2f %s", action, sig.Strategy, sig.Confidence*100, price, sig.Reason)
+		if hasQuote {
+			// 有实时行情时在现价后补涨跌幅（%+.2f 自带 +/- 符号）
+			// English: when a live quote exists, append the change% after the price (%+.2f adds the +/- sign).
+			body = fmt.Sprintf("%s 战法:%s 置信度:%.0f%% 现价:%.2f 涨跌幅:%+.2f%% %s",
+				action, sig.Strategy, sig.Confidence*100, price, changePct, sig.Reason)
+		}
+		body += gateNote
+		// 交易信号入消息中心：ID 含 code+战法保证去重，方向/行动供前端状态色展示。
+		items = append(items, data.MessageItem{
+			ID:          sig.Code + "@交易信号@" + sig.Strategy,
+			Code:        sig.Code,
+			Name:        sig.Name,
+			Level:       "交易信号",
+			Action:      action,
+			Strategy:    sig.Strategy,
+			Time:        sig.GeneratedAt.Format("15:04:05"),
+			Title:       fmt.Sprintf("交易信号 %s %s", sig.Code, sig.Name),
+			Body:        body,
+			Direction:   direction,
+			GeneratedAt: sig.GeneratedAt,
+		})
+	}
+	// 提醒/止损类信号转消息：级别默认"策略信号"，ID 用 code+级别 保证去重。
+	for _, sig := range alertSignals {
+		level := sig.AlertType
+		if level == "" {
+			level = "策略信号"
+		}
+		items = append(items, data.MessageItem{
+			ID:          sig.Code + "@" + level,
+			Code:        sig.Code,
+			Name:        sig.Name,
+			Level:       level,
+			Action:      sig.Action,
+			Strategy:    sig.Strategy,
+			Time:        sig.GeneratedAt.Format("15:04:05"),
+			Title:       fmt.Sprintf("%s %s", level, sig.Code),
+			Body:        sig.Reason,
+			Direction:   sig.Direction,
+			GeneratedAt: sig.GeneratedAt,
+		})
+	}
+
+	// §GAP2-W2 账户隔离（I-3）：持仓派生消息改为逐成员私有生成——
+	// 旧实现用无过滤 rpt.HeldPositions()/List() 把【所有人】的持仓止盈止损并进共享消息中心，
+	// 朋友能看到 owner 的仓位与成本，反之亦然。现在公共区只保留交易信号/策略信号（D3 共享口径），
+	// 私有区按 memberIDs 逐账号用 ListFor(uid) 生成，Scope=uid 且 ID 加 "u<uid>|" 前缀防跨账号碰撞。
+	// English: §GAP2-W2 — position-derived alerts are now generated per member from ListFor(uid) with
+	// Scope=uid and a "u<uid>|" ID prefix; public items (trade/policy signals) stay shared per D3.
+	if sr != nil {
+		bearCodes := bearHitCodes(sr)
+		now := time.Now()
+		for _, uid := range e.memberIDs() {
+			for _, pos := range e.rpt.HeldPositionsFor(uid) {
+				if bearCodes[pos.Code] {
+					items = append(items, data.MessageItem{
+						ID:          fmt.Sprintf("u%s|bearhold@%s", uid, pos.Code),
+						Scope:       uid,
+						Code:        pos.Code,
+						Name:        pos.Name,
+						Level:       "利空提示",
+						Action:      "卖出",
+						Strategy:    pos.Strategy,
+						Time:        now.Format("15:04:05"),
+						Title:       fmt.Sprintf("利空提示 %s", pos.Code),
+						Body:        fmt.Sprintf("持仓 %s(%s) 命中利空板块,建议考虑减仓/卖出", pos.Name, pos.Code),
+						Direction:   "利空",
+						GeneratedAt: now,
+					})
+				}
+			}
+			for _, l := range e.rpt.ListFor(uid) {
+				if l.Status != "持仓中" && l.ExitAt == nil {
+					continue
+				}
+				pct := ""
+				if l.ProfitPct != nil {
+					pct = fmt.Sprintf("%.1f%%", *l.ProfitPct)
+				}
+				items = append(items, data.MessageItem{
+					ID:          fmt.Sprintf("u%s|hold@%s", uid, l.SignalID),
+					Scope:       uid,
+					Code:        l.Code,
+					Name:        orName(l.Name, e.authoritativeName(l.Code), l.Code),
+					Level:       "持仓提示",
+					Action:      l.Status,
+					Strategy:    l.Strategy,
+					Time:        l.EntryAt.Format("15:04:05"),
+					Title:       fmt.Sprintf("%s %s", l.Status, l.Code),
+					Body:        fmt.Sprintf("策略:%s 入场:%.2f %s", l.Strategy, l.EntryPrice, pct),
+					Direction:   l.Direction,
+					GeneratedAt: l.EntryAt,
+				})
+			}
+		}
+	}
+	// §MARKET_RISK_GATE P5 前瞻预警：未来 N 天内有高影响事件（交割日/CPI/FOMC/NFP）时出一条"临近事件"提醒，
+	// 消息中心按 macro-warning@日期@类型 稳定键每日去重（Sync 每轮 upsert，同键覆盖不累积）。
+	// English: P5 forward warning — when a high-impact event (delivery/CPI/FOMC/NFP) is within N days, emit a
+	// "upcoming event" reminder; the message center dedups daily by a stable macro-warning@date@level key.
+	if e.combatAgent != nil {
+		if wmsg, wkey, wHit := e.combatAgent.ForwardMacroWarning(time.Now()); wHit {
+			items = append(items, data.MessageItem{
+				ID:          wkey,
+				Level:       "风险提示",
+				Title:       "宏观事件前瞻",
+				Body:        wmsg,
+				Time:        time.Now().Format("15:04:05"),
+				GeneratedAt: time.Now(),
+			})
+		}
+	}
+	// P1 强提醒：本轮新产生的 清仓/止损 告警，首次出现时走桌面通知 + Webhook 推送。
+	// 依据消息去重键（code@level）判新：已在消息中心存在则说明前几轮已提醒过，不再重复推送。
+	// English: strong P1 push — brand-new close-out / stop-loss alerts get a desktop + Webhook
+	// notification on first appearance; deduped by the message-center key so repeats stay quiet.
+	e.pushCriticalAlerts(items)
+	e.pushSSEMessages(items)
+	e.msgStore.Sync(items)
+}
+
+// messageVisibleExisting 构建指定作用域的"已存在键"集合（判新去重用）：
+// 公共项对照公共可见集，私有项对照该账号可见集。
+// English: builds the existing-key set for one item's scope (public vs that user's visible view).
+func (e *Engine) messageVisibleExisting(scope string) map[string]bool {
+	existing := make(map[string]bool)
+	for _, m := range e.msgStore.ListVisible(scope) {
+		existing[m.ID] = true
+	}
+	return existing
+}
+
+// pushSSEMessages 把本轮新增的关键消息经 SSE 定向推送（§GAP2-W2 按作用域路由）：
+// 私有消息（Scope=uid）只推给该账号；公共消息扇出给本引擎服务的全部账号前端。
+// 仅推送止盈/止损/清仓/交易信号等关键级别，且只在消息中心首次出现时推送（按作用域判新）。
+// English: routes critical messages over SSE — private items go to their owner only; public ones fan
+// out to every account served by this engine; deduped per scope on first appearance.
+func (e *Engine) pushSSEMessages(items []data.MessageItem) {
+	if e.sse == nil {
+		return
+	}
+	members := e.memberIDs()
+	// 所有级别的新消息首次出现时都经 SSE 推给前端——消息中心页据此实时刷新；
+	// 系统弹窗仍由前端按关键级别（止盈/止损/清仓/交易信号）自行过滤，互不冲突。
+	// English: push every newly-appearing message (any level) over SSE so the message
+	// center reloads immediately; the frontend still gatekeeps system notifications by level.
+	for _, it := range items {
+		// 去重键：ID 优先，空则回退 code+级别；已可见（历史存在）的消息不再重复推送。
+		key := it.ID
+		if key == "" {
+			key = it.Code + "@" + it.Level
+		}
+		if e.messageVisibleExisting(it.Scope)[key] {
+			continue
+		}
+		payload := map[string]interface{}{
+			"type": "message",
+			"item": it,
+		}
+		if it.Scope != "" {
+			e.sse.BroadcastTo(it.Scope, payload)
+			continue
+		}
+		// 公共关键消息：扇出全部成员；无成员信息时回退 userID（独占引擎旧语义）
+		if len(members) == 0 {
+			e.sse.BroadcastTo(e.userID, payload)
+			continue
+		}
+		for _, uid := range members {
+			e.sse.BroadcastTo(uid, payload)
+		}
+	}
+}
+
+// pushCriticalAlerts 对本次待同步消息中新增的关键告警（清仓/止损/交易信号/止盈）推送桌面+Webhook+外部推送网关强提醒。
+// 仅推送消息中心尚未存在的键，避免 5s 循环重复轰炸；未配置推送器时直接跳过。
+// 推送级别与 SSE 定向推送一致（止盈/止损/清仓/交易信号），让 APK 后台/离线也能收到交易信号与关键通知。
+// （pushCriticalAlerts pushes desktop + Webhook + external-push-gateway alerts for newly-added critical
+// messages (close-out / stop-loss / trade signals / take-profit) whose dedup key is not yet in the
+// message center, so the 5s loop stays quiet on repeats; no-op when no notifier is wired. The level
+// set matches the SSE push so APK background/offline still receives trade signals and key alerts.）
+func (e *Engine) pushCriticalAlerts(items []data.MessageItem) {
+	e.mu.RLock()
+	nt := e.notifier
+	e.mu.RUnlock()
+	if nt == nil {
+		return
+	}
+	for _, it := range items {
+		switch it.Level {
+		// 减仓=统一纪律"首触止损未深破→半平"，属保护性动作，同样需要强提醒
+		// English: 减仓/trim (first SL touch without deep breach → half out) is protective, alert too.
+		case "清仓", "止损", "止盈", "减仓", "交易信号":
+		default:
+			continue
+		}
+		key := it.ID
+		if key == "" {
+			key = it.Code + "@" + it.Level
+		}
+		// §GAP2-W2 按作用域判新：私有告警对照本人可见集，公共告警对照公共集——
+		// 避免不同账号的同键消息互相"顶掉"首次推送时机。
+		if e.messageVisibleExisting(it.Scope)[key] {
+			continue
+		}
+		title := fmt.Sprintf("%s %s(%s)", it.Level, it.Name, it.Code)
+		msg := notify.Message{
+			Level:   notify.LevelHigh,
+			Title:   title,
+			Content: it.Body,
+			// §GAP2-W2 别名路由：私有告警推给归属账号的设备别名（quant_<uid>），
+			// 公共信号保持默认别名（owner 手机）——朋友的止损提醒不再打到 owner 手机上。
+			Alias: it.Scope,
+		}
+		// §M8（2026-09-22 修复批）：Push 已内聚 WS/Webhook/手机网关三路扇出，
+		// 此处不再直调 PushGateway——原「Push + PushGateway」双调用在同一路内聚后必双发，
+		// 去重设计见 internal/notify/notify.go Push 注释。
+		nt.Push(msg)
+	}
+}
+
+// syncLiveAdviceAlerts 把实盘持仓分析建议（统一纪律裁决 Source=discipline + 常规卖出侧）中的
+// 止损/止盈/减仓 转入消息中心，并触发 P1 桌面/Webhook/外部推送网关强提醒——**与 auto_sell 开关无关**：
+// 用户关闭自动交易（mode≠auto 或 auto_sell=false）时，实时持仓触发止盈/止损/减仓判定仍能收到强提醒，
+// 及时手动处理；自动模式开启时也同步下发"已触发自动卖出"便于核对成交。
+// 去重：私有作用域（Scope=主账号）+ 交易日键（u<uid>|discipline@码@类@日）——纪律在观察窗结算后
+// 每轮重复输出断言（auto 关闭、持仓未动）,靠交易日键阻止 5s 循环重复轰炸；跨交易日仍未处理的持仓
+// 会在新交易日再次提醒（与退出动作同 home 消息，同键刷新正文）。与主循环纸面告警键（code@级别）
+// 不冲突。正文携带 现价/盈亏/回撤 + 自动卖出开关状态，行情缺失（RefPrice=0）时按 §P2#25 不伪造现价。
+// English: routes live-position advices whose action is 止损/止盈/减仓 — from the unified-discipline
+// engine (Source=discipline) and the regular sell-side — into the message center and fires P1 desktop /
+// Webhook / push-gateway alerts regardless of the auto_sell switch: with auto trading off, a live holding
+// tripping TP/SL/trim still gets a strong reminder to act manually; when auto is on it also announces
+// "已触发自动卖出" so fills can be double-checked. Dedup: private scope (Scope=primary account) plus a
+// trading-day key — the discipline re-asserts its decision every round once settled (holding untouched
+// with auto off), so the day key blocks 5s-loop spam while re-alerting on a fresh trading day when the
+// position is still unhandled. No key clash with main-loop paper alerts (code@level). The body carries
+// price / P&L / drawdown and the auto-sell state; missing quotes (RefPrice=0) never fake a price (§P2#25).
+func (e *Engine) syncLiveAdviceAlerts(sendTo string, advices []trading.PositionAdvice, autoActive bool) {
+	if e.msgStore == nil || len(advices) == 0 {
+		return
+	}
+	now := time.Now()
+	day := data.TradingDayDate(now)
+	idPrefix := "discipline@"
+	if sendTo != "" {
+		idPrefix = "u" + sendTo + "|discipline@"
+	}
+	items := make([]data.MessageItem, 0, len(advices))
+	for _, a := range advices {
+		switch a.Action {
+		case "止损", "止盈", "减仓":
+		default:
+			continue // 加仓/格局/持有 不提醒
+		}
+		name := a.Name
+		if name == "" {
+			name = a.Code
+		}
+		var b strings.Builder
+		b.WriteString("[")
+		if a.RefPrice > 0 {
+			fmt.Fprintf(&b, "现价:%.2f", a.RefPrice)
+			if math.Abs(a.ProfitPct) > 0.001 {
+				fmt.Fprintf(&b, " 盈亏:%+.2f%%", a.ProfitPct)
+			}
+			// §P4 缺陷4：只在真实回撤（现价低于阶段高点）时渲染——现价新高时
+			// DrawdownPct≥0 顶出「回撤:+0.64%」纯语义噪声，强化"这不是止盈止损点位"的困惑。
+			// English: P4 defect-4 — render drawdown only for a real pullback; a positive value at a new
+			// stage high was pure semantic noise.
+			if a.DrawdownPct < -0.001 {
+				fmt.Fprintf(&b, " 回撤:%+.2f%%", a.DrawdownPct)
+			}
+		} else {
+			b.WriteString("现价未知")
+		}
+		b.WriteString("]")
+		if a.Reason != "" {
+			b.WriteString(" ")
+			b.WriteString(a.Reason)
+		}
+		// 自动卖出开关状态提示：让用户立即知道系统是否已代执行/需手动处理
+		// English: surface auto-sell state so the user knows whether the system already acted.
+		if autoActive {
+			b.WriteString(" 【已触发自动卖出】")
+		} else {
+			b.WriteString(" 【自动卖出未开启，请手动处理】")
+		}
+		direction := "利空"
+		if a.Action == "止盈" {
+			direction = "利好"
+		}
+		items = append(items, data.MessageItem{
+			ID:          fmt.Sprintf("%s%s@%s@%s", idPrefix, a.Code, a.Action, day),
+			Scope:       sendTo,
+			Code:        a.Code,
+			Name:        name,
+			Level:       a.Action,
+			Action:      "卖出",
+			Strategy:    a.Strategy,
+			Time:        a.GeneratedAt.Format("15:04:05"),
+			Title:       fmt.Sprintf("%s %s", a.Action, a.Name),
+			Body:        b.String(),
+			Direction:   direction,
+			GeneratedAt: a.GeneratedAt,
+		})
+	}
+	if len(items) == 0 {
+		return
+	}
+	// 与 syncMessages 同序：先判新推送（P1 桌面/Webhook + SSE），后合并入库（下一轮同键即"已存在"静默）
+	// English: same order as syncMessages — push first (P1 + SSE), then persist; next round the key exists so it stays quiet.
+	e.pushCriticalAlerts(items)
+	e.pushSSEMessages(items)
+	e.msgStore.Sync(items)
+}
+
+// SetScanner 设置板块扫描器（线程安全，透传给策略引擎）。
+// §E8 修复：锁内只换引用，子模块同步放锁外——与 SetEmotionConfig/SetNotifier 的快照模式一致，
+// 避免持 e.mu 调外部对象形成锁序隐患。
+func (e *Engine) SetScanner(scanner *data.SectorScanner) {
+	e.mu.Lock()
+	e.scanner = scanner
+	e.mu.Unlock()
+	e.strategy.SetScanner(scanner)
+}
+
+// SetSectorSource 设置同花顺出口（板块名单/行情表）。
+func (e *Engine) SetSectorSource(ths *data.THSClient) {
+	e.mu.Lock()
+	e.ths = ths
+	e.mu.Unlock()
+}
+
+// LLMClient 返回当前 LLM 客户端（可空）。
+func (e *Engine) LLMClient() *llm.Client {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	return e.llmClient
+}
+
+// SetClock 注入时钟（e2e 固定交易时段用）；nil 恢复真实时间。
+// 修复：主循环/近实时循环的"盘前抑制信号"门控此前读真实 time.Now——
+// 凌晨跑 e2e 时全部信号被抑制（日期/时刻漂移型 flaky 根因）。
+func (e *Engine) SetClock(fn func() time.Time) {
+	e.mu.Lock()
+	e.clockFn = fn
+	e.mu.Unlock()
+}
+
+// nowTime 引擎统一时钟读取。
+func (e *Engine) nowTime() time.Time {
+	e.mu.RLock()
+	fn := e.clockFn
+	e.mu.RUnlock()
+	if fn == nil {
+		return time.Now()
+	}
+	return fn()
+}
+
+// SetLLMClient 热重建 LLM 客户端（前端改配置时调用）。§E8 同上：锁外透传。
+func (e *Engine) SetLLMClient(c *llm.Client) {
+	e.mu.Lock()
+	e.llmClient = c
+	e.mu.Unlock()
+	e.newsAgent.SetLLMClient(c)
+}
+
+// ── 利好/利空开关 ──
+
+// SetLongEnabled 设置做多开关状态（线程安全，前端控制面板调用）。
+func (e *Engine) SetLongEnabled(v bool) {
+	e.mu.Lock()
+	e.longEnabled = v
+	e.mu.Unlock()
+}
+
+// LongEnabled 返回做多开关是否开启。
+func (e *Engine) LongEnabled() bool {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	return e.longEnabled
+}
+
+// SetShortEnabled 设置做空开关状态。
+// 关闭（切回仅做多）时顺带清除消息中心残留的做空方向消息（Level/Direction=做空），
+// 避免仅做多界面误展示历史或测试产生的做空条目；不记录墓碑，重新开启后可正常同步。
+func (e *Engine) SetShortEnabled(v bool) {
+	e.mu.Lock()
+	e.shortEnabled = v
+	e.mu.Unlock()
+	if !v && e.msgStore != nil {
+		n := e.msgStore.PurgeShortLevel()
+		log.Printf("[engine] 做空已关闭, 已清除消息中心 %d 条做空残留", n)
+	}
+}
+
+// ShortEnabled 返回做空开关是否开启。
+func (e *Engine) ShortEnabled() bool {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	return e.shortEnabled
+}
+
+// DashboardData 返回当前看板快照（引擎内部 agg 的 Current()）。多账号模式下各引擎独立看板。
+// English: returns the current dashboard snapshot from this engine's agg. In multi-account mode
+// each engine has its own agg, so results are per-account.
+func (e *Engine) DashboardData() *display.DashboardData {
+	return e.agg.Current()
+}
+
+// GetDebugInfo 返回最近一轮流水线的调试数据。
+func (e *Engine) GetDebugInfo() *newsagent.DebugInfo {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	return e.debugInfo
+}
+
+// produceOut 新闻流水线的中间产物，供 Run 后续环节复用（策略评估/D1评分/调试快照）。
+type produceOut struct {
+	rawNews []data.NewsItem        // 原始新闻（标题党校正后）
+	st0     newsagent.Stage0Result // Stage0 归因分类结果
+	events  []newsagent.NewsEvent  // 全量已打标事件（含中性/一般）
+	valid   []newsagent.NewsEvent  // 阈值过滤+聚簇+衰减后的有效事件（进引擎）
+	timing  NewsTiming             // 本轮新闻流水线分段耗时（e2e 实速模拟观测）
+}
+
+// NewsTiming 新闻生产子环节耗时（均为实测墙钟时长，含该环节内 LLM/网络等待）。
+type NewsTiming struct {
+	Sectors time.Duration // 板块名单刷新
+	Fetch   time.Duration // 原始新闻拉取
+	Stage0  time.Duration // Stage0 归因分类(LLM)
+	Stage2  time.Duration // Stage2 深度分析(LLM) + 事件构建
+	Events  time.Duration // 聚簇/衰减/验真/传播
+}
+
+// RunTiming 一轮 engine.Run 的完整分段耗时（e2e 实速模拟 + 性能观测）。
+// 各字段为实测墙钟时长，单位纳秒；聚合关系见报告输出。
+type RunTiming struct {
+	Total       time.Duration // 整轮总耗时
+	News        NewsTiming    // 0-6 新闻流水线
+	Evaluate    time.Duration // 7  策略评估(归因+分流+评分池+行情)
+	HotRec      time.Duration // 7b 热点板块记录固化
+	D1          time.Duration // 8  D1 批量评分(LLM)
+	PE          time.Duration // 8a PE 预取
+	Pool        time.Duration // 8b 涨停池+新闻简报
+	Verify      time.Duration // 9  板块验证
+	HotPool     time.Duration // 9b 热点池更新(成分股并监控池)
+	MergeSector time.Duration // 9c 板块→个股归因
+	Signals     time.Duration // 10-12 出信号(做多/涨停增强/做空/个股直入)
+	Tracker     time.Duration // 12b 跟踪池收尾
+	Alerts      time.Duration // 13 持仓止盈/止损提醒
+	Agg         time.Duration // 14 看板更新+信号日志
+	SSE         time.Duration // 16 SSE 广播
+}
+
+// produceNews 执行新闻流水线：拉取→Stage0 归因→Stage2 深度分析→固化→阈值→聚簇→衰减→归因验真传播。
+// 独立成方法以便盘前以异步 goroutine 触发，避免 LLM 同步重试阻塞主循环。
+func (e *Engine) produceNews(ctx context.Context, since time.Time) produceOut {
+	out := produceOut{}
+
+	// 0. 刷新同花顺板块名单到 scanner（FindSectorsByNames/归因校验依赖真实板块名单）
+	_stepSectors := time.Now()
+	e.refreshSectors()
+	out.timing.Sectors = time.Since(_stepSectors)
+
+	// 1. 拉取原始新闻（新抓入未归因队列）+ 历史未归因新闻（LLM 上一轮失败留队重试）
+	// 合并去重后统一跑 Stage0/Stage2：成功归因的从队列移除并标记 seen，失败留队下一轮重试，
+	// 保证"昨夜新闻因 LLM 慢/失败"也能在盘前多轮内补上归因。
+	_stepFetch := time.Now()
+	newNews := e.newsAgent.Fetch(ctx, since)
+	pending := e.newsAgent.UnattributedItems()
+	out.rawNews = dedupNews(append(newNews, pending...))
+	out.timing.Fetch = time.Since(_stepFetch)
+
+	if len(out.rawNews) == 0 {
+		log.Printf("[engine] 无新新闻且无待归因新闻 (since=%s), 本轮仅执行打分", since.Format("01-02 15:04"))
+		return out
+	}
+
+	// 2. Stage0 归因分类：个股 / 板块 / 一般（合并垃圾过滤+价值初筛+标题党复核）
+	_stepStage0 := time.Now()
+	out.st0 = e.newsAgent.Stage0(out.rawNews)
+	out.timing.Stage0 = time.Since(_stepStage0)
+	if out.st0.Err != nil {
+		// Stage0 失败（如 LLM 未配置/连不通）：整批不归一般（避免误判丢失），
+		// 全部标记 FailedIdx 留未归因队列，下一轮轮询重新调 LLM；仅记录原因便于排障。
+		// English: Stage0 failure (e.g. LLM unconfigured/unreachable): the whole batch is NOT misclassified as
+		// general news; all items stay in the unattributed queue (FailedIdx) and are re-attributed next round
+		// once the LLM is reachable.
+		log.Printf("[engine][news漏斗] Stage0失败, 原始%d条留待重试(入未归因队列), 无LLM分析: %v", len(out.rawNews), out.st0.Err)
+	}
+	log.Printf("[engine][news漏斗] 原始=%d 个股=%d 板块=%d IPO=%d 一般=%d (板块material保留=%d)",
+		len(out.rawNews), len(out.st0.StockIdx), len(out.st0.SectorIdx), len(out.st0.IpoIdx), len(out.st0.GeneralIdx), len(out.st0.Material))
+
+	// 2b. 标题党修复：LLM 校正标题应用到原文（供 Stage2 分析、事件与展示使用）
+	for i, t := range out.st0.CorrectedTitle {
+		if i >= 0 && i < len(out.rawNews) && t != "" {
+			out.rawNews[i].Title = t
+		}
+	}
+
+	// 3. 收集全量事件
+	_stepStage2 := time.Now()
+	// 本轮归因失败的新闻（留未归因队列，下轮重试）
+	var failedNews []data.NewsItem
+	// 3a. 个股新闻：跳过 Stage1，直接 Stage2 深度分析
+	if len(out.st0.StockIdx) > 0 {
+		stockItems := pickItems(out.rawNews, out.st0.StockIdx)
+		evs, failed := e.newsAgent.Stage2(stockItems)
+		out.events = append(out.events, evs...)
+		failedNews = append(failedNews, failed...)
+	}
+
+	// 3b. 板块新闻：material 价值初筛（合并进 Stage0 单次调用）→ Stage2 深度分析
+	if len(out.st0.SectorIdx) > 0 {
+		sectorItems := pickItems(out.rawNews, out.st0.SectorIdx)
+		var kept []int
+		for j := range sectorItems {
+			if out.st0.Material[out.st0.SectorIdx[j]] {
+				kept = append(kept, j)
+			}
+		}
+		if len(kept) > 0 {
+			evs, failed := e.newsAgent.Stage2(pickItems(sectorItems, kept))
+			out.events = append(out.events, evs...)
+			failedNews = append(failedNews, failed...)
+		}
+	}
+
+	// 3c. IPO 新闻：直构事件（不走 LLM）
+	if len(out.st0.IpoIdx) > 0 {
+		ipoItems := pickItems(out.rawNews, out.st0.IpoIdx)
+		out.events = append(out.events, e.newsAgent.BuildIPOFeedEvents(ipoItems)...)
+	}
+
+	// 3d. 一般新闻：不入引擎，仅由 SaveEvents 保存展示
+
+	// 4. 注入 IPO 日历事件
+	out.events = append(out.events, e.newsAgent.BuildIPOEvents()...)
+
+	// 4a. IPO 启动板块事件：即将上市新股（宇树科技等）LLM 分析产业链价值传导，
+	// 归因出热点板块与上下游影响个股（卧龙电驱/三花智控），灌入板块监测与打分池。
+	// （IPO boot events: LLM chain analysis for soon-to-list IPOs turns their listing into a hot sector
+	// with upstream/downstream beneficiaries, feeding sector monitoring and the scoring pool.）
+	out.events = append(out.events, e.newsAgent.BuildIPOBootEvents()...)
+
+	// 4b. 政策反制事件：从涉外政策新闻关键词识别（直构，不走 LLM），并入事件流
+	retEvents := e.buildPolicyRetaliationSignals(e.newsAgent.DeriveRetaliation(out.rawNews))
+	out.events = append(out.events, retEvents...)
+
+	// 5. 持久化全量事件供 /api/news 展示（含中性/一般新闻）
+	e.newsAgent.SaveEvents(out.events)
+	log.Printf("[engine][news漏斗] 事件共=%d (>=0.25落盘), 个股+板块+IPO来源", len(out.events))
+
+	// 5b. 固化 Stage2 带价值事件（|score|≥0.25 且方向=利好/利空，含关联个股），跨刷新/跨日持续存在。
+	// 同板块+同方向新事件覆盖（分数取最新）；随下一交易日到期清理。
+	e.newsAgent.SaveFrozen(out.events)
+
+	// 6. 阈值过滤：仅 |score| ≥ 0.50 进引擎（弱/中性丢弃）
+	out.valid = filterThreshold(out.events, 0.50)
+	// 6a. 固化事件回填：本轮没有产出有效事件时，回填昨日/上一轮固化的事件，避免弱刷新或 LLM
+	// 偶发失败把已固化的利好/利空事件（及关联个股）直接打没。正常连产场景未复用避免重复。
+	if len(out.valid) == 0 {
+		frozen := e.newsAgent.FrozenEvents()
+		if len(frozen) > 0 {
+			out.valid = filterThreshold(frozen, 0.50)
+			if len(out.valid) > 0 {
+				log.Printf("[engine][news漏斗] 本轮无新有效事件, 回填固化 %d 条保底", len(out.valid))
+			}
+		}
+	}
+	log.Printf("[engine][news漏斗] 有效=%d (阈值0.5, 含固化回填)", len(out.valid))
+	if len(out.valid) > 0 {
+		// 6b. 事件聚簇：同板块/同方向的重复新闻合并为单条（去重避免刷屏）
+		out.valid = clusterEvents(out.valid)
+
+		// 6c. 事件衰减：同板块同方向事件在窗口内重复出现时按 0.5^(h/4) 降权
+		e.applyEventDecay(out.valid)
+
+		// 6c2. 新闻时效衰减（§P1.1）：事件年龄按类型半衰期降权，过期事件 Score→0
+		// 由下方 6d 阈值过滤清除（开关 Enhance.NewsDecay 关闭时零操作）。
+		// English: news time-decay (P1.1). Applied at the single choke point so all downstream
+		// consumers (hotspot pool / sector attribution / D1 / tactics) see consistent decaying
+		// scores; expired events drop out via the 6d re-filter.
+		e.applyAgeDecay(out.valid)
+
+		// 6c3. 新闻影响率加权（§P2.1）：按历史影响中位修正置信度（开关关闭时零操作）。
+		e.applyNewsImpact(out.valid)
+
+		// 6d. 衰减后再次阈值过滤（重复事件降权后可掉出 0.5 线）
+		out.valid = filterThreshold(out.valid, 0.50)
+		log.Printf("[engine][news漏斗] 聚簇+衰减后再滤 -> 有效=%d", len(out.valid))
+		if len(out.valid) > 0 {
+			// 6e. 板块验真回填：剔除 LLM 幻觉板块名（命中真实板块名单才保留）
+			e.verifySectorAttribution(out.valid)
+
+			// 6f. 板块→个股事件级传播：板块 top 成分股注入 RelatedStocks 进个股监测池
+			e.propagateSectorToStocks(out.valid)
+		}
+	}
+	if len(out.valid) == 0 {
+		log.Printf("[engine] 无有效事件(|score|>=0.5), 本轮仅执行打分")
+	}
+	logDroppedFromPool(out.events, out.valid)
+	// 6g. 归因完成判定并从未归因队列移除：
+	//    - 成功归因 = 产出事件（含中性，只要 Stage2 分析完成）或 Stage0 明确分类为一般/IPO；
+	//    - 失败留队 = Stage0 FailedIdx（LLM 重试耗尽未判定）或 Stage2 failedItems（深度分析失败）。
+	// 用标题匹配把成功者移出 pending（MarkAttributedTitles），失败者由下一轮盘前/盘中重试，
+	// 避免"LLM 慢/失败一次 = 昨夜有价值的新闻永久丢失"。
+	e.markAttributedFromProduce(out, failedNews)
+	// 阶段2(深度分析 LLM)+事件构建总耗时（含聚簇/衰减/验真/传播）
+	out.timing.Stage2 = time.Since(_stepStage2)
+	out.timing.Events = out.timing.Stage2
+	return out
+}
+
+// markAttributedFromProduce 从未归因队列移除本轮成功归因的新闻（保留失败者留队重试）。
+// 成功集合 = 产出事件新闻 ∪ Stage0 判为一般/IPO 的新闻；失败集合 = Stage0 FailedIdx ∪ Stage2 failedItems。
+// （markAttributedFromProduce removes this round's successfully-attributed news from the unattributed queue,
+// keeping failures queued for retry. Success = emitted events ∪ Stage0-classified general/IPO; failure =
+// Stage0 FailedIdx ∪ Stage2 failedItems.）
+func (e *Engine) markAttributedFromProduce(out produceOut, failedNews []data.NewsItem) {
+	failed := make(map[string]bool, len(failedNews))
+	for _, it := range failedNews {
+		failed[it.Title] = true
+	}
+	for _, f := range out.st0.FailedIdx {
+		if f >= 0 && f < len(out.rawNews) {
+			failed[out.rawNews[f].Title] = true
+		}
+	}
+	// 事件标题集合（成功归因）
+	success := make(map[string]bool)
+	for _, ev := range out.events {
+		success[ev.Title] = true
+	}
+	// Stage0 判为一般（Official=false 等明确分类）或 IPO 的新闻也算归因完成（无需 LLM 深度分析）
+	for _, i := range out.st0.GeneralIdx {
+		if i >= 0 && i < len(out.rawNews) {
+			success[out.rawNews[i].Title] = true
+		}
+	}
+	for _, i := range out.st0.IpoIdx {
+		if i >= 0 && i < len(out.rawNews) {
+			success[out.rawNews[i].Title] = true
+		}
+	}
+	// 移除成功者中不冲突的（失败优先：失败标题覆盖成功标题）
+	for t := range failed {
+		delete(success, t)
+	}
+	if len(success) > 0 {
+		e.newsAgent.MarkAttributedTitles(success)
+	}
+}
+
+// dedupNews 按标题去重合并两批新闻（保留先出现者，通常新抓在前、历史未归因在后）。
+// （dedupNews merges two news slices by title, keeping the first occurrence (new fetches first, then pending).）
+func dedupNews(items []data.NewsItem) []data.NewsItem {
+	if len(items) <= 1 {
+		return items
+	}
+	// 按标题去重：保留首次出现的新闻，空标题直接丢弃。
+	seen := make(map[string]bool, len(items))
+	out := make([]data.NewsItem, 0, len(items))
+	for _, it := range items {
+		if it.Title == "" || seen[it.Title] {
+			continue
+		}
+		seen[it.Title] = true
+		out = append(out, it)
+	}
+	return out
+}
+
+// logDroppedFromPool 可观测旁路：消息中心已落盘展示(≥0.25)的事件，若未进入 ≥0.5 有效事件池
+// （因而不会参与 D1 打分 / N 形信号），打印事件标题、关联个股与丢弃原因，便于排查"打了利好却没进 D1"。
+// 返回被丢弃计数（供测试断言）。
+func logDroppedFromPool(shown, valid []newsagent.NewsEvent) int {
+	if len(shown) == 0 {
+		return 0
+	}
+	keep := make(map[string]bool, len(valid))
+	for _, ev := range valid {
+		keep[ev.Title] = true
+	}
+	var dropped int
+	var sb strings.Builder
+	for _, ev := range shown {
+		if absScore(ev.Score) < 0.25 {
+			continue // 未落盘展示的不在考察范围
+		}
+		if keep[ev.Title] {
+			continue
+		}
+		dropped++
+		code := ""
+		if len(ev.RelatedStocks) > 0 {
+			code = ev.RelatedStocks[0]
+		}
+		sb.WriteString(fmt.Sprintf("[%s|%s|score=%+.2f|%s] %s\n", ev.Level, ev.Direction, ev.Score, code, ev.Title))
+	}
+	if dropped > 0 {
+		log.Printf("[观察] 消息中心已展示但未进打分池 %d 条(请逐条核对 Level/关联股是否落入打分池):\n%s", dropped, sb.String())
+	}
+	return dropped
+}
+
+// TryAsyncRun 尝试异步触发一次引擎 run（盘前用）：已有异步 run 进行中则返回 false 跳过本轮，
+// 避免多 goroutine 并发重入导致状态互相覆盖；其余时段仍由主循环同步调用 Run。
+// §E1 修复：goroutine 加 panic recovery——主流水线（LLM 解析/策略扫描/板块传播）任何未预期
+// panic 此前会直接杀死整个交易进程，现降级为跳过本轮并留完整堆栈日志。
+// English: E1 fix — the async Run goroutine now recovers from panics (full stack logged) instead of
+// crashing the whole trading process; the cycle is simply skipped and asyncBusy is still released.
+func (e *Engine) TryAsyncRun(ctx context.Context, since time.Time) bool {
+	if !atomic.CompareAndSwapInt32(&e.asyncBusy, 0, 1) {
+		return false
+	}
+	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				metrics.PanicRecovered() // §R4-9 panic 恢复计数进指标面
+				log.Printf("[engine] 异步Run panic(本轮跳过): %v\n%s", r, debug.Stack())
+			}
+			atomic.StoreInt32(&e.asyncBusy, 0)
+		}()
+		e.Run(ctx, since)
+	}()
+	return true
+}
+
+// AsyncIdle 返回异步引擎是否空闲（上一轮异步 Run 已完成）。
+// 供盘前主循环"跑完即排下一轮"轮询，替代固定 5min 间隔。
+// （AsyncIdle reports whether the async engine is idle (previous async Run finished), for the premarket
+// main loop to trigger the next round immediately instead of waiting a fixed 5 minutes.）
+func (e *Engine) AsyncIdle() bool {
+	return atomic.LoadInt32(&e.asyncBusy) == 0
+}
+
+// HasNewNews 委托新闻代理做轻量"新新闻到达"探测（无新闻代理则视为无新料），
+// 供盘中调度器决定是否立即触发新一轮扫描（而非等固定 5min 心跳）。
+// （HasNewNews delegates to the news agent's cheap "new news arrived" probe, telling the intraday
+// scheduler whether to trigger a fresh round immediately instead of waiting on the fixed heartbeat.）
+func (e *Engine) HasNewNews() bool {
+	if e.newsAgent == nil {
+		return false
+	}
+	return e.newsAgent.HasNewNews()
+}
+
+// Run 驱动一轮完整流水线：拉取 → Stage0 → Stage1/2 → 阈值过滤 → 归因 → 板块验证 → 战法扫描 → 信号聚合 → 广播。
+// since 为本次追回起始时间，由调用方（主循环）根据市场时段计算。
+func (e *Engine) Run(ctx context.Context, since time.Time) *strategy_engine.StrategyResult {
+	t0 := time.Now()
+	// §修复 P2#23：主循环同样先做交易日滚动清空（双通道互补，防止仅近实时循环在休市期未跑时漏清）。
+	// English: P2#23 — also roll over the day stores at the top of the main loop (belt-and-braces with the
+	// scoring loop, in case the near-realtime channel idled over a holiday/weekend).
+	e.RolloverDayStores()
+	// 同步本账号配置（做多/做空开关 + 战法参数），保证账号内各设备一致
+	// English: sync this account's config (long/short toggles + strategy params) for cross-device consistency.
+	e.syncAccountConfig()
+	// §MARKET_RISK_GATE P6：每日一次校准宏观日历真实发布日（进程级去重、失败静默降级、非阻塞主流程）。
+	e.calibrateMacroCalendarOnceToday()
+
+	// 0-6. 新闻流水线：拉取→Stage0/1/2→固化→阈值→聚簇→衰减→归因验真传播
+	pOut := e.produceNews(ctx, since)
+	rawNews, st0, events, valid := pOut.rawNews, pOut.st0, pOut.events, pOut.valid
+
+	// 6g. 新热点立马进池：新闻归因一产出有效事件，立即归因出板块 → 验证 → 更新 5s 实时监控池，
+	// 不等主循环末尾。这样归因出板块成分股的瞬间就能被近实时循环盯上（减少"板块已热但个股迟迟不入池"）。
+	// 与 9b 的 updateHotPool 幂等（相同板块重复写入无害）。
+	// English: push fresh hotspots into the watch pool immediately after attribution, without waiting for
+	// the round's end, so sector constituents are picked up by the near-realtime loop at once (idempotent
+	// with the later updateHotPool at step 9b).
+	e.pushFreshHotspots(valid)
+
+	// 7. 策略评估：归因 + 分流 + 评分池 + 行情数据（无事件时仅覆盖 持仓+自选 打分池）
+	// §P1-2 多账号隔离：持仓/自选按本账号过滤（共享引擎且 userID 为空时回退全局并集）。
+	positions := e.rpt.HeldPositionCodesFor(e.userID)
+	if e.userID == "" {
+		positions = e.rpt.HeldPositionCodes()
+	}
+	// §SHORT-1 持仓集合：做空战法 sell 信号仅对持仓股发出（非持仓降级 watch 规避提示）。
+	// §SHORT-2 并入全账号纸面持仓：纸面账本持有的也要出 sell 才能走自动卖出（决策②）。
+	heldSet := make(map[string]bool, len(positions))
+	for _, c := range positions {
+		heldSet[c] = true
+	}
+	if e.paperHeldCodes != nil {
+		for _, c := range e.paperHeldCodes() {
+			heldSet[c] = true
+		}
+	}
+	watchlist := e.wlMgr.List(e.userID)
+	if e.userID == "" {
+		watchlist = e.wlMgr.All()
+	}
+	_stepEval := time.Now()
+	sr := e.strategy.Evaluate(ctx, valid, positions, watchlist)
+	_evalT := time.Since(_stepEval)
+
+	// 7b. 固化本轮热点板块记录（同花顺 top-20 匹配后，供前端展示历史）
+	_stepHotRec := time.Now()
+	e.captureHotRecord(sr)
+	_hotRecT := time.Since(_stepHotRec)
+
+	td := data.TradingDayDate(time.Now())
+
+	// 8b. 当日涨停池 + 事件新闻简报（龙头识别 / 涨停分类 / 预期差检测）
+	// §MARKET_RISK_GATE P0：主源经协调器路由为 hithink（新同花顺）优先、东财永远兜底。
+	_stepPool := time.Now()
+	pool, poolSrc, poolErr := e.fetchRiskPool()
+	if poolErr != nil {
+		log.Printf("[engine] 涨停池拉取失败(源=%s): %v", poolSrc, poolErr)
+	}
+	// §P2.2 板块联动观察：识别当日龙头（Enhance.SectorLinkage 开启时；关闭零操作）。
+	e.sectorLinkageObserve(pool)
+	// §MARKET_RISK_GATE P1/P2：为情绪纠偏与状态机装配真实市场广度/炸板率/指数趋势。
+	// 涨跌家数取不到时 up/down=0 → 情绪纠偏弃权、上涨占比=NaN；炸板池仅 hithink（无源=NaN 弃权）。
+	// English: P1/P2 wiring — assemble real breadth / break-rate / index trend for emotion correction
+	// and the state machine. A failed breadth fetch yields up/down=0 (correction abstains, upRatio=NaN);
+	// the break pool is hithink-only (no source → NaN abstain), never a fabricated neutral.
+	stateOn := e.enhanceFlag(func(c config.EnhanceConfig) bool { return c.MarketState })
+	riskBrUp, riskBrDown, riskBrValid := 0, 0, false
+	if e.emotionConfigured() || stateOn {
+		riskBrUp, riskBrDown, riskBrValid = e.riskBreadth()
+	}
+	riskUpRatio := math.NaN()
+	if riskBrValid && riskBrUp+riskBrDown > 0 {
+		riskUpRatio = float64(riskBrUp) / float64(riskBrUp+riskBrDown)
+	}
+	riskBreakRate, riskMA20, riskMA60 := math.NaN(), math.NaN(), math.NaN()
+	if stateOn {
+		riskBreakRate = e.riskBreakRate(len(pool))
+		riskMA20, riskMA60 = e.indexMASlopes()
+	}
+	// §P2.3 市场状态机观察：由涨停池 + 真实广度/炸板/指数斜率装配快照（缺失项 NaN 弃权）。开关关闭零操作。
+	// English: §P2.3 market-state observation fed from the pool plus real breadth/break/index slope (NaN abstains).
+	e.MarketStateObserve(len(pool), maxLadder(pool), riskBreakRate, riskUpRatio, riskMA20, riskMA60)
+	// 事件简报取当日全量已打标事件（比本轮 valid 更全：个股级事件即使本轮未过阈值也可关联信号标题）
+	// English: build news briefs from today's full attributed-event store (richer than this round's `valid`,
+	// so individual-stock events below this round's threshold can still title D1 events on their signals).
+	newsBriefs := newsBriefsByCode(e.newsAgent.AllEvents())
+	_poolT := time.Since(_stepPool)
+
+	// 8c. 情绪阶段（供 N 形评分硬闸）+ 8a/8b 持续打分输出容器
+	// §E2 修复：emotionCfg/llmClient 与热更新写方（SetEmotionConfig/SetLLMClient）构成数据竞争，
+	// 统一改为 RLock 快照后使用。
+	e.mu.RLock()
+	emotionCfg := e.emotionCfg
+	llmClient := e.llmClient
+	e.mu.RUnlock()
+	emotionPhase := ""
+	if emotionCfg != nil {
+		emotionPhase = data.DetectEmotionPhaseV2(pool, riskBrUp, riskBrDown, emotionCfg)
+	}
+	e.mu.Lock()
+	e.lastEmotionPhase = emotionPhase
+	// FIX#13 缓存本轮利空归因，供近实时实盘建议（pushRealAdvice→BearishAttributionAlerts）复用：
+	// 实盘持仓命中利空板块/利空个股 → advice Action=止损 → autoExecuteRealSells 自动全平。
+	// English: FIX#13 cache this round's bearish attributions for the near-realtime real-book advice,
+	// so a live holding hit by a bear sector/stock yields a stop-loss advice that auto-closes.
+	e.lastBearReasons = bearHitReasons(sr)
+	e.mu.Unlock()
+
+	// §MARKET_RISK_GATE P3 风险档合成：情绪相位 + 市场状态（关=空弃权）+ 真实上涨占比 + 宏观事件三源合一，
+	// 下发 combat_agent 统一收紧做多，并缓存到引擎供 SSE 徽标/自动买谨慎层/持仓预警读取（单一真相源）。
+	// English: P3 risk-tier synthesis — emotion phase + market state (empty=abstain) + real up-ratio + macro
+	// events, pushed to the combat agent to tighten longs and cached on the engine for the SSE badge /
+	// auto-buy caution / held alerts (single source of truth).
+	e.mu.RLock()
+	mState := e.lastMarketState
+	e.mu.RUnlock()
+	if e.combatAgent != nil {
+		riskTier, riskReasons := e.combatAgent.ComputeAndSetRiskTier(emotionPhase, mState, riskUpRatio)
+		e.mu.Lock()
+		e.lastRiskTier, e.lastRiskReasons = riskTier, riskReasons
+		e.mu.Unlock()
+		if riskTier != combat_agent.RiskTierNone {
+			log.Printf("[engine] §风险档=%s 原因=%v（情绪=%s 状态=%s 上涨占比=%.0f%%）",
+				riskTier, riskReasons, emotionPhase, mState, riskUpRatio*100)
+		}
+		// §P8 日级留痕：每交易日一条最新风险档快照，落研究库供分组回测/复盘（进程级每日去重）。
+		e.persistRiskDailyToday(store.MarketRiskDailyRow{
+			TradeDate:    td,
+			Emotion:      emotionPhase,
+			MarketState:  mState,
+			RiskTier:     riskTier,
+			Reasons:      strings.Join(riskReasons, "+"),
+			UpRatio:      nanPtr(riskUpRatio),
+			BreakRate:    nanPtr(riskBreakRate),
+			LimitUpCount: len(pool),
+			LadderHeight: maxLadder(pool),
+		})
+	}
+
+	stockScores := make(map[string]combat_agent.StockScores)
+
+	// 9. 板块验证（开关控制），结果同时用于战法扫描与看板展示
+	_stepVerify := time.Now()
+	var verifiedBull, verifiedBear []sector_agent.VerifiedSector
+	if e.LongEnabled() {
+		verifiedBull = e.sectorAgent.Verify(sr.HotSectors)
+		// 板块解码/归因失败降级检测：输入有热点板块却验证出 0 个，说明 LLM/板块解析异常，
+		// 板块默认退化为中性(无信号)。记告警 + 计入降级计数，保证日志可见而非静默吞掉。
+		if len(sr.HotSectors) > 0 && len(verifiedBull) == 0 {
+			e.recordLLMDegrade(fmt.Sprintf("板块验真失败: 输入%d个利好板块验证为0(解码/归因异常, 默认中性无信号)", len(sr.HotSectors)), len(sr.HotSectors))
+		}
+	}
+	if e.ShortEnabled() {
+		verifiedBear = e.sectorAgent.Verify(sr.BearSectors)
+		if len(sr.BearSectors) > 0 && len(verifiedBear) == 0 {
+			e.recordLLMDegrade(fmt.Sprintf("板块验真失败: 输入%d个利空板块验证为0(解码/归因异常, 默认中性无信号)", len(sr.BearSectors)), len(sr.BearSectors))
+		}
+	}
+	_verifyT := time.Since(_stepVerify)
+
+	// 9b. 验证通过的板块成分股并入 5s 实时监控池（fetcher 新浪批量拉取，热点股随板块轮换）
+	_stepHotPool := time.Now()
+	e.updateHotPool(verifiedBull, verifiedBear)
+	_hotPoolT := time.Since(_stepHotPool)
+
+	// 9c. 板块→个股归因：热点板块 top 成分股并入打分池 + 行情。
+	// 修复"板块利好只有板块、没有个股"：此前成分股不在 sr.MarketData 里，
+	// ScanLong 遍历 sector.Stocks 时 md==nil 直接丢弃 → 板块永远归因不到个股。
+	// 现在 D1 与板块利好/利空事件分完全解耦：不再用 SectorHot.Score 直接当 D1，
+	// 而是把成分股并入 ScoringPool、由随后的 D1 batch 统一 LLM 打分；
+	// 板块事件标题经 eventMap 注入 D1 评分上下文，供 LLM 合理核定。
+	// English: sector→stock attribution merges verified-bull top constituents into the scoring pool +
+	// market data. D1 is fully decoupled from the sector bull/bear event score: constituents join the pool
+	// and the following D1 batch grades them via LLM, with the sector event title injected as D1 context.
+	_stepMerge := time.Now()
+	peScores := make(map[string]float64, len(sr.ScoringPool))
+	eventMap := e.mergeSectorStocksIntoScores(ctx, sr, verifiedBull, verifiedBear, peScores)
+	_mergeT := time.Since(_stepMerge)
+
+	// 8. D1 评分（扩展后的打分池个股：新闻/持仓/自选 + 板块成分股 + LLM重试队列）。
+	// 板块事件标题一并注入 D1 评分上下文（个股不在新闻点名里也能按板块事件合理打分）；
+	// LLM 失败/漏项不兜底（不回退上一轮、不归0占位）：标记 RetryPending 并入重试队列，
+	// 下轮随打分池重新调 LLM，避免断链归零。D1 与板块利好/利空事件分解耦，独立 40 分制。
+	// English: D1 batch scores the expanded pool (news/holdings/watchlist + sector constituents + the LLM
+	// retry queue). Sector event titles are injected into D1 context so non-news-named constituents still
+	// grade fairly. LLM failures are NEVER padded (no prior-round fallback, no plain-0 placeholder): they are
+	// marked RetryPending and merged back into the retry queue for a fresh LLM call next round.
+	_stepD1 := time.Now()
+	d1Scorer := combat_agent.NewD1Scorer(llmClient, "")
+	e.mu.RLock()
+	retries := e.d1MaxRetries
+	maxTokens := e.d1MaxTokens
+	e.mu.RUnlock()
+	d1Scorer.SetMaxRetries(retries)
+	d1Scorer.SetMaxTokens(maxTokens)
+	e.mu.RLock()
+	retryQueue := make([]string, 0, len(e.d1RetryQueue))
+	for code := range e.d1RetryQueue {
+		retryQueue = append(retryQueue, code)
+	}
+	e.mu.RUnlock()
+	// 重试队列并入本轮打分池：失败股下轮重新走 LLM，不回退、不丢弃。
+	// English: merge the retry queue into this round's pool so failed stocks are re-scored via LLM.
+	if len(retryQueue) > 0 {
+		inPool := make(map[string]bool, len(sr.ScoringPool))
+		for _, c := range sr.ScoringPool {
+			inPool[c] = true
+		}
+		for _, c := range retryQueue {
+			if !inPool[c] {
+				sr.ScoringPool = append(sr.ScoringPool, c)
+			}
+		}
+		log.Printf("[engine] D1重试队列%d只并入本轮打分池", len(retryQueue))
+	}
+	d1Scorer.SetSectorEvents(eventMap)
+	// §信号速度 S1：增量 D1 —— 只对"有新事件/缺分/待重试"的个股调 LLM，其余复用上一轮评分。
+	// 事件签名（EventSignature）= 命中该股新闻事件 Datetime+Title 排序拼接 + 板块事件标题；
+	// 签名未变 → 直接复用 lastD1Scores，避免每轮全池 56 只重复调 LLM（主循环耗时主因）。
+	// English: §speed S1 — incremental D1: only re-score codes with new events / missing scores / pending
+	// retries; the rest reuse the previous round's score. Signature = matched news "Datetime|Title" (sorted)
+	// plus sector event title; unchanged signature → reuse, cutting per-round LLM calls from full-pool to new-only.
+	e.mu.RLock()
+	prevScores := e.lastD1Scores
+	prevSig := e.d1ScoredSig
+	e.mu.RUnlock()
+	// 遍历打分池：计算每只个股本次事件签名，与上一轮相同则复用旧分（不加进待评列表）。
+	toScore := make([]string, 0, len(sr.ScoringPool))
+	reuse := make(map[string]combat_agent.D1Score, len(sr.ScoringPool))
+	sigNow := make(map[string]string, len(sr.ScoringPool))
+	for _, code := range sr.ScoringPool {
+		sig := combat_agent.EventSignature(code, sr.MarketData[code], valid, eventMap[code])
+		sigNow[code] = sig
+		if prev, ok := prevScores[code]; ok && !prev.RetryPending && prevSig[code] == sig {
+			reuse[code] = prev
+			continue
+		}
+		toScore = append(toScore, code)
+	}
+	d1Scores := d1Scorer.BatchScore(toScore, valid, sr.MarketData)
+	for code, sc := range reuse {
+		d1Scores[code] = sc
+	}
+	log.Printf("[engine] D1增量: 全池%d只 → 复用%d只(无新事件) 重评%d只", len(sr.ScoringPool), len(reuse), len(toScore))
+	// 记录本轮评分时的事件签名（供下轮增量复用判定；离池个股签名一并清理防无限增长）
+	e.mu.Lock()
+	e.d1ScoredSig = sigNow
+	e.mu.Unlock()
+	// 收集 LLM 失败待重试个股：并入重试队列（下轮重调 LLM），并清理已成功个股。
+	// English: collect RetryPending stocks into the retry queue (re-scored next round); drop the resolved ones.
+	nextRetry := make(map[string]bool)
+	for code, d := range d1Scores {
+		if d.RetryPending {
+			nextRetry[code] = true
+		}
+	}
+	// LLM 评分失败降级检测：失败个股本轮无 D1 分(等价于中性占位 0 分)，记告警 + 计入降级计数，
+	// 保证日志可见（而非静默置 0），失败股并入下轮重试队列继续尝试真实 LLM 评分。
+	if len(nextRetry) > 0 {
+		e.recordLLMDegrade(fmt.Sprintf("D1 LLM 评分失败 %d 只, 本轮降级为中性占位并进入重试队列", len(nextRetry)), len(nextRetry))
+	}
+	e.mu.Lock()
+	e.lastD1Scores = d1Scores
+	e.d1RetryQueue = nextRetry
+	e.mu.Unlock()
+
+	// 历史 D1 方案B·攒数据：本轮真实 LLM 评分按日落库 d1_scores（幂等覆盖），
+	// 攒够数据后 N 形回放按触发日 JOIN 当日真实分。重试占位（RetryPending，分数 0）
+	// 不入库；落库失败仅记日志，绝不影响打分主流程。
+	// 存放库与实盘账本分离（e.d1Store）——d1_scores 属研究侧数据，落 trading.db 而非 live.db。
+	// English: persist this round's real LLM D1 scores per day (idempotent) so N-shape replay can
+	// later join the real trigger-day score. Retry placeholders are skipped; failures only log.
+	// Routes to the dedicated D1 store (trading.db), separate from the live book store.
+	if e.d1Store != nil && len(d1Scores) > 0 {
+		rows := make([]store.D1ScoreRow, 0, len(d1Scores))
+		for code, d := range d1Scores {
+			if d.RetryPending {
+				continue
+			}
+			rows = append(rows, store.D1ScoreRow{Code: code, Score: d.Score, Blocked: d.Blocked, Reason: d.Reason})
+		}
+		if err := e.d1Store.UpsertD1Scores(time.Now().Format("2006-01-02"), rows); err != nil {
+			log.Printf("[engine] D1 评分落库失败(不影响主流程): %v", err)
+		}
+	}
+	_d1T := time.Since(_stepD1)
+
+	// 8a. 打分池 PE 预取（N 形 D3 超跌评分；东财 clist f9，TTL 缓存降低限流压力）。
+	// 板块成分股的 PE 已在 9c 内补，这里只补其余池内个股。
+	// English: prefetch PE for the scoring pool (N-shape D3 oversold). Constituent PE was filled in 9c;
+	// only remaining pool codes are fetched here.
+	_stepPE := time.Now()
+	// §S2：现价取 5s 新浪快照（一次性快照，不新增请求），PE 当日首取后盘中按现价推算。
+	// English: §S2 — take one 5s Sina snapshot for live prices (no extra requests); after the daily first
+	// fetch, PE is derived intraday from the live price.
+	snap := e.snapshotQuotes()
+	for _, code := range sr.ScoringPool {
+		if _, ok := peScores[code]; ok {
+			continue
+		}
+		price := 0.0
+		if si := snap[code]; si != nil && si.Price > 0 {
+			price = si.Price
+		}
+		// 按实时价取 PE（无行情时按 0 兜底，不影响估值展示）。
+		peScores[code] = e.marketAPI.GetStockPEAt(code, price)
+	}
+	_peT := time.Since(_stepPE)
+
+	// 10-12. 出信号：做多 + 涨停增强 + 做空 + 个股直入（D1 复用，不重复调 LLM）
+	_stepSignals := time.Now()
+	// 10. 利好开关开 → 做多分支
+	var bullSignals []combat_agent.Signal
+	// 做多开关开启才跑多信号扫描（板块+行情+预期差+打分统一装配为 ScanInput）。
+	if e.LongEnabled() {
+		bullInput := combat_agent.ScanInput{
+			Sectors:      verifiedBull,
+			L1Score:      sr.L1Score,
+			L1Blocked:    sr.L1Blocked,
+			MarketData:   sr.MarketData,
+			D1Scores:     d1Scores,
+			PE:           peScores,
+			LimitUpPool:  pool,
+			News:         newsBriefs,
+			Scores:       stockScores,
+			EmotionPhase: emotionPhase,
+		}
+		bullSignals = e.combatAgent.ScanLong(bullInput)
+	}
+
+	// 10b. 涨停池增强：龙头识别 + 涨停分类 + 预期差（并入做多信号流）
+	// §E4 修复：此前不受 LongEnabled 门控——关掉做多开关后龙头识别仍发 buy 并进模拟盘建仓。
+	// 关闭时整体跳过（含 watch：用户已明确表达不关注做多侧）。
+	var gapCodes []string
+	// 取全部利空/利多新闻涉及代码作为个股维度输入（预期差检测用）。
+	for code := range newsBriefs {
+		gapCodes = append(gapCodes, code)
+	}
+	if e.LongEnabled() {
+		limitSignals := e.combatAgent.ScanLimitUp(combat_agent.ScanInput{
+			LimitUpPool:      pool,
+			IndividualStocks: gapCodes,
+			MarketData:       sr.MarketData,
+			L1Blocked:        sr.L1Blocked,
+			News:             newsBriefs,
+			Scores:           stockScores,
+			EmotionPhase:     emotionPhase,
+			PE:               peScores,
+		})
+		bullSignals = append(bullSignals, limitSignals...)
+	}
+
+	// 11. 利空开关开 → 做空分支
+	var bearSignals []combat_agent.Signal
+	// 做空开关开启才跑空信号扫描（利空板块归因 + 个股利空新闻）。
+	if e.ShortEnabled() {
+		bearInput := combat_agent.ScanInput{
+			Sectors:      verifiedBear,
+			L1Score:      sr.L1Score,
+			L1Blocked:    sr.L1Blocked,
+			MarketData:   sr.MarketData,
+			D1Scores:     d1Scores,
+			PE:           peScores,
+			LimitUpPool:  pool,
+			News:         newsBriefs,
+			Scores:       stockScores,
+			EmotionPhase: emotionPhase,
+			HeldCodes:    heldSet, // §SHORT-1 持仓股才发 sell，非持仓降级 watch
+		}
+		bearSignals = e.combatAgent.ScanShort(bearInput)
+	}
+
+	// 12. 个股直入（跳过板块验证）：分做多/做空两组
+	// 先收集本轮的个股事件候选（来自新闻事件的 stage2 个股），再与已跟踪个股/持仓/自选合并
+	var newLong, newShort []string
+	for _, st := range sr.LongStocks {
+		newLong = append(newLong, st.Code)
+	}
+	for _, st := range sr.ShortStocks {
+		newShort = append(newShort, st.Code)
+	}
+
+	// 取当日仍在跟踪期内的个股池（按方向区分做多/做空）
+	var trackedLong, trackedShort []*data.TrackedStock
+	// §P1-B nil stockTracker 防御：未注入跟踪池时按空池处理，避免 panic。
+	if e.stockTracker != nil {
+		trackedLong = e.stockTracker.GetActiveByDirection(td, "利好")
+		trackedShort = e.stockTracker.GetActiveByDirection(td, "利空")
+	}
+
+	// 8a/8b 个股监测池 = 新闻个股 + 已跟踪个股 + 持仓 + 自选（去重）
+	longCodes := mergeCodes(trackedCodes(trackedLong), newLong, positions, watchlist)
+	shortCodes := mergeCodes(trackedCodes(trackedShort), newShort, positions, watchlist)
+
+	// 分别对做多/做空监测池执行战法扫描（D1 评分复用，避免重复调 LLM）
+	var individualSignals []combat_agent.Signal
+	if len(longCodes) > 0 && e.LongEnabled() {
+		// 做多监测池：仅传 IndividualStocks，战法对自选/持仓/跟踪股逐只出信号。
+		in := combat_agent.ScanInput{
+			IndividualStocks: longCodes,
+			L1Score:          sr.L1Score,
+			L1Blocked:        sr.L1Blocked,
+			MarketData:       sr.MarketData,
+			D1Scores:         d1Scores,
+			PE:               peScores,
+			Scores:           stockScores,
+			EmotionPhase:     emotionPhase,
+		}
+		individualSignals = append(individualSignals, e.combatAgent.ScanLong(in)...)
+	}
+	if len(shortCodes) > 0 && e.ShortEnabled() {
+		// 做空监测池：同样只传个股列表，逐只评估利空做空机会。
+		in := combat_agent.ScanInput{
+			IndividualStocks: shortCodes,
+			L1Score:          sr.L1Score,
+			L1Blocked:        sr.L1Blocked,
+			MarketData:       sr.MarketData,
+			D1Scores:         d1Scores,
+			PE:               peScores,
+			Scores:           stockScores,
+			EmotionPhase:     emotionPhase,
+			News:             newsBriefs, // §SHORT-1 利好兑现砸盘需个股关联利好简报（事件窗判定）
+			HeldCodes:        heldSet,    // §SHORT-1 持仓股才发 sell，非持仓降级 watch
+		}
+		individualSignals = append(individualSignals, e.combatAgent.ScanShort(in)...)
+	}
+
+	// §H5（2026-09-22 修复批）5min 批量轮同样推进全局打分时钟 scoresAt：旧实现只在 5s 近实时轮
+	// 写入（scoring_loop.go，且池空提前 return 时整体冻结），却被卖出裁决当全源新鲜度基准，
+	// 批量轮产出的做多信号被陈旧全局时钟误判过期。新鲜度主判据已改为打分自身 UpdatedAt，
+	// 本时钟仅兜底无自带时刻的装配——批量轮打分完成即前进，不再被 5s 轮独占冻结。
+	// English: §H5 — the 5-minute batch round also advances the fallback global scoring clock,
+	// which used to be written only by the 5s round (frozen when its pool was empty).
+	if e.LongEnabled() && e.combatAgent != nil {
+		e.mu.Lock()
+		e.scoresAt = time.Now()
+		e.mu.Unlock()
+	}
+
+	// 将本轮的个股信号写入跟踪池：有效期至下一交易日（到期后自动移出监测池）
+	_stepTracker := time.Now()
+	if e.stockTracker != nil {
+		expiry := data.AddTradingDays(td, 1)
+		for _, sig := range individualSignals {
+			// 按信号方向映射为跟踪池的 利好/利空 标记
+			dir := "利好"
+			if sig.Direction == "做空" {
+				dir = "利空"
+			}
+			e.stockTracker.Add(sig.Code, sig.Name, dir, sig.Reason, td, expiry)
+		}
+
+		// 收拢本轮全部有信号的个股代码，通知跟踪池做当日轮次收尾（失效未命中的个股）
+		allSigCodes := make([]string, len(individualSignals))
+		for i, sig := range individualSignals {
+			allSigCodes[i] = sig.Code
+		}
+		e.stockTracker.OnCycleDone(td, allSigCodes)
+	}
+
+	// 个股信号并入做多信号流统一展示/广播
+	bullSignals = append(bullSignals, individualSignals...)
+
+	// 午休(11:30-13:00)行情冻结，压制做多/做空买卖信号（与近实时循环一致）：只保留
+	// 止盈/止损/卖点/情绪退潮等提醒信号，不发布新的买入/watch/watch 战法信号。
+	// prevPass 由 filterTransitionSignals 维护，13:00 开盘后首个 Pass 仍会正常翻转。
+	// English: quotes freeze at lunch (11:30-13:00), so suppress long/short trade signals exactly like the
+	// near-realtime loop — keep take-profit/stop-loss/sell-point/emotion-retreat reminders, but emit no new
+	// buy/watch strategy signals. prevPass is maintained by filterTransitionSignals, so the first Pass
+	// after 13:00 re-flips normally.
+	// 与下方的 BeforeOpenTrade 及近实时循环一致，统一走注入时钟 e.nowTime() 而非
+	// time.Now()：生产两者无异，但测试在线程注入确定时钟后不受真实钟点影响
+	//（否则 11:30-13:00 跑 e2e 会把全量信号稳定清空，制造时钟 flaky）。
+	if data.IsPreAfternoon(e.nowTime()) {
+		bullSignals = nil
+		bearSignals = nil
+	}
+	// 开盘(9:30)前同样压制做多/做空战法信号：盘前无实盘成交量/最新价，
+	// 动量/量价齐升等易基于昨日存量 K 线误报（与近实时循环 BeforeOpenTrade 同口径）。
+	// 新闻归因/D1 评分仍正常推进，只是不对外发布买入/watch 信号。
+	// English: also suppress long/short strategy signals before the 9:30 open — pre-open there is no live
+	// volume or latest price, so momentum/volume-price strategies would false-fire on stale daily bars
+	// (same gate as the near-realtime loop's BeforeOpenTrade). News attribution / D1 scoring still run;
+	// only buy/watch signals are held back.
+	// 集合竞价前（<9:25）不出交易信号，避免竞价漂移价触发买卖。
+	if data.BeforeOpenTrade(e.nowTime()) {
+		bullSignals = nil
+		bearSignals = nil
+	}
+
+	// §M9 轮首快照：本轮所有 sell_unified_mode 消费方（paperSignals 证据闸 / judgePaperLedgers /
+	// 13e report 旧链出口）共用同一个值——轮中配置翻转（shadow→on）不再造成「本轮旧口径把出口
+	// 关了、新口径裁决又没跑」的保护空窗。快照只在轮首读一次，消费方一律透传、禁止现读。
+	// English: round-start snapshot of sell_unified_mode, threaded to every same-round consumer.
+	roundSellMode := e.sellUnifiedModeEngine()
+
+	// 主循环把可交易 buy 信号送入模拟盘撮合（龙头识别/涨停增强等仅在主循环产生的信号，
+	// 近实时循环的 ScorePool 不含它们；watch/提醒不撮合，只做翻转去重防重复买入）。
+	// English: the main loop feeds its tradeable buy signals into the paper fill (leader-ID / limit-up
+	// enhancements only exist here — the near-realtime ScorePool excludes them); watch/alert signals are
+	// skipped, and only non-Pass→Pass flips are emitted to avoid repeat buys.
+	{
+		// 筛选出纯买入信号 → 状态翻转去重 → 只把"新出现的买入"投给模拟盘。
+		// English: the main loop feeds its tradeable buy signals into the paper fill (leader-ID / limit-up
+		// enhancements only exist here — the near-realtime ScorePool excludes them); watch/alert signals are
+		// skipped, and only non-Pass→Pass flips are emitted to avoid repeat buys.
+		var buys []combat_agent.Signal
+		for _, sig := range bullSignals {
+			if sig.Action == "buy" {
+				buys = append(buys, sig)
+			}
+		}
+		if len(buys) > 0 {
+			// §SIGNAL_CONTROLLER 主循环 live 分发：全量活跃买入信号送信号控制器裁定，
+			// pass 私才 autoPlace 下单（消息与下单解耦：4102 的 syncMessages 照常记录并标注原因）。
+			// prune=false——探针清理权归近实时全量喂入方，本方只推进（与旧 realBuyConfirmPass
+			// 无 prune 的行为一致，防主循环子集喂入误清 5s 循环探针）。
+			// English: main-loop live dispatch — controller-passed buys only; no pruning here.
+			e.dispatchLive(buys, e.snapshotQuotes(), false, time.Now())
+			// §统一纪律·买入确认：主循环也喂全量活跃买入信号（非仅翻转），持续性确认由
+			// 信号控制器 paper 通道在 registry 分发时统一裁定（旧 paper 内嵌状态机已删除）。
+			e.paperSignals(buys, nil, e.snapshotQuotes(), roundSellMode)
+		}
+	}
+
+	// 10-12 出信号结束
+	_signalsT := time.Since(_stepSignals)
+	// 12b 跟踪池收尾结束
+	_trackerT := time.Since(_stepTracker)
+
+	// 13. 持仓止盈/止损提醒（传入当轮打分表 + 利空板块信号：有反向信号才硬推止盈/止损）
+	// §R4-6：行情优先走 5s 快照（批量），缺失持仓才逐票兜底单查。
+	_stepAlerts := time.Now()
+	alertSignals := e.combatAgent.CheckPositionAlerts(e.rpt, e.marketAPI, e.snapshotQuotes(), stockScores, bearHitCodes(sr))
+	_alertsT := time.Since(_stepAlerts)
+
+	// 13b. 战法退出引擎实时评估（移动止盈/分批止盈/尾盘强平/破位/超期 等卖点提醒，仅提醒不自动执行）。
+	// 行情与日K复用本轮打分池数据（sr.MarketData），持仓由 HeldPositions 覆盖。
+	// English: live wiring of the strategy exit engines (trailing stop / staged take-profit / intraday
+	// close / breakdown / timeout…), reminder-only; reuses this round's scoring-pool quotes and daily bars.
+	exitQuotes := make(map[string]*data.StockInfo, len(sr.MarketData))
+	exitDayK := make(map[string][]data.KLine, len(sr.MarketData))
+	for code, md := range sr.MarketData {
+		if md == nil {
+			continue
+		}
+		if md.Quote != nil && md.Quote.Price > 0 {
+			exitQuotes[code] = md.Quote
+		}
+		if len(md.KLines) > 0 {
+			exitDayK[code] = md.KLines
+		}
+	}
+	alertSignals = append(alertSignals, e.combatAgent.CheckPositionsExits(e.rpt, exitQuotes, exitDayK, time.Now())...)
+
+	// 13c. 情绪退潮/背离 → 对做多持仓整体减仓建议（仅提醒）。
+	// English: when the emotion cycle turns to retreat/divergence, advise trimming all long positions.
+	alertSignals = append(alertSignals, e.combatAgent.EmotionRetreatAlerts(e.rpt, exitQuotes, emotionPhase, time.Now())...)
+
+	// 13c'. 利空归因持仓抛售提醒（E4）：做多持仓命中利空板块/利空个股 → 独立于价格止损提醒尽快抛售。
+	// 使用 bearHitReasons 提供归因说明（板块名/上榜原因/关联新闻），让用户理解为何抛售。
+	// English: E4 bearish-attribution sell alerts — long holdings hit by bearish sectors/stocks get an
+	// independent "sell soon" reminder decoupled from price stops, with an attribution reason (sector
+	// name / listing reason / linked news) explaining why.
+	alertSignals = append(alertSignals, e.combatAgent.BearishAttributionAlerts(e.rpt, exitQuotes, bearHitReasons(sr), time.Now())...)
+
+	// 13c''. §MARKET_RISK_GATE P5 系统性风险持仓提醒：由合成风险档（情绪+市场状态+宏观三源）驱动，对做多持仓
+	// 产出「建议减仓」提醒（AlertType=系统性风险，SellAction 不命中 → 绝不自动卖出，仅进消息中心/展示）。
+	// 与只看情绪的 13c EmotionRetreatAlerts 互补：交割日/CPI/熊市等情绪未转弱但风险已抬头的日子也会避险提醒。
+	// English: P5 composite-tier held-position trim reminder — reminder only (never auto-sold), complementing
+	// the emotion-only 13c by firing on delivery-day/CPI/bear-market risk even before the phase turns cold.
+	_, _, _, riskTier, riskReasons := e.MarketEnvSnapshot()
+	alertSignals = append(alertSignals, e.combatAgent.MarketRiskAlerts(e.rpt, exitQuotes, riskTier, riskReasons, time.Now())...)
+
+	// 13d. 逐股卖点评估：对打分池全量个股（含未持仓的自选/跟踪股）评估利空D1/破位/派发/动量衰竭，
+	// 命中即产出"卖点"提醒（仅提醒不自动执行）；消息中心按 code@卖点评估 稳定键去重，5s 循环同键刷新。
+	// 仅做多（shortEnabled=false）时非持仓个股不评估、不发减仓/清仓提醒（非持仓无从减仓，纯噪音）；
+	// 做多+做空（shortEnabled=true）时评估全打分池，级别徽标按卖出方向显示为"做空"。
+	// English: per-stock sell-point assessment over the whole scoring pool (including watchlist/tracked
+	// stocks not yet held) — bearish D1 / breakdown / distribution / momentum-exhaustion; reminder-only,
+	// deduped in the message center by code@卖点评估, refreshed by the 5s loop on the same key. In
+	// long-only mode non-held codes are skipped (no point trimming what you don't hold); in long+short
+	// mode the whole pool is assessed and the level badge reads 做空 (sell direction).
+	if len(sr.ScoringPool) > 0 {
+		sellCodes := sr.ScoringPool
+		if !e.ShortEnabled() {
+			// §P1-2 多账号隔离：仅本账号持仓参与卖出侧评估（共享引擎 userID 为空时回退全局）。
+			sellCodes = e.rpt.HeldPositionCodesFor(e.userID)
+			if e.userID == "" {
+				sellCodes = e.rpt.HeldPositionCodes()
+			}
+		}
+		alertSignals = append(alertSignals, e.combatAgent.AssessSellSide(sellCodes, sr.MarketData, d1Scores, stockScores, e.ShortEnabled())...)
+	}
+
+	// 13e-pre. §SELLPOINT-UNIFY P3 模拟盘并轨：纸面双账（paper 引擎 + report 手动账本）每轮走
+	// 与 live 同一卖出裁决内核（ChannelPaper 通道）。必须无条件每轮跑——观察窗窗长/结算栅格以
+	// 真实时钟推进，不依附"本轮恰好有卖出信号"的撮合分发时机；shadow/on 的取舍在裁决层内部按
+	// qmt.sell_unified_mode 判定（off=直接返回，shadow=只留痕，on=处置经唯一出口执行）。
+	// English: P3 — the paper ledgers are judged every round (wall-clock windows), independent of
+	// fill timing; the mode switch inside decides record-only vs execute.
+	e.judgePaperLedgers(sellJudgeFeed{
+		Scores:      stockScores,
+		D1Scores:    d1Scores,
+		BearReasons: bearHitReasons(sr),
+		PoolQuotes:  exitQuotes,
+		SnapQuotes:  e.snapshotQuotes(),
+	}, roundSellMode)
+
+	// 13e 卖出提醒自动执行（阶段1.1 全自动卖出）：把本轮 清仓/减仓/硬止盈/硬止损 告警
+	// （combat_agent.SellAction 归一为 close/trim）送入模拟盘自动成交——清仓类全平、
+	// 减仓类半仓（paper 引擎内每码每日一次去重）。仅提醒级（提示/关注/跌幅提醒）不动作。
+	// 行情复用 exitQuotes（本轮打分池实时快照）。
+	// English: auto-execute sell alerts (full-auto selling) — this round's 清仓/减仓/hard-TP/hard-SL
+	// alerts (normalized to close/trim by combat_agent.SellAction) go straight into the paper engine:
+	// close-type exits fully, trim-type halves (deduped once per code per day inside paper). Reminder-only
+	// levels (提示/关注/跌幅提醒) never act. Quotes reuse exitQuotes (this round's live snapshot).
+	{
+		var sells []combat_agent.Signal
+		for _, s := range alertSignals {
+			if combat_agent.SellAction(s) != "" {
+				sells = append(sells, s)
+			}
+		}
+		// §SHORT-2 做空战法 sell 信号（持仓走弱）并入自动卖出：SellAction 已把做空战法 sell 归一为
+		// close，这里一并送入 13e（纸面+report 账本自动平）；同时打实盘标记供 pushRealAdvice 消费。
+		// English: §SHORT-2 — bear-tactic "sell" signals (weak holdings) join the auto-sell round:
+		// SellAction normalizes them to "close", so they flow into paper/report exits; also stamp a
+		// live mark that pushRealAdvice turns into a 止损-class advice for real holdings.
+		for _, s := range bearSignals {
+			if combat_agent.IsShortTactic(s.StrategyType) && s.Action == "sell" {
+				sells = append(sells, s)
+				e.markShortSell(s.Code, s.Strategy)
+			}
+		}
+		if len(sells) > 0 {
+			e.paperSignals(sells, nil, exitQuotes, roundSellMode)
+			// FIX#15 report 账本（用户手动录入持仓）也自动执行卖出：close→LogExit 全平、
+			// trim→SellLot 半仓（每码每日一次）。只处理 paper 引擎未持有的（避免双账簿重复卖）。
+			// §SELLPOINT-UNIFY P3：mode=on 时 report 账本已由 13e-pre 的统一裁决处置
+			//（judgePaperLedgers→judgeReportLedger），此旧链出口关闭，杜绝双写。
+			// English: FIX#15 auto-execute sells on the report book (manually entered holdings) as well —
+			// close→LogExit full exit, trim→SellLot half (once per code per day); only codes not held
+			// by the paper engine are handled here to avoid double-selling both books. Under P3 on-mode
+			// the report book is exited by the unified adjudicator instead, so this legacy exit is closed.
+			// §M9：这里复用轮首快照 roundSellMode，不再现读配置——同一轮内口径必须一致。
+			if roundSellMode != "on" {
+				e.autoExitReportSells(sells, exitQuotes)
+			}
+		}
+	}
+
+	// 14. 聚合器更新看板
+	_stepAgg := time.Now()
+	// 本轮全部展示信号并入 5s 实时监控池，保证展示接口的现价/涨跌幅真实（信号股不在自选池时也能读到行情）
+	e.syncSignalPool(bullSignals, bearSignals, alertSignals)
+	// 固化当日信号：本轮做多/做空 Pass 信号按 code@strategy 覆盖写盘
+	// English: pin today's signals — this round's long/short Passed signals overwrite the store per code@strategy.
+	// 先为做多/做空信号补全真实 D1 事件信息（评分/负面拦截/LLM理由/事件标题），随信号一并固化展示
+	// English: backfill real D1 event info onto long/short signals first so it rides along when pinned/displayed.
+	enrichSignalsWithD1(bullSignals, d1Scores, newsBriefs)
+	enrichSignalsWithD1(bearSignals, d1Scores, newsBriefs)
+	if e.signalStore != nil {
+		tradeSignals := append([]combat_agent.Signal{}, bullSignals...)
+		tradeSignals = append(tradeSignals, bearSignals...)
+		e.signalStore.Upsert(tradeSignals)
+	}
+	// 展示信号 = 当日固化信号 + 本轮信号（固化信号未被新一轮评分替换前持续显示）
+	// English: displayed signals = pinned day signals + current round, so pinned signals stay visible
+	// all day until replaced by a newer score.
+	e.agg.Update(sr, verifiedBull, verifiedBear,
+		mergeSignals(bullSignals, e.signalStore.List()), bearSignals, alertSignals, stockScores, e.rpt)
+	// 14 看板更新结束
+	_aggT := time.Since(_stepAgg)
+
+	// 14b. 信号产生日志：逐条输出本轮生成的做多/做空/提醒信号（带日期时间戳，便于排障）
+	for _, sig := range bullSignals {
+		log.Printf("[engine] 产生信号 %s %s(%s) 方向=%s 操作=%s 置信=%.2f | %s",
+			sig.Strategy, sig.Code, sig.Name, sig.Direction, sig.Action, sig.Confidence, sig.Reason)
+	}
+	for _, sig := range bearSignals {
+		log.Printf("[engine] 产生信号 %s %s(%s) 方向=%s 操作=%s 置信=%.2f | %s",
+			sig.Strategy, sig.Code, sig.Name, sig.Direction, sig.Action, sig.Confidence, sig.Reason)
+	}
+	for _, sig := range alertSignals {
+		log.Printf("[engine] 产生信号 %s %s(%s) 方向=%s 操作=%s 置信=%.2f | %s",
+			sig.Strategy, sig.Code, sig.Name, sig.Direction, sig.Action, sig.Confidence, sig.Reason)
+	}
+
+	// 8a/8b 打分持久化（与近实时循环同口径，当日最新分）
+	e.scoreStore.Save(td, stockScores)
+
+	// 14b. 交易信号/告警/持仓提示合并进消息中心（持久化），带 5s 快照行情（现价+涨跌幅）
+	e.syncMessages(bullSignals, bearSignals, alertSignals, sr, e.snapshotQuotes())
+
+	// 15. 调试数据
+	e.captureDebug(rawNews, st0, events)
+
+	// 15b. 信号批次快照：收拢本轮全部信号（做多/做空/提醒）供"信号日志"弹窗按批次复盘
+	allSignals := make([]combat_agent.Signal, 0, len(bullSignals)+len(bearSignals)+len(alertSignals))
+	allSignals = append(allSignals, bullSignals...)
+	allSignals = append(allSignals, bearSignals...)
+	allSignals = append(allSignals, alertSignals...)
+	e.captureSignalRecords(len(rawNews), allSignals)
+
+	// 16. SSE 广播通知前端（附信号摘要）
+	// bull/bear 只统计可操作买入（Action=="buy"）信号：watch/brief 观察信号仍进消息中心与信号列表，
+	// 但不计入浏览器通知数量，避免观察类信号频繁弹系统通知。
+	// §修复 P2#23：按 code 去重后计数（同票多战法只算一只），与 /api/signals 列表去重口径一致，
+	// 消除"toast 报 40+ 条但列表只有 21 条"的观感差异。
+	// English: bull/bear count only actionable buy (Action=="buy") signals — watch/brief observations still
+	// land in the message center and signal list, but aren't counted for browser notifications, so
+	// watch-only signals don't spam the system notification. P2#23: dedup by code (a stock hit by several
+	// strategies counts once), matching the /api/signals list so the toast number lines up with the list.
+	_stepSSE := time.Now()
+	if e.sse != nil && e.sse.Len() > 0 {
+		payload := map[string]string{
+			"type":   "scan",
+			"status": "done",
+			"bull":   fmt.Sprintf("%d", countUniqueBuyCodes(bullSignals, "buy")),
+			"bear":   fmt.Sprintf("%d", countUniqueBuyCodes(bearSignals, "buy")),
+			"alert":  fmt.Sprintf("%d", len(alertSignals)),
+			"time":   time.Now().Format("15:04:05"),
+		}
+		if pool != nil {
+			payload["zt_pool"] = fmt.Sprintf("%d", len(pool))
+		}
+		if emotionCfg != nil { // §E2 复用本轮 RLock 快照
+			payload["emotion"] = data.DetectEmotionPhaseV2(pool, 0, 0, emotionCfg)
+		}
+		e.sse.Broadcast(payload)
+	}
+	_sseT := time.Since(_stepSSE)
+
+	// 记录本轮分段耗时（供 e2e 实速模拟 + /api/debug 观测）
+	e.mu.Lock()
+	e.lastTiming = &RunTiming{
+		Total: time.Since(t0),
+		News:  pOut.timing, Evaluate: _evalT,
+		HotRec:      _hotRecT,
+		D1:          _d1T,
+		PE:          _peT,
+		Pool:        _poolT,
+		Verify:      _verifyT,
+		HotPool:     _hotPoolT,
+		MergeSector: _mergeT,
+		Signals:     _signalsT,
+		Tracker:     _trackerT,
+		Alerts:      _alertsT,
+		Agg:         _aggT,
+		SSE:         _sseT,
+	}
+	e.mu.Unlock()
+
+	log.Printf("[engine] 流水线完成: %d条原始 → %d事件 → %d有效 (%v)",
+		len(rawNews), len(events), len(valid), time.Since(t0))
+
+	// 本轮无 LLM 分析原因的显式提示：新闻有但未产出有效事件时，一眼定位是"LLM失败"还是"被阈值过滤"
+	if len(rawNews) > 0 {
+		if st0.Err != nil {
+			log.Printf("[engine] 本轮无LLM分析原因: Stage0失败(%v), 原始%d条全部归一般(仅展示)", st0.Err, len(rawNews))
+		} else if len(events) == 0 {
+			log.Printf("[engine] 本轮无LLM分析原因: Stage0成功但无事件产出(个股/板块/IPO来源全空, 或全被material初筛过滤)")
+		} else if len(valid) == 0 {
+			log.Printf("[engine] 本轮无有效事件原因: 共%d事件但均|score|<0.50 被阈值过滤", len(events))
+		}
+	}
+
+	return sr
+}
+
+// ReanalyzeNews 手动 LLM 补推：强制重新拉取最近新闻（忽略 tracker 去重），
+// 走 Stage0 归因分类 + Stage2 深度分析，落盘事件，供前端"补推"按钮触发。
+// 适用场景：早盘/盘中 LLM 上游抖动导致 Stage0 失败、整批新闻被归"一般"未进 LLM。
+// 返回统计（原始条数/个股/板块/IPO/一般/事件数），以便前端提示结果。
+func (e *Engine) ReanalyzeNews() (map[string]int, error) {
+	e.mu.RLock()
+	na := e.newsAgent
+	e.mu.RUnlock()
+	if na == nil {
+		return nil, fmt.Errorf("新闻代理未启动")
+	}
+
+	// 强制拉取（忽略历史去重，仅按本轮打重）
+	raw := na.FetchForce()
+	if len(raw) == 0 {
+		log.Printf("[engine] 补推: 未拉到新闻")
+		return map[string]int{"raw": 0}, nil
+	}
+	log.Printf("[engine] 补推: 强制拉取 %d 条新闻", len(raw))
+
+	// Stage0 归因分类（失败时整批归一般并保留错误原因）
+	st0 := na.Stage0(raw)
+	if st0.Err != nil {
+		log.Printf("[engine] 补推: Stage0失败, %d条归一般: %v", len(raw), st0.Err)
+	}
+
+	// 标题党校正
+	for i, t := range st0.CorrectedTitle {
+		if i >= 0 && i < len(raw) && t != "" {
+			raw[i].Title = t
+		}
+	}
+
+	// 收集事件：个股 → Stage2；板块 → material 初筛后 Stage2；IPO → 直构
+	var events []newsagent.NewsEvent
+	var failedNews []data.NewsItem
+	// 个股类新闻：全部直接进 Stage2 归因（提取代码/板块/事件主体）。
+	if len(st0.StockIdx) > 0 {
+		evs, failed := na.Stage2(pickItems(raw, st0.StockIdx))
+		events = append(events, evs...)
+		failedNews = append(failedNews, failed...)
+	}
+	if len(st0.SectorIdx) > 0 {
+		sectorItems := pickItems(raw, st0.SectorIdx)
+		// 板块类新闻：material 标记为"有实质内容"的才保留并送 Stage2。
+		var kept []int
+		for j := range sectorItems {
+			if st0.Material[st0.SectorIdx[j]] {
+				kept = append(kept, j)
+			}
+		}
+		if len(kept) > 0 {
+			evs, failed := na.Stage2(pickItems(sectorItems, kept))
+			events = append(events, evs...)
+			failedNews = append(failedNews, failed...)
+		}
+	}
+	if len(st0.IpoIdx) > 0 {
+		events = append(events, na.BuildIPOFeedEvents(pickItems(raw, st0.IpoIdx))...)
+	}
+	events = append(events, na.BuildIPOEvents()...)
+
+	// 落盘事件（供 /api/news 展示）
+	na.SaveEvents(events)
+
+	// 本轮补推的分阶段计数：既进日志便于事后排查，也原样返回给接口展示。
+	stat := map[string]int{
+		"raw":     len(raw),
+		"stock":   len(st0.StockIdx),
+		"sector":  len(st0.SectorIdx),
+		"ipo":     len(st0.IpoIdx),
+		"general": len(st0.GeneralIdx),
+		"events":  len(events),
+		"failed":  len(failedNews),
+	}
+	log.Printf("[engine] 补推完成: 原始%d 个股%d 板块%d IPO%d 一般%d 事件%d 未归因%d (err=%v)",
+		stat["raw"], stat["stock"], stat["sector"], stat["ipo"], stat["general"], stat["events"], stat["failed"], st0.Err)
+	return stat, nil
+}
+
+// TestAttribution 单条归因测试：传一条标题+正文摘要，直接走 Stage2 LLM 深度分析
+// （含产业链价值传导推导 + 差分事件拆分），返回拆分后的 NewsEvent 供快速验证归因逻辑。
+// 用于 B2 单条验证：如"诺基亚收购恩智浦一工厂 计划自产磷化铟半导体"应归因上游磷化铟厂商。
+func (e *Engine) TestAttribution(title, digest string) ([]newsagent.NewsEvent, error) {
+	e.mu.RLock()
+	na := e.newsAgent
+	e.mu.RUnlock()
+	if na == nil {
+		return nil, fmt.Errorf("新闻代理未启动")
+	}
+	if strings.TrimSpace(title) == "" {
+		return nil, fmt.Errorf("标题不能为空")
+	}
+	item := data.NewsItem{
+		Title:    title,
+		Content:  digest,
+		Source:   "测试",
+		Datetime: time.Now().Format("2006-01-02 15:04:05"),
+	}
+	events, _ := na.Stage2([]data.NewsItem{item})
+	if len(events) == 0 {
+		log.Printf("[engine] 单条归因测试: 无事件产出 (title=%s)", title[:min(len(title), 40)])
+	}
+	return events, nil
+}
+
+// refreshSectors 每轮拉取同花顺全量板块名单并喂给 scanner，保证 FindSectorsByNames 可命中真实板块。
+func (e *Engine) refreshSectors() {
+	e.mu.RLock()
+	scanner, ths := e.scanner, e.ths
+	e.mu.RUnlock()
+	if scanner == nil || ths == nil {
+		return
+	}
+	boards, err := ths.GetBoardList()
+	if err != nil {
+		log.Printf("[engine] 同花顺板块名单刷新失败: %v", err)
+		return
+	}
+	scanner.Update(boards, 0, 0, 0)
+	e.feedRPS(boards)
+	// §D1 护栏2（板块归因目录点选）：把真实板块名单注入 LLM 层——Stage2 板块归因只能从该
+	// 白名单逐字点选，禁止自由发明板块名（LLM 发明板块/偏移归因是 D1 误判的主要来源）。
+	names := make([]string, 0, len(boards))
+	for _, b := range boards {
+		if b.Name != "" {
+			names = append(names, b.Name)
+		}
+	}
+	llm.SetSectorCatalog(names)
+	// §D1 护栏4（生产侧前置）：刷新东财「板块名→BK代码」映射，供利空板块成分股做第二源验证。
+	e.refreshEMBoardCodes()
+	log.Printf("[engine] 板块名单刷新: %d 个 (一级行业+概念), 板块点选白名单已注入 LLM", len(boards))
+}
+
+// refreshEMBoardCodes §D1 护栏4：拉取东财板块列表并缓存「名称→BK代码」映射，
+// 作为利空板块成分股双源验证的第二源入口（THS 881xxx 代码无法直接查东财，只认 BK）。
+// 失败保留旧映射（归因不受影响，仅可能把 dual 降级为 single，方向安全）。
+// （refreshEMBoardCodes caches EastMoney sector name→BK code for the dual-source constituent
+// verification of bearish sectors; failures keep the previous map (tier can only downgrade to single).）
+func (e *Engine) refreshEMBoardCodes() {
+	e.mu.RLock()
+	marketAPI := e.marketAPI
+	e.mu.RUnlock()
+	if marketAPI == nil {
+		return
+	}
+	list, err := marketAPI.GetSectorList()
+	if err != nil {
+		log.Printf("[engine] 东财板块列表刷新失败(保留旧映射，双源验证可能降为 single): %v", err)
+		return
+	}
+	m := make(map[string]string, len(list))
+	for _, s := range list {
+		if s.Name != "" && strings.HasPrefix(s.Code, "BK") {
+			m[s.Name] = s.Code
+		}
+	}
+	e.mu.Lock()
+	e.emBoardCodes = m
+	e.mu.Unlock()
+}
+
+// bearTierEntry §D1 护栏4：利空验证等级单条记录——等级（signalctl.BearVerified*）+ 盖章时刻（过期判据）。
+type bearTierEntry struct {
+	verified string
+	at       time.Time
+}
+
+// bearTierTTL §D1 护栏4：验证等级新鲜度窗。主循环每轮刷新；流水线停摆或利空板块事件消退后，
+// 旧等级超窗即失效（消费侧降回 single 只预警），防止拿几小时前的归因做即时硬清。
+const bearTierTTL = 60 * time.Minute
+
+// bearTierEMTopN §D1 护栏4：东财第二源成分名单拉取上限。放大到远超注入 topN，
+// 避免两源排序不同导致交集近空、把真实双源成分误判为 single。
+const bearTierEMTopN = 100
+
+// feedRPS §修复 D3（2026-08-29）：按多个可得周期构造 RPS 近似值（此前 RPS20/RPS60 用同一
+// 单日涨幅，等价无效）。可用字段：当日涨跌幅 ChangePct（短周期≈RPS20）、两日涨幅 Gain2d
+// （中周期≈RPS60）。真实多周期（5/10/20/60/120/250）百分位仍需历史 K 线（Phase F 升级），
+// 但至少让两个维度反映不同时间窗口，支撑 RPSRank 排序去伪。
+func (e *Engine) feedRPS(boards []data.SectorInfo) {
+	e.mu.RLock()
+	sa := e.sectorAgent
+	e.mu.RUnlock()
+	if sa == nil || len(boards) == 0 {
+		return
+	}
+	// br 板块行情行：代码 + 名称 + 当日/次日涨跌幅。
+	type br struct { // 板块行情行：代码 + 名称 + 当日/次日涨跌幅
+		code, name string
+		d1, d2     float64
+	}
+	// 收集全部板块行情行（名称非空才计入），作为 RPS 排名基础数据。
+	rows := make([]br, 0, len(boards))
+	for _, b := range boards {
+		if b.Name == "" {
+			continue
+		}
+		rows = append(rows, br{code: b.Code, name: b.Name, d1: b.ChangePct, d2: b.Gain2d})
+	}
+	sort.Slice(rows, func(i, j int) bool { return rows[i].d1 > rows[j].d1 })
+	rps := make([]data.SectorRPS, 0, len(rows))
+	for i, r := range rows {
+		rank20 := 0.0
+		if len(rows) > 1 {
+			// 按当日涨幅排名线性映射 RPS20 近似值（第一名≈100，最后一名≈0）
+			rank20 = 100 * (1 - float64(i)/float64(len(rows)-1))
+		}
+		// 中周期：用两日涨幅 Gain2d 重新排名（若全 0 退化为单日涨幅）
+		rank60 := rank20
+		if rows[0].d2 != 0 || rows[len(rows)-1].d2 != 0 {
+			// 显式按 Gain2d 排名（避免与上面 d1 排序混淆）
+			order := make([]int, len(rows))
+			for k := range order {
+				order[k] = k
+			}
+			sort.SliceStable(order, func(x, y int) bool { return rows[order[x]].d2 > rows[order[y]].d2 })
+			pos := 0
+			for k, idx := range order {
+				if rows[idx].code == r.code {
+					pos = k
+					break
+				}
+			}
+			if len(rows) > 1 {
+				rank60 = 100 * (1 - float64(pos)/float64(len(rows)-1))
+			}
+		}
+		rps = append(rps, data.SectorRPS{
+			Code:  r.code,
+			Name:  r.name,
+			RPS20: rank20,
+			RPS60: rank60,
+		})
+	}
+	sa.FeedRPS(rps)
+}
+
+// verifySectorAttribution 板块验真回填：对 level=板块 且 |score|≥0.5 的事件，
+// 用真实板块名单（FindSectorsByNames 精确命中）校验 Sectors，剔除 LLM 幻觉板块。
+func (e *Engine) verifySectorAttribution(events []newsagent.NewsEvent) {
+	e.mu.RLock()
+	scanner := e.scanner
+	e.mu.RUnlock()
+	if scanner == nil {
+		return
+	}
+	removed := 0
+	for i := range events {
+		ev := &events[i]
+		if ev.Level != "板块" || absScore(ev.Score) < 0.5 || len(ev.Sectors) == 0 {
+			continue
+		}
+		kept := make([]string, 0, len(ev.Sectors))
+		for _, s := range ev.Sectors {
+			if len(scanner.FindSectorsByNames([]string{s})) > 0 {
+				kept = append(kept, s)
+			}
+		}
+		if len(kept) != len(ev.Sectors) {
+			removed += len(ev.Sectors) - len(kept)
+			ev.Sectors = kept
+		}
+	}
+	if removed > 0 {
+		log.Printf("[engine] 板块验真回填: 剔除 %d 个非真实板块名", removed)
+	}
+}
+
+// propagateSectorToStocks 板块→个股事件级传播：对命中真实板块的板块级事件，
+// 取板块前 N 成分股注入 RelatedStocks（"名称(代码)"），并同步清洗 CleanedStocks，
+// 使板块权重沿 事件→个股监测池(8a/8b) 传递。同一板块每轮只取一次成分股。
+// N 由 sectorConstTopN（默认 20）决定，扩大覆盖以纳入更多同板块强势股。
+// 遍历范围含直接板块 + 上游 + 下游板块，补足 LLM 未点名的产业链个股。
+func (e *Engine) propagateSectorToStocks(events []newsagent.NewsEvent) {
+	e.mu.RLock()
+	scanner := e.scanner
+	topN := e.sectorConstTopN
+	e.mu.RUnlock()
+	if scanner == nil {
+		return
+	}
+	if topN <= 0 {
+		topN = 20 // 未配置时的兜底默认值，保证每板块覆盖面稳定
+	}
+
+	// 第一遍：仅收集需要拉成分股的板块（串行、无网络 IO），按所属事件下标分组。
+	// 同一板块每轮只取一次成分股，避免重复注入。
+	// （Pass 1: collect which sectors need constituents, grouped by owning event index,
+	// serially and without any network I/O. Each sector is fetched once per round.）
+	type needFetch struct {
+		evIdx   int    // 所属事件下标（events 切片）
+		code    string // 板块代码
+		name    string // 板块名（日志用/东财 BK 映射键）
+		bearish bool   // §D1 护栏4：事件为利空——只有利空板块触发双源成分验证（判定等级供卖出硬清资格）
+	}
+	fetched := make(map[string]bool)
+	var needs []needFetch
+	for i := range events {
+		ev := &events[i]
+		if ev.Level != "板块" || absScore(ev.Score) < 0.5 {
+			continue
+		}
+		// 利空判定：方向=利空或带符号分为负（chainScore 保证利空事件分数为负，两口径取并以防字段缺省）。
+		isBear := ev.Direction == "利空" || ev.Score < 0
+		// 汇总直接板块 + 上游 + 下游板块一并传播（上游/下游为空时 append 无副作用）。
+		allSectors := append([]string{}, ev.Sectors...)
+		allSectors = append(allSectors, ev.UpstreamSectors...)
+		allSectors = append(allSectors, ev.DownstreamSectors...)
+		for _, name := range allSectors {
+			// 通过板块名反查代码；已排过队的不重复排队。
+			si := e.sectorByName(name)
+			if si == nil {
+				continue
+			}
+			if fetched[si.Code] {
+				continue
+			}
+			fetched[si.Code] = true
+			needs = append(needs, needFetch{evIdx: i, code: si.Code, name: name, bearish: isBear})
+		}
+	}
+	if len(needs) == 0 {
+		return
+	}
+
+	// 第二遍：并发拉取成分股（有界 worker 池）。实际并发受各数据源限流器约束，
+	// 不会打爆同花顺/东财；串行 N 板块 O(N×T) 因此压到 ~O(T)。
+	// （Pass 2: fetch constituents concurrently with a bounded worker pool. Real concurrency is
+	// capped by the per-source rate limiters, so THS/EastMoney are never hammered; the serial
+	// O(N×T) cost over N sectors drops to ~O(T).）
+	type result struct {
+		code    string           // 板块代码（回传任务标识，串行注入按此对账）
+		stocks  []data.StockInfo // 拉取到的板块成分股 topN（THS 优先、东财兜底）
+		err     error            // 拉取失败原因（非 nil 时该板块本轮不注入，仅记日志）
+		bearish bool             // §D1 护栏4：透传任务的利空标记（决定是否需要验证等级）
+		thsSet  map[string]bool  // §D1 护栏4：同花顺成分股纯代码集合（仅利空板块填充）
+		emSet   map[string]bool  // §D1 护栏4：东财成分股纯代码集合（仅利空板块填充；BK 映射缺失时为 nil）
+	}
+	// sectorFetchWorkers 板块行情并发拉取的工作协程数。
+	const sectorFetchWorkers = 6
+	// 有界 worker 池：jobs 分发、results 汇总，全部拉完再继续。
+	jobs := make(chan needFetch)
+	results := make(chan result, len(needs))
+	var wg sync.WaitGroup
+	for w := 0; w < sectorFetchWorkers; w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for nf := range jobs {
+				r := result{code: nf.code, bearish: nf.bearish}
+				if nf.bearish {
+					// 利空板块：双源各取一份成分名单（注入列表 THS 优先/东财兜底，与旧口径一致），
+					// 两份集合同时回传用于判定 双源(dual)/单源(single) 验证等级。
+					r.stocks, r.thsSet, r.emSet, r.err = e.sectorConstituentsDual(nf.code, nf.name, topN)
+				} else {
+					r.stocks, r.err = e.sectorConstituents(nf.code, topN)
+				}
+				results <- r
+			}
+		}()
+	}
+	// 投喂全部任务后关 jobs，等待 worker 收尾再关 results。
+	for _, nf := range needs {
+		jobs <- nf
+	}
+	close(jobs)
+	wg.Wait()
+	close(results)
+
+	// 第三遍：按板块代码暂存结果，再串行注入各自事件（避免并发写 events 切片）。
+	// （Pass 3: stage results by sector code, then inject serially to avoid racing on events.）
+	byCode := make(map[string]result, len(needs))
+	// §D1 护栏5：本轮利空板块是否有「双源俱失」的取数失败——有则验证等级只做增量合并，
+	// 保留失败板块旧条目（缺数据绝不判"无利空"、绝不把已验证的 dual 悄悄降格）。
+	failedBear := false
+	for r := range results {
+		if r.err != nil {
+			log.Printf("[engine] 板块成分股获取失败 %s: %v", r.code, r.err)
+			if r.bearish {
+				failedBear = true
+				opslog.DayOnce("bear-tier-degrade:"+r.code, func() {
+					opslog.Logf("news", "利空板块成分股双源均获取失败 %s，保留上次验证等级（数据缺失不否定利空，硬清资格按旧级）: %v", r.code, r.err)
+				})
+			}
+			continue
+		}
+		byCode[r.code] = r
+	}
+	injected := 0
+	for _, nf := range needs {
+		ev := &events[nf.evIdx]
+		r, ok := byCode[nf.code]
+		if !ok {
+			continue
+		}
+		stocks := r.stocks
+		// 成分股注入事件相关股票列表（同名称/同标签去重）。
+		added := 0
+		for _, st := range stocks {
+			label := fmt.Sprintf("%s(%s)", st.Name, st.Code)
+			if strContains(ev.RelatedStocks, label) || strContains(ev.RelatedStocks, st.Name) {
+				continue // 已注入过同名/同标签则跳过
+			}
+			ev.RelatedStocks = append(ev.RelatedStocks, label)
+			added++
+		}
+		injected += added
+		if added > 0 || len(ev.RelatedStocks) > 0 {
+			ev.CleanedStocks = e.newsAgent.CleanStocks(ev.RelatedStocks)
+		}
+	}
+	if injected > 0 {
+		log.Printf("[engine] 板块→个股传播: 注入 %d 只成分股", injected)
+	}
+
+	// §D1 护栏4（生产侧）：按本轮利空板块计算成分股验证等级——
+	// dual=同花顺∩东财双源名单均命中（唯一具备「触线+利空即时硬清」资格的来源），
+	// single=仅单源命中（只预警）。护栏3 在此天然成立：能进入 byCode 的板块都经过
+	// sectorByName/verifySectorAttribution 的真实板块验真，新题材未验真通道永远到不了 dual 集合。
+	at := time.Now()
+	newTier := make(map[string]bearTierEntry)
+	for _, r := range byCode {
+		if !r.bearish {
+			continue
+		}
+		for code, tier := range classifyBearTier(r.thsSet, r.emSet) {
+			newTier[code] = bearTierEntry{verified: tier, at: at}
+		}
+	}
+	e.mu.Lock()
+	e.bearTier = mergeBearTier(e.bearTier, newTier, failedBear)
+	e.mu.Unlock()
+}
+
+// classifyBearTier §D1 护栏4（纯函数）：按双源命中集合给出 代码→验证等级——
+// 两源交集=dual；仅任一源命中=single。emSet/thsSet 为 nil（该源不可用）时对应代码只能判 single。
+// （classifyBearTier is a pure helper: intersection of the two source sets is dual,
+// membership in a single source is single; a nil set (source unavailable) can only yield single.）
+func classifyBearTier(thsSet, emSet map[string]bool) map[string]string {
+	out := make(map[string]string, len(thsSet)+len(emSet))
+	for code := range thsSet {
+		if emSet[code] {
+			out[code] = signalctl.BearVerifiedDual
+		} else {
+			out[code] = signalctl.BearVerifiedSingle
+		}
+	}
+	for code := range emSet {
+		if _, ok := out[code]; !ok {
+			out[code] = signalctl.BearVerifiedSingle
+		}
+	}
+	return out
+}
+
+// mergeBearTier §D1 护栏4/5（纯函数）：本轮算出的等级写回引擎——
+// keepOld=false（全部利空板块取数成功）整表替换，事件消退的成分股等级自然出表；
+// keepOld=true（存在双源俱失板块）保留旧表全部条目、仅覆盖本轮成功算出的——失败源不得把
+// 已验证的 dual 悄悄降格（缺数据不否定利空，护栏5口径）。
+// （mergeBearTier swaps the tier map in: full replace when every bearish sector fetched OK,
+// otherwise old entries are kept and only freshly-computed codes are overwritten.）
+func mergeBearTier(old, updated map[string]bearTierEntry, keepOld bool) map[string]bearTierEntry {
+	if !keepOld {
+		return updated
+	}
+	out := make(map[string]bearTierEntry, len(old)+len(updated))
+	for k, v := range old {
+		out[k] = v
+	}
+	for k, v := range updated {
+		out[k] = v
+	}
+	return out
+}
+
+// sectorConstituents 获取板块成分股：同花顺优先（东财限流时的兜底源），失败/为空回退东财。
+// THS 板块代码（881xxx/308xxx）与扫描器缓存一致，可直接调 GetBoardStocks。
+// （sectorConstituents returns a sector's constituents: THS first (fallback source when
+// EastMoney is throttled), EastMoney otherwise. THS board codes match the scanner cache.）
+func (e *Engine) sectorConstituents(sectorCode string, topN int) ([]data.StockInfo, error) {
+	e.mu.RLock()
+	ths := e.ths
+	marketAPI := e.marketAPI
+	e.mu.RUnlock()
+	if ths != nil {
+		if list, err := ths.GetBoardStocks(sectorCode, topN); err == nil && len(list) > 0 {
+			return list, nil
+		}
+	}
+	return marketAPI.GetSectorStocks(sectorCode, topN)
+}
+
+// sectorConstituentsDual §D1 护栏4：利空板块成分股的双源拉取——同花顺（主源，代码与扫描器缓存一致）
+// + 东财（经「板块名→BK代码」映射的第二源；映射缺失=东财无此板块，只能算单源）。
+// 返回：注入列表（THS 优先、东财兜底，与旧口径一致）+ 两源各自的纯代码命中集合（判 dual/single 用）。
+// 仅当两源同时失败才回传 err（调用方保留旧等级并按护栏5告警）。
+// （sectorConstituentsDual fetches a bearish sector's constituents from BOTH THS and EastMoney
+// (via name→BK mapping); returns injection list plus per-source code sets for tier classification.
+// Error only when both sources fail — the caller keeps the previous tier (§八 guardrail 5).）
+func (e *Engine) sectorConstituentsDual(sectorCode, sectorName string, topN int) ([]data.StockInfo, map[string]bool, map[string]bool, error) {
+	e.mu.RLock()
+	ths := e.ths
+	marketAPI := e.marketAPI
+	emCode := e.emBoardCodes[sectorName] // 东财 BK 代码；未命中映射=东财无同名板块，第二源视为不可用
+	e.mu.RUnlock()
+
+	var thsList []data.StockInfo
+	var thsSet map[string]bool
+	var thsErr error
+	if ths != nil {
+		thsList, thsErr = ths.GetBoardStocks(sectorCode, topN)
+		if thsErr == nil && len(thsList) > 0 {
+			thsSet = stockCodeSet(thsList)
+		}
+	}
+	// 东财第二源名单放大拉取（bearTierEMTopN）：两源排序不同，只取 topN 会让真双源成分误判 single。
+	var emList []data.StockInfo
+	var emSet map[string]bool
+	var emErr error
+	if marketAPI != nil && emCode != "" {
+		emList, emErr = marketAPI.GetSectorStocks(emCode, bearTierEMTopN)
+		if emErr == nil && len(emList) > 0 {
+			emSet = stockCodeSet(emList)
+		} else if emErr == nil {
+			emErr = fmt.Errorf("东财成分股为空 (%s)", emCode)
+		}
+	} else if marketAPI != nil {
+		emErr = fmt.Errorf("东财板块名未命中BK映射(%s)", sectorName)
+	} else {
+		emErr = fmt.Errorf("行情接口未装配")
+	}
+	if ths == nil {
+		thsErr = fmt.Errorf("同花顺客户端未装配")
+	}
+	if thsSet == nil && thsErr == nil {
+		thsErr = fmt.Errorf("同花顺成分股为空 (%s)", sectorCode) // 空名单等同失败，保证双失错误信息完整
+	}
+
+	switch {
+	case thsSet != nil:
+		return thsList, thsSet, emSet, nil // 主源命中（emSet 可为 nil=东财缺失，只判 single）
+	case emSet != nil:
+		return emList, nil, emSet, nil // THS 失败，东财兜底注入（无交集可言，全判 single）
+	}
+	return nil, nil, nil, fmt.Errorf("双源成分股均失败: ths=%v em=%v", thsErr, emErr)
+}
+
+// stockCodeSet 把成分股列表转为纯 6 位代码集合（双源交集判定口径；THS/东财返回均为 6 位码，防御性去后缀）。
+func stockCodeSet(list []data.StockInfo) map[string]bool {
+	set := make(map[string]bool, len(list))
+	for _, st := range list {
+		if c := pureTsCode(st.Code); c != "" {
+			set[c] = true
+		}
+	}
+	return set
+}
+
+// bearTierFor §D1 护栏4（消费侧）：查某股的利空验证等级。无记录/等级为空/超 TTL 一律按 single——
+// 缺数据只失去「触线即时硬清」资格（降回预警/窗结算），绝不误判为"无利空"（护栏5口径）。
+// （bearTierFor looks up a code's bearish verification tier; missing or stale entries degrade to
+// single (warn-only), never to "no bearish" — guardrail 5 semantics.）
+func (e *Engine) bearTierFor(pureCode string) string {
+	e.mu.RLock()
+	entry, ok := e.bearTier[pureCode]
+	e.mu.RUnlock()
+	if !ok || entry.verified == "" {
+		return signalctl.BearVerifiedSingle
+	}
+	if time.Since(entry.at) > bearTierTTL {
+		return signalctl.BearVerifiedSingle // 超龄等级不再给硬清资格
+	}
+	return entry.verified
+}
+
+// sectorByName 精确匹配板块名称返回 SectorInfo，未命中返回 nil。
+func (e *Engine) sectorByName(name string) *data.SectorInfo {
+	if e.scanner == nil {
+		return nil
+	}
+	// FindSectorsByNames 已含精确+包含匹配，直接取首个命中（板块名噪声也能落到真实板块）
+	infos := e.scanner.FindSectorsByNames([]string{name})
+	if len(infos) > 0 {
+		return &infos[0]
+	}
+	return nil
+}
+
+// absScore 返回带符号分数的绝对值。
+func absScore(s float64) float64 {
+	if s < 0 {
+		return -s
+	}
+	return s
+}
+
+// strContains 判断字符串切片中是否包含指定元素。
+func strContains(slice []string, s string) bool {
+	for _, v := range slice {
+		if v == s {
+			return true
+		}
+	}
+	return false
+}
+
+// captureDebug 收集本轮流水线调试数据，并固化到当日 Stage 记录。
+// §REQ-20260902：保留全天轮次（去掉 20 条截断）；无实际内容（既无原始新闻、无选中，
+// 也无阶段事件）的轮次直接跳过，避免前端出现「0 条 / 选 0」的空轮次。
+// English: keeps the whole day of stage rounds (no 20-round cap); rounds with no raw news,
+// no selections and no stage-2 events are skipped so the UI never lists empty rounds.
+func (e *Engine) captureDebug(rawNews []data.NewsItem, st0 newsagent.Stage0Result, events []newsagent.NewsEvent) {
+	titles := make([]string, len(rawNews))
+	for i, n := range rawNews {
+		titles[i] = n.Title
+	}
+	idx := append([]int{}, st0.StockIdx...)
+	idx = append(idx, st0.SectorIdx...)
+	idx = append(idx, st0.IpoIdx...)
+
+	// 组装本轮 Stage 调试快照：原始条数/选中索引/阶段2事件全量保存供 LLM 面板回看。
+	e.mu.Lock()
+	debugInfo := &newsagent.DebugInfo{
+		Stage1Mode:    "combined",
+		RawCount:      len(rawNews),
+		SelectedCount: len(idx),
+		RawTitles:     titles,
+		SelectedIdx:   idx,
+		Stage2Events:  events,
+		ProcessTime:   time.Now(),
+	}
+	e.debugInfo = debugInfo
+	// 空轮次不落库（避免 LLM 面板被无内容历史淹没）。
+	if len(rawNews) == 0 && len(idx) == 0 && len(events) == 0 {
+		e.mu.Unlock()
+		return
+	}
+	e.stageRecords = append(e.stageRecords, *debugInfo)
+	e.mu.Unlock()
+
+	e.persistStageRecords()
+}
+
+// captureNearRealtimeStage §LLM 面板修复：近实时打分循环每轮也会触发一次 Stage 快照，
+// 让 LLM 诊断页主面板在主循环空闲/无 L2 新闻时也能看到"原始新闻缓存"（待归因队列 + 已归因事件）。
+// 节流：距上次捕获 ≥ 60s 才落盘，避免每 5s 一次磁盘写入（低配服务器友好）。
+// English: near-realtime stage snapshot — the 5s scoring loop also emits a Stage record so the LLM
+// debug main panel always has a raw-news cache (pending queue + attributed events) even when the main
+// loop is idle or no L2 news arrived. Throttled to ≥ 60s between writes to avoid per-5s disk I/O.
+func (e *Engine) captureNearRealtimeStage() {
+	if e.newsAgent == nil {
+		return
+	}
+	e.mu.RLock()
+	last := e.lastStageCap
+	e.mu.RUnlock()
+	if !last.IsZero() && time.Since(last) < 60*time.Second {
+		return
+	}
+	pending := e.newsAgent.UnattributedItems()
+	events := e.newsAgent.AllEvents()
+	// 只保留待归因队列的非空标题，作为快照的原始新闻缓存。
+	titles := make([]string, 0, len(pending))
+	for _, it := range pending {
+		if it.Title != "" {
+			titles = append(titles, it.Title)
+		}
+	}
+	e.mu.Lock()
+	e.lastStageCap = time.Now()
+	debugInfo := &newsagent.DebugInfo{
+		Stage1Mode:    "combined",
+		RawCount:      len(titles),
+		SelectedCount: 0,
+		RawTitles:     titles,
+		Stage2Events:  events,
+		ProcessTime:   time.Now(),
+	}
+	e.debugInfo = debugInfo
+	// §REQ-20260902：无实际内容（无待归因标题且无已归因事件）不落库，前端不出现空轮次。
+	if len(titles) == 0 && len(events) == 0 {
+		e.mu.Unlock()
+		return
+	}
+	e.stageRecords = append(e.stageRecords, *debugInfo)
+	e.mu.Unlock()
+	e.persistStageRecords()
+}
+
+// pickItems 按索引从新闻列表中选取条目。
+func pickItems(items []data.NewsItem, indices []int) []data.NewsItem {
+	var out []data.NewsItem
+	for _, i := range indices {
+		if i >= 0 && i < len(items) {
+			out = append(out, items[i])
+		}
+	}
+	return out
+}
+
+// filterThreshold 过滤事件：仅保留 |score| ≥ 阈值的（弱/中性丢弃）。
+func filterThreshold(events []newsagent.NewsEvent, threshold float64) []newsagent.NewsEvent {
+	var out []newsagent.NewsEvent
+	for _, ev := range events {
+		s := ev.Score
+		if s < 0 {
+			s = -s
+		}
+		if s >= threshold {
+			out = append(out, ev)
+		}
+	}
+	return out
+}
+
+// trackedCodes 提取跟踪个股代码列表。
+func trackedCodes(tracked []*data.TrackedStock) []string {
+	out := make([]string, 0, len(tracked))
+	for _, s := range tracked {
+		out = append(out, s.Code)
+	}
+	return out
+}
+
+// mergeCodes 按顺序合并多组个股代码并去重（保留首次出现顺序）。
+func mergeCodes(groups ...[]string) []string {
+	// 合并多组代码为去重集合（去空白、跳过空串），保持首次出现顺序。
+	seen := make(map[string]bool)
+	var out []string
+	for _, g := range groups {
+		for _, c := range g {
+			c = strings.TrimSpace(c)
+			if c == "" || seen[c] {
+				continue
+			}
+			seen[c] = true
+			out = append(out, c)
+		}
+	}
+	return out
+}
+
+// newsBriefsByCode 将有效新闻事件转为 code → 新闻简报映射（供预期差检测）。
+// 方向由事件 Score 符号推导（score≥0 视为利好）。
+func newsBriefsByCode(events []newsagent.NewsEvent) map[string][]combat_agent.NewsBrief {
+	m := make(map[string][]combat_agent.NewsBrief)
+	codeCandidates := func(ev newsagent.NewsEvent) []string {
+		codes := make([]string, 0, len(ev.RelatedStocks)+len(ev.CleanedStocks))
+		// RelatedStocks 可能是 "名称"、"名称(代码)" 或裸代码；CleanedStocks 统一为 "名称|代码"。
+		// 优先用 CleanedStocks（格式最规范），再补 RelatedStocks，去重。
+		// English: RelatedStocks may hold names, "name(code)" or bare codes; CleanedStocks is uniformly
+		// "name|code". Prefer CleanedStocks (most normalized), then RelatedStocks, deduped.
+		seen := make(map[string]bool)
+		clean := func(raw string) string {
+			raw = strings.TrimSpace(raw)
+			if raw == "" {
+				return ""
+			}
+			if _, after, ok := strings.Cut(raw, "|"); ok {
+				raw = strings.TrimSpace(after)
+			} else if i := strings.Index(raw, "("); i > 0 {
+				raw = strings.TrimSpace(strings.TrimSuffix(raw[i+1:], ")"))
+			}
+			raw = strings.TrimSpace(raw)
+			// 仅接受可判定为代码的条目：6 位数字，或含字母的港美股/指数代码（如 0700.HK）。
+			// 纯名称（如 "中兴商业"）无法映射到信号，跳过以免脏关联。
+			// English: only accept entries resolvable to codes — 6-digit A-share codes, or alphanumeric
+			// HK/US/index codes (e.g. 0700.HK). Bare names (e.g. "中兴商业") can't map to signals; skip.
+			digits := 0
+			alnum := 0
+			for _, r := range raw {
+				switch {
+				case r >= '0' && r <= '9':
+					digits++
+					alnum++
+				case (r >= 'A' && r <= 'Z') || (r >= 'a' && r <= 'z'):
+					alnum++
+				}
+			}
+			if alnum == 0 {
+				return ""
+			}
+			if digits == 6 && alnum == 6 {
+				return raw
+			}
+			if digits > 0 && alnum > digits {
+				return raw // 含字母的代码（港美股/带后缀）
+			}
+			return ""
+		}
+		// 汇总去重后的代码候选（CleanedStocks + RelatedStocks 双来源）。
+		for _, cs := range ev.CleanedStocks {
+			if c := clean(cs); c != "" && !seen[c] {
+				seen[c] = true
+				codes = append(codes, c)
+			}
+		}
+		for _, rs := range ev.RelatedStocks {
+			if c := clean(rs); c != "" && !seen[c] {
+				seen[c] = true
+				codes = append(codes, c)
+			}
+		}
+		return codes
+	}
+	// 逐个事件展开：同一代码多条新闻简报追加（供预期差按时间序取最新）。
+	for _, ev := range events {
+		if ev.Title == "" {
+			continue
+		}
+		positive := ev.Score >= 0
+		for _, code := range codeCandidates(ev) {
+			m[code] = append(m[code], combat_agent.NewsBrief{
+				Title:    ev.Title,
+				Positive: positive,
+				Time:     ev.Datetime,
+				Score:    ev.Score,
+				Level:    ev.Level,
+			})
+		}
+	}
+	return m
+}
+
+// enrichSignalsWithD1 为信号补全真实 D1 事件信息（区别于策略 Reason）：
+// 从引擎最近一轮 D1 评分缓存（d1Scores[code].Score/Blocked/Reason）和新闻事件简报
+// （newsBriefs[code] 的标题）回填 Signal.D1Score/D1Blocked/D1Reason/D1Event，
+// 供前端"信号"列表单独展示 D1 事件分析，而不混入策略信号本身的原因。
+// 复用各战法已扫描结果里的 D1 上下文，不额外调 LLM。
+// English: backfills real D1 event info onto signals (distinct from the strategy Reason) — takes the
+// latest D1 score cache (d1Scores[code].Score/Blocked/Reason) and news briefs (newsBriefs[code] titles)
+// into Signal.D1Score/D1Blocked/D1Reason/D1Event, so the frontend signal list can show the D1 event
+// analysis separately instead of mixing it into the strategy reason. Reuses existing D1 context; no new LLM call.
+func enrichSignalsWithD1(sigs []combat_agent.Signal, d1Scores map[string]combat_agent.D1Score, newsBriefs map[string][]combat_agent.NewsBrief) {
+	if len(sigs) == 0 {
+		return
+	}
+	for i := range sigs {
+		s := &sigs[i]
+		// D1 事件标题（新闻归因）独立于 D1 评分缓存：即使 LLM D1 评分缺失/降级为 0，事件仍应展示。
+		// English: the D1 event title (news attribution) is independent of the D1 score cache — even when the
+		// LLM D1 score is missing or degraded to 0, the event should still be shown.
+		if briefs := newsBriefs[s.Code]; len(briefs) > 0 {
+			// 取与信号方向一致的事件标题（利好→做多；利空→做空），无匹配则取首条
+			// English: pick a title matching the signal direction (bullish→long; bearish→short),
+			// falling back to the first brief when none matches.
+			pos := s.Direction == "做多"
+			picked := ""
+			for _, b := range briefs {
+				if b.Positive == pos {
+					picked = b.Title
+					break
+				}
+			}
+			if picked == "" {
+				picked = briefs[0].Title
+			}
+			s.D1Event = picked
+		}
+		d1, ok := d1Scores[s.Code]
+		if !ok {
+			continue
+		}
+		// 回填 D1 评分缓存：分数/是否被板块 D1 规则阻断/理由，前端据此展示 D1 独立评分。
+		s.D1Score = d1.Score
+		s.D1Blocked = d1.Blocked
+		s.D1Reason = d1.Reason
+	}
+}
+
+// clusterEvents 事件聚簇：同方向且共享任一板块的事件合并为单条。// 簇内标题用" | "连接（最多保留 3 条），个股/相关股票去重合并，Score 取 |score| 最大者。
+// 防止同一主题的多条快讯在信号流中刷屏。
+func clusterEvents(events []newsagent.NewsEvent) []newsagent.NewsEvent {
+	if len(events) < 2 {
+		return events
+	}
+	// 为每个"板块+方向"维护簇索引：同板块不同方向的事件不得合并
+	// （对抗制裁型上游利好/下游利空拆分事件方向相反，误合并会吞掉方向）。
+	clusterOf := make(map[string]int)
+	clusters := make([][]int, 0, len(events))
+	assign := func(ev newsagent.NewsEvent) int {
+		if ev.Level == "个股" {
+			return -1 // 个股级事件不参与聚簇，各自独立
+		}
+		for _, sec := range ev.Sectors {
+			key := sec + "|" + ev.Direction
+			if idx, ok := clusterOf[key]; ok {
+				return idx // 命中已有同板块同方向簇则归入该簇
+			}
+		}
+		return -1 // 无共享板块，新建独立簇
+	}
+	for i, ev := range events {
+		idx := assign(ev)
+		if idx < 0 {
+			idx = len(clusters)
+			clusters = append(clusters, nil)
+		}
+		clusters[idx] = append(clusters[idx], i)
+		for _, sec := range ev.Sectors {
+			clusterOf[sec+"|"+ev.Direction] = idx
+		}
+	}
+
+	// 同簇事件收口成一条对外事件：单条直接透传，多条才走下面的标题拼接与属性择优，
+	// 避免同一利好被重复推成多条信号。
+	out := make([]newsagent.NewsEvent, 0, len(clusters))
+	for _, idxs := range clusters {
+		if len(idxs) == 0 {
+			continue
+		}
+		merged := events[idxs[0]]
+		if len(idxs) == 1 {
+			out = append(out, merged)
+			continue
+		}
+		// 合并标题（最多3条）
+		titles := []string{merged.Title}
+		for _, i := range idxs[1:] {
+			ev := events[i]
+			if len(titles) < 3 && ev.Title != "" && !containsStr(titles, ev.Title) {
+				titles = append(titles, ev.Title)
+			}
+			// 保留 |score| 最大的事件属性
+			if absScore(ev.Score) > absScore(merged.Score) {
+				merged.Score = ev.Score
+				merged.Direction = ev.Direction
+				merged.Reason = ev.Reason
+				merged.EventType = ev.EventType
+				merged.Level = ev.Level
+			}
+			merged.RelatedStocks = mergeStr(merged.RelatedStocks, ev.RelatedStocks)
+			merged.CleanedStocks = mergeStr(merged.CleanedStocks, ev.CleanedStocks)
+		}
+		merged.Title = strings.Join(titles, " | ")
+		out = append(out, merged)
+	}
+	if len(out) != len(events) {
+		log.Printf("[engine] 事件聚簇: %d → %d 条", len(events), len(out))
+	}
+	return out
+}
+
+// applyEventDecay 板块事件衰减：同板块同方向事件在 H 小时内重复出现时，
+// Score 乘以 0.5^(H/4)（1h→0.84, 2h→0.71, 4h→0.50, 8h→0.25），弱化重复消息。
+// §E 修复：map 加锁（结构体注释声明 mu 保护全部可变字段，此字段是历史例外——并发
+// 手动触发/测试即 fatal concurrent map read/write）+ 清理 >24h 过期键防慢性泄漏。
+func (e *Engine) applyEventDecay(events []newsagent.NewsEvent) {
+	now := time.Now()
+	for i := range events {
+		ev := &events[i]
+		if ev.Level == "个股" || len(ev.Sectors) == 0 {
+			continue
+		}
+		key := strings.Join(ev.Sectors, "+") + "|" + ev.Direction
+		e.mu.Lock()
+		if last, ok := e.sectorEventTimes[key]; ok {
+			hours := now.Sub(last).Hours()
+			if hours > 0 && hours < 24 {
+				ev.Score *= math.Pow(0.5, hours/4)
+				log.Printf("[engine] 事件衰减 %s(%s): 距上次%.1fh, score→%.2f", key, ev.Title, hours, ev.Score)
+			}
+		}
+		// 惰性清理：衰减窗口仅 24h，过期条目已无作用
+		for k, t := range e.sectorEventTimes {
+			if now.Sub(t).Hours() >= 24 {
+				delete(e.sectorEventTimes, k)
+			}
+		}
+		e.sectorEventTimes[key] = now
+		e.mu.Unlock()
+	}
+}
+
+// enhanceFlag 读取信号/战法增强开关（§EnhanceConfig）。
+// cfgMgr 为 nil（测试/最小装配）或未挂 Rules 时返回 false → 全部增强默认关闭、零行为变化。
+// English: reads a signal/tactic enhancement toggle (§EnhanceConfig). Returns false when cfgMgr
+// is nil or Rules is absent → all enhancements off by default.
+func (e *Engine) enhanceFlag(get func(config.EnhanceConfig) bool) bool {
+	e.mu.RLock()
+	mgr := e.cfgMgr
+	e.mu.RUnlock()
+	if mgr == nil {
+		return false
+	}
+	return get(mgr.Rules.Enhance)
+}
+
+// applyAgeDecay 新闻时效衰减（§P1.1）：事件年龄按类型半衰期降权。
+// 在汇聚点（out.valid 值副本）上次于重复事件衰减执行；过期事件 Score→0 由下游 6d
+// 阈值过滤自然清除。开关 Enhance.NewsDecay 关闭时零操作。
+// 注：固化回填（6a）事件也参与衰减——跨日旧事件会被正常淘汰，符合"过期事件不冒充新事件"。
+// English: news time-decay (P1.1). Rewrites the score of each event copy by age/per-type
+// half-life. Runs at the pipeline choke point after repeat-event decay; expired events (Score→0)
+// are dropped by the downstream 6d threshold filter. No-op unless Enhance.NewsDecay is enabled.
+// Note: freeze-backfilled (6a) events also decay, so stale cross-day events drop out naturally.
+func (e *Engine) applyAgeDecay(events []newsagent.NewsEvent) {
+	if !e.enhanceFlag(func(c config.EnhanceConfig) bool { return c.NewsDecay }) {
+		return
+	}
+	now := time.Now()
+	for i := range events {
+		ev := &events[i]
+		orig := ev.Score
+		ev.Score = ev.EffectiveScore(now)
+		if ev.Score != orig {
+			log.Printf("[engine][news漏斗] 时效衰减 %s(%s) age=%v: score %.2f→%.2f",
+				ev.EventType, ev.Title, time.Since(parseEventTime(ev.Datetime)).Round(time.Second), orig, ev.Score)
+		}
+	}
+}
+
+// ensureImpactTable 懒建新闻影响率表（线程安全；Enhance.NewsImpact 关闭时无需创建）。
+func (e *Engine) ensureImpactTable() *research.ImpactTable {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.impactTbl == nil {
+		e.impactTbl = research.NewImpactTable(0)
+	}
+	return e.impactTbl
+}
+
+// applyNewsImpact 新闻影响率加权（§P2.1）：按"事件类型×当前情绪相位×方向"的历史影响中位
+// 对事件分数乘 [0.7,1.3] 置信度乘子（样本不足回退 1.0，零行为变化）。开关 Enhance.NewsImpact
+// 关闭时 no-op。English: news impact-rate weighting (P2.1) multiplies each event's score by the
+// [0.7,1.3] confidence multiplier from historical median impact by type×phase×direction (1.0 when
+// under-sampled). No-op unless Enhance.NewsImpact is on.
+func (e *Engine) applyNewsImpact(events []newsagent.NewsEvent) {
+	if !e.enhanceFlag(func(c config.EnhanceConfig) bool { return c.NewsImpact }) {
+		return
+	}
+	tb := e.ensureImpactTable()
+	e.mu.RLock()
+	phase := e.lastEmotionPhase
+	e.mu.RUnlock()
+	for i := range events {
+		ev := &events[i]
+		mul := tb.Confidence(ev.EventType, phase, ev.Direction)
+		if mul == 1.0 {
+			continue
+		}
+		orig := ev.Score
+		ev.Score *= mul
+		log.Printf("[engine][news漏斗] 影响率加权 %s(%s) 相位=%s 方向=%s 乘子=%.2f score %.2f→%.2f",
+			ev.EventType, ev.Title, phase, ev.Direction, mul, orig, ev.Score)
+	}
+}
+
+// RecordNewsImpact 摄入一条"新闻类型×相位×方向"的 5/30/60 分钟超额收益样本（§P2.1）。
+// 由调度器/盘后回填调用；开关关闭时仍摄入（表一直累积，供后续开关启用即用），
+// 但不影响当前打分。English: ingests one type×phase×direction excess-return sample for §P2.1.
+// Called by the scheduler/EOD backfill; samples always accumulate (usable once the toggle is on)
+// but do not affect scoring while disabled.
+func (e *Engine) RecordNewsImpact(evType, phase, direction string, excess5, excess30, excess60 []float64, halfLifeObs float64) {
+	tb := e.ensureImpactTable()
+	tb.Update(evType, phase, direction, excess5, excess30, excess60, halfLifeObs)
+}
+
+// ImpactTableRef 返回影响率表用于持久化合并（Merge）——外部加载磁盘表后调用 Merge。
+// 开关关闭或未初始化时返回 nil。English: returns the impact table for persistence/merge.
+func (e *Engine) ImpactTableRef() *research.ImpactTable {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	return e.impactTbl
+}
+
+// SectorLinkageLeaders 把当日涨停池折算为联动龙头列表（§P2.2）。
+// 龙头定义复用 sector_agent.IsLeader（封单强度 × 连板高度）。
+// English: converts today's limit-up pool into linkage leaders (P2.2), reusing IsLeader.
+func (e *Engine) SectorLinkageLeaders(pool []data.LimitUpStock) []sector_agent.LinkageLeader {
+	if len(pool) == 0 {
+		return nil
+	}
+	out := make([]sector_agent.LinkageLeader, 0, len(pool))
+	for _, s := range pool {
+		out = append(out, sector_agent.LinkageLeader{
+			Code:        s.Code,
+			Name:        s.Name,
+			Sector:      s.Industry,
+			SealRatio:   s.SealRatio,
+			BoardHeight: s.LianBan,
+			ChangePct:   s.ChangePct,
+		})
+	}
+	return out
+}
+
+// sectorLinkageObserve 板块联动观察钩子（§P2.2，观察版·零行为变化）：Enhance.SectorLinkage
+// 开启时把当日涨停池折算为龙头列表写入 e.sectorLeaders。
+// §F-7 状态标注（20260918 复核）：sectorLeaders 只写不读、FindLinkageCandidates 仅单测调用，
+// 开关也不在任何 Web UI 暴露（只有配置项 enhance.sector_linkage_enabled，默认关）——
+// 即"开与关对交易产出完全等价"。接入交易意图产出前不要依赖该开关。
+// English: §P2.2 sector-linkage observation hook, observation-only: when
+// Enhance.SectorLinkage is on it records today's leaders into e.sectorLeaders, which is
+// written-but-never-read and FindLinkageCandidates has zero production callers; the switch has
+// no Web UI surface (config key enhance.sector_linkage_enabled, off by default), so enabling it
+// changes no trading output. Do not rely on it before candidates feed trading intent.
+func (e *Engine) sectorLinkageObserve(pool []data.LimitUpStock) {
+	if !e.enhanceFlag(func(c config.EnhanceConfig) bool { return c.SectorLinkage }) || len(pool) == 0 {
+		return
+	}
+	leaders := e.SectorLinkageLeaders(pool)
+	var strong []sector_agent.LinkageLeader
+	for _, ld := range leaders {
+		if sector_agent.IsLeader(ld) {
+			strong = append(strong, ld)
+		}
+	}
+	if len(strong) == 0 {
+		return
+	}
+	e.mu.Lock()
+	e.sectorLeaders = strong
+	e.mu.Unlock()
+	log.Printf("[engine] §P2.2 板块联动观察：龙头 %d 只", len(strong))
+	for i := 0; i < len(strong) && i < 5; i++ {
+		log.Printf("[engine] §P2.2 龙头[%d] %s(%s) %s 封单比%.1f%% 连板%d",
+			i, strong[i].Name, strong[i].Code, strong[i].Sector, strong[i].SealRatio, strong[i].BoardHeight)
+	}
+}
+
+// MarketStateObserve 市场状态机观察（§P2.3）：Enhance.MarketState 开启时按快照更新状态机的
+// 牛/震荡/熊判定与仓位档位。喂入数据由调用方（主循环已有涨停池/连板/炸板等）装配。
+// 关闭或快照空时零操作。返回当前状态与仓位档位上限。
+// English: market-state observation (P2.3). When enabled, feeds a snapshot into the bull/range/
+// bear tracker and updates the max position cap. No-op when disabled or the snapshot is empty.
+// Returns the current state and the max position fraction.
+func (e *Engine) MarketStateObserve(limitUpCount, ladderHeight int, breakRate, upRatio, ma20Slope, ma60Slope float64) (research.MarketState, float64) {
+	if !e.enhanceFlag(func(c config.EnhanceConfig) bool { return c.MarketState }) {
+		e.mu.Lock()
+		e.lastMarketState, e.lastMaxPosPct = "", 0 // 状态机关闭：清缓存，F2 不展示状态徽标
+		e.mu.Unlock()
+		return research.StateRange, 0
+	}
+	e.mu.Lock()
+	if e.marketTracker == nil {
+		e.marketTracker = research.NewStateTracker(research.StateConfig{})
+	}
+	tracker := e.marketTracker
+	e.mu.Unlock()
+	st := tracker.Observe(research.StateSnapshot{
+		LimitUpCount:   limitUpCount,
+		LadderHeight:   ladderHeight,
+		BreakRate:      breakRate,
+		UpRatio:        upRatio,
+		IndexMA20Slope: ma20Slope,
+		IndexMA60Slope: ma60Slope,
+	}, time.Now())
+	cap := tracker.MaxPosPct()
+	e.mu.Lock()
+	e.lastMarketState, e.lastMaxPosPct = string(st), cap
+	e.mu.Unlock()
+	if st != research.StateRange {
+		log.Printf("[engine] §P2.3 市场状态=%s 仓位档=%.0f%%（涨停%d 连板%d 炸板率%.0f%% 上涨占比%.0f%%）",
+			st, cap*100, limitUpCount, ladderHeight, breakRate, upRatio)
+	}
+	return st, cap
+}
+
+// MarketEnvSnapshot 返回市场环境条（F2）所需的最近一轮快照：情绪相位 + 市场状态（关=空串）+ 仓位档
+// + 风险档（空/Yellow/Red）+ 触发原因。纯读缓存加锁快照，不触发取数。
+// English: returns the latest environment snapshot for the F2 status bar — emotion phase, market state
+// (empty when the machine is off), position cap, risk tier (empty/Yellow/Red), and trigger reasons —
+// read from cache under lock (no fetch).
+func (e *Engine) MarketEnvSnapshot() (emotion, marketState string, maxPosPct float64, riskTier string, riskReasons []string) {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	return e.lastEmotionPhase, e.lastMarketState, e.lastMaxPosPct, e.lastRiskTier, e.lastRiskReasons
+}
+
+// macroCalGuardMu/macroCalGuardDay 进程级"每日一次校准"闸门（校准缓存是进程全局的，
+// 多账号引擎共用，故只需一个引擎每天跑一次，避免重复 LLM 调用/token 浪费）。
+var (
+	macroCalGuardMu  sync.Mutex
+	macroCalGuardDay string
+)
+
+// calibrateMacroCalendarOnceToday §MARKET_RISK_GATE P6：每日一次用外部 API/LLM 校准宏观日历真实发布日。
+// 仅当风险档总开 + 校准开关开时执行；进程级每日一次去重；任何失败静默降级公式（不阻断主循环）。
+// English: P6 — calibrate the macro calendar (real CPI/FOMC/delivery dates) once per day via external API/LLM.
+// Runs only when the risk gate + calibration switch are both on; process-level once-per-day; every failure
+// silently degrades to formula without blocking the main loop.
+func (e *Engine) calibrateMacroCalendarOnceToday() {
+	if e.macroCalCachePath == "" {
+		return // 无落盘目录（纯内存引擎）→ 跳过校准
+	}
+	e.mu.RLock()
+	cm := e.cfgMgr
+	llm := e.llmClient
+	e.mu.RUnlock()
+	if cm == nil {
+		return
+	}
+	mg := cm.Rules.Strategy.MacroGate
+	if !mg.RiskGateOn() || !mg.CalibrateOn() {
+		return
+	}
+	today := data.TradingDayDate(time.Now())
+	macroCalGuardMu.Lock()
+	if macroCalGuardDay == today {
+		macroCalGuardMu.Unlock()
+		return
+	}
+	macroCalGuardDay = today
+	macroCalGuardMu.Unlock()
+
+	var chat data.ChatFunc
+	if llm != nil {
+		chat = llm.Chat // 可选 LLM 出口：nil 时校准内部静默降级为公式推算，不阻断
+	}
+	src, n := data.CalibrateMacroCalendar(chat, mg.CalibrateAPIURL, e.macroCalCachePath, time.Now().Year(), mg.CalibrateHorizonMonths())
+	log.Printf("[engine] §P6 宏观日历校准完成: 来源=%s 校准事件=%d", src, n)
+}
+
+// macroDailyGuardMu/macroDailyGuardDay 进程级"每日一次风险档留痕"闸门（多账号引擎共用研究库，只写一次）。
+var (
+	macroDailyGuardMu  sync.Mutex
+	macroDailyGuardDay string
+)
+
+// persistRiskDailyToday §MARKET_RISK_GATE P8：把当日风险档快照落研究库 market_risk_daily（每日一次，进程级去重）。
+// 研究库未注入（d1Store=nil，纯内存/无研究库）时静默跳过。写入取最新一轮快照（同日重复运行覆盖）。
+// English: P8 — persist today's risk-tier snapshot into the research DB's market_risk_daily (once per day,
+// process-level dedup); silently skipped when the research DB isn't wired (nil d1Store); a same-day rerun
+// overwrites with the latest round.
+func (e *Engine) persistRiskDailyToday(row store.MarketRiskDailyRow) {
+	if e.d1Store == nil || row.TradeDate == "" {
+		return
+	}
+	macroDailyGuardMu.Lock()
+	if macroDailyGuardDay == row.TradeDate {
+		macroDailyGuardMu.Unlock()
+		return
+	}
+	macroDailyGuardDay = row.TradeDate
+	macroDailyGuardMu.Unlock()
+	if err := e.d1Store.UpsertMarketRiskDaily(row); err != nil {
+		log.Printf("[engine] §P8 风险档日级留痕失败: %v", err)
+	}
+}
+
+// nanPtr 把 NaN 转为 nil（供落库 NULL 语义：缺失=弃权，不当 0）。
+// English: maps NaN to nil for NULL persistence (missing = abstain, never a fake 0).
+func nanPtr(x float64) *float64 {
+	if x != x { // NaN
+		return nil
+	}
+	v := x
+	return &v
+}
+
+// maxLadder 涨停池最高连板数（§P2.3 市场状态机输入）。English: max board height in the pool.
+func maxLadder(pool []data.LimitUpStock) int {
+	m := 0
+	for _, s := range pool {
+		if s.LianBan > m {
+			m = s.LianBan
+		}
+	}
+	return m
+}
+
+// SignalQualityRecord 记录一个信号结果样本（§P2.5）：按 战法×板块×新闻类型×情绪相位 分桶。
+// 归因方（引  擎对信号做胜负判定后）调用；开关关闭时仍累积（启用即用），不影响打分。
+// English: records one signal-outcome sample (P2.5) bucketed by tactic×sector×news-type×phase.
+// Called by the attribution side after win/loss judgment; samples always accumulate.
+func (e *Engine) SignalQualityRecord(tactic, sector, newsType, phase string, hit bool) {
+	tb := e.signalQualityTable()
+	if tb == nil {
+		return
+	}
+	tb.Update(research.MakeQualityKey(tactic, sector, newsType, phase), hit)
+}
+
+// SignalQualityWeight 返回分桶权重乘子（§P2.5）；未达最小样本或未开启时恒 1.0。
+// English: returns the bucket weight multiplier (P2.5); 1.0 below MinSample or when disabled.
+func (e *Engine) SignalQualityWeight(tactic, sector, newsType, phase string) float64 {
+	tb := e.signalQualityTable()
+	if tb == nil {
+		return 1.0
+	}
+	return tb.Weight(research.MakeQualityKey(tactic, sector, newsType, phase))
+}
+
+// signalQualityTable 按 DynWeight 开关返回信号质量表；开关关闭返回 nil（不参与权重）。
+func (e *Engine) signalQualityTable() *research.SignalQualityTable {
+	if !e.enhanceFlag(func(c config.EnhanceConfig) bool { return c.DynWeight }) {
+		return nil
+	}
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.signalQuality == nil {
+		e.signalQuality = research.NewSignalQualityTable(0)
+	}
+	return e.signalQuality
+}
+
+// parseEventTime 解析新闻 Datetime；失败时返回零时间（仅日志展示用）。
+func parseEventTime(dt string) time.Time {
+	t, err := time.ParseInLocation("2006-01-02 15:04:05", dt, time.Local)
+	if err != nil {
+		return time.Time{}
+	}
+	return t
+}
+
+// normalizeCode 规整股票代码：去除交易所后缀（.SH/.SZ 等），保留 6 位纯数字。
+// English: normalizes a stock code by stripping any exchange suffix, keeping the 6-digit form.
+func normalizeCode(code string) string {
+	if i := strings.IndexByte(code, '.'); i > 0 {
+		return code[:i]
+	}
+	return code
+}
+
+// AuctionStrength 返回某代码最近一轮竞价强度分（§P1.2；非竞价窗口或未开启时返回 0）。
+// 供战法代理开盘窗口（9:30-10:00）确认/观察与外部展示消费。
+// English: returns the latest auction strength score for a code (P1.2; 0 outside the auction
+// window or when disabled). Consumed by the combat agent's open-window confirmation/observation.
+func (e *Engine) AuctionStrength(code string) float64 {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	if len(e.auctionStrengths) == 0 {
+		return 0
+	}
+	return e.auctionStrengths[normalizeCode(code)]
+}
+
+// containsStr 判断字符串切片是否包含目标。
+func containsStr(s []string, v string) bool {
+	for _, x := range s {
+		if x == v {
+			return true
+		}
+	}
+	return false
+}
+
+// mergeStr 合并两个字符串切片（去重，保留顺序）。
+func mergeStr(a, b []string) []string {
+	out := make([]string, 0, len(a)+len(b))
+	for _, s := range append(a, b...) {
+		if s == "" || containsStr(out, s) {
+			continue
+		}
+		out = append(out, s)
+	}
+	return out
+}
+
+// bearHitCodes 收拢本轮全部利空标的（利空板块领跌股 + 利空个股），返回 code→true 映射。
+// 供持仓利空提醒使用：凡命中该集合的持仓提示卖出。
+func bearHitCodes(sr *strategy_engine.StrategyResult) map[string]bool {
+	out := make(map[string]bool)
+	for _, bs := range sr.BearSectors {
+		for _, code := range bs.LeadStocks {
+			out[code] = true
+		}
+	}
+	for _, code := range sr.BearStocks {
+		out[code] = true
+	}
+	return out
+}
+
+// bearHitReasons 返回 利空个股 → 归因说明 的映射（E4：利空归因持仓抛售提醒用）。
+// 说明拼接命中的利空板块名、上榜原因与关联新闻标题，供"利空归因到持仓"时向用户解释为何抛售。
+// English: returns a map of bearish stock → attribution reason (E4: bearish-attribution sell alerts).
+// The reason concatenates the hit bear sector name, its listing reason and linked news titles so the
+// user understands why their holding should be sold.
+func bearHitReasons(sr *strategy_engine.StrategyResult) map[string]string {
+	out := make(map[string]string)
+	for _, bs := range sr.BearSectors {
+		desc := bs.Name
+		if bs.Reason != "" {
+			desc += "(" + bs.Reason + ")"
+		}
+		if len(bs.NewsTitles) > 0 {
+			desc += " 事件:" + strings.Join(bs.NewsTitles, ";")
+		}
+		for _, code := range bs.LeadStocks {
+			if prev, ok := out[code]; ok {
+				out[code] = prev + " | " + desc
+			} else {
+				out[code] = desc
+			}
+		}
+	}
+	for _, code := range sr.BearStocks {
+		if _, ok := out[code]; !ok {
+			out[code] = "利空个股事件"
+		}
+	}
+	return out
+}
+
+// shortSellMark §SHORT-2 做空战法卖出标记（交易日 + 触发战法名）。
+// English: §SHORT-2 bear-tactic sell mark — trading day plus the triggering tactic name.
+type shortSellMark struct {
+	Day    string // 标记当日交易日（YYYY-MM-DD）（the trading day the mark was stamped）
+	Tactic string // 触发战法中文名（如「放量破位」）（display name of the tactic that fired）
+}
+
+// markShortSell §SHORT-2 记录做空战法对某股的 sell 标记（纯code → 战法名/交易日）。
+// 主循环每轮命中即刷新（保留当日最新战法名）；跨交易日自然失效（消费方比对交易日）。
+// English: §SHORT-2 — stamp a bear-tactic sell mark for a code (pure code → tactic/trading-day);
+// refreshed each round it fires, and the consumer drops stale marks from another trading day.
+func (e *Engine) markShortSell(code, tactic string) {
+	pure := pureTsCode(code)
+	if pure == "" {
+		return
+	}
+	e.shortSellMarksMu.Lock()
+	defer e.shortSellMarksMu.Unlock()
+	if e.shortSellMarks == nil {
+		e.shortSellMarks = make(map[string]shortSellMark)
+	}
+	e.shortSellMarks[pure] = shortSellMark{Day: data.TradingDayDate(e.nowTime()), Tactic: tactic}
+}
+
+// shortSellMarkOf §SHORT-2 查询某股当日有效做空 sell 标记（跨日自动视为无效）。
+// English: §SHORT-2 — the valid same-trading-day bear sell mark for a code, empty otherwise.
+func (e *Engine) shortSellMarkOf(code string) (shortSellMark, bool) {
+	e.shortSellMarksMu.Lock()
+	defer e.shortSellMarksMu.Unlock()
+	m, ok := e.shortSellMarks[pureTsCode(code)]
+	if !ok || m.Day != data.TradingDayDate(e.nowTime()) {
+		return shortSellMark{}, false
+	}
+	return m, true
+}
+
+// shortTacticCloseAdvices §SHORT-2 把当日做空战法 sell 标记转换为实盘清仓级建议（止损类，
+// Source=short_tactic），供 autoExecuteRealSells 复用门槛（mode=auto+auto_sell）/幂等键/
+// 剩余量扣减，syncLiveAdviceAlerts 复用 P1 强提醒。跳过已有止损级建议的码（避免双触发）
+// 与行情缺失的持仓（宁可不卖）。
+// English: §SHORT-2 — convert same-trading-day bear-tactic sell marks into 止损-class live advices
+// (Source=short_tactic) so the existing auto-sell gates/idempotency/remaining-qty logic and the P1
+// strong-reminder channel apply unchanged; codes already carrying a stop-loss advice are skipped
+// (no double trigger), and holdings without a live quote are never sold.
+func (e *Engine) shortTacticCloseAdvices(positions []store.RealPosition, advices []trading.PositionAdvice, quotes map[string]*data.StockInfo) []trading.PositionAdvice {
+	var out []trading.PositionAdvice
+	for i := range positions {
+		p := &positions[i]
+		if p.Qty <= 0 {
+			continue
+		}
+		mark, ok := e.shortSellMarkOf(p.TsCode)
+		if !ok {
+			continue
+		}
+		dup := false
+		for _, a := range advices {
+			if a.Code == pureTsCode(p.TsCode) && a.Action == "止损" {
+				dup = true
+				break
+			}
+		}
+		if dup {
+			continue
+		}
+		q := quotes[pureTsCode(p.TsCode)]
+		if q == nil || q.Price <= 0 {
+			continue // 无实时价不下单（宁可不卖）（no live quote → never sell）
+		}
+		profitPct := 0.0
+		if p.CostPrice > 0 {
+			profitPct = (q.Price - p.CostPrice) / p.CostPrice * 100
+		}
+		out = append(out, trading.PositionAdvice{
+			Code:        pureTsCode(p.TsCode),
+			TsCode:      p.TsCode,
+			Name:        p.Name,
+			Qty:         p.Qty,
+			Action:      "止损",
+			Level:       "高",
+			Reason:      fmt.Sprintf("做空战法「%s」判定走弱，自动清仓持仓", mark.Tactic),
+			RefPrice:    q.Price,
+			ProfitPct:   profitPct,
+			Strategy:    mark.Tactic,
+			GeneratedAt: e.nowTime(),
+			Source:      "short_tactic",
+		})
+	}
+	return out
+}
+
+// autoExitReportSells FIX#15 report 账本自动执行卖出（对用户手动录入报表持仓/未进纸面引擎的持仓生效）：
+// close→rpt.LogExit 全平（自动镜像盈亏）；trim→rpt.SellLot 半仓（每码每日一次 reportTrimDone 去重）。
+// 只处理「全局纸面引擎 e.paper 未持有」的 code——已由 paper 账本自动卖出的不再重复处理，避免双账簿重复卖。
+// 行情缺失跳过（与 paper autoSellLocked 同口径：宁可不卖也不以错误价格记账）。
+// English: auto-exits report-book holdings (manual/未进 paper 账本) on sell signals — close→LogExit full,
+// trim→SellLot half once per code per day (reportTrimDone). Only codes the global paper engine does NOT
+// hold are handled (paper already auto-sells its own), avoiding double-selling both books. Missing quotes skip
+// (same stance as paper autoSellLocked: better not to sell than to book at a wrong price).
+func (e *Engine) autoExitReportSells(sells []combat_agent.Signal, quotes map[string]*data.StockInfo) {
+	e.mu.RLock()
+	paper := e.paper
+	e.mu.RUnlock()
+	if e.rpt == nil || len(sells) == 0 {
+		return
+	}
+	// 构建待执行的卖出动作（code → act），仅保留纸面引擎未持有的
+	plan := make(map[string]string, len(sells))
+	for _, s := range sells {
+		act := combat_agent.SellAction(s)
+		if act != "" {
+			if paper != nil && paper.Enabled() && paper.Holds(s.Code) {
+				continue // 纸面账本已持有，由 paper 自动卖,避免双账簿重复
+			}
+			plan[s.Code] = act
+		}
+	}
+	if len(plan) == 0 {
+		return
+	}
+	now := time.Now()
+	td := data.TradingDayDate(now)
+	e.reportTrimDoneMu.Lock()
+	defer e.reportTrimDoneMu.Unlock()
+	if e.reportTrimDone == nil {
+		e.reportTrimDone = make(map[string]string)
+	}
+	// 遍历 report 账本持仓，命中计划动作且行情有效时执行卖出。
+	for _, pos := range e.rpt.HeldPositions() {
+		act, hit := plan[pos.Code]
+		if !hit || pos.Code == "" {
+			continue
+		}
+		q, ok := quotes[pos.Code]
+		if !ok || q == nil || q.Price <= 0 {
+			continue // 无实时价不自动卖（宁缺毋错价）
+		}
+		reason := "自动卖出"
+		if act == "trim" {
+			// trim：半仓（整手向下取整），每码每交易日最多一次
+			if e.reportTrimDone[pos.Code] == td {
+				continue
+			}
+			half := int(pos.Quantity) / 2 / 100 * 100
+			if half <= 0 {
+				continue // 持仓不足两手半仓无意义，留给 close 类信号处理
+			}
+			e.rpt.SellLot(pos.SignalID, q.Price, float64(half))
+			reason = "自动减仓"
+			e.reportTrimDone[pos.Code] = td
+		} else if act == "close" {
+			e.rpt.LogExit(pos.SignalID, q.Price, reason)
+		}
+		log.Printf("[engine] report 账本自动%s %s(%s) 价%.2f act=%s", reason, pos.Code, pos.Name, q.Price, act)
+	}
+}

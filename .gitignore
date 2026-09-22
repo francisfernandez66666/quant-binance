@@ -1,0 +1,117 @@
+# 文档/SVG/流程图（不入库：文档与流程图全部由本地管理，不提交 git）
+*.svg
+*.pdf
+*.md
+*.drawio
+*.png
+*.jpg
+*.jpeg
+*.mm
+*.puml
+*.dot
+*.gv
+README*
+README.md
+README-*.md
+events_leftside.yaml
+FLOW*
+ARCH*
+SEQUENCE*
+
+# 构建产物
+# 仅忽略仓库根的编译产物 ./quant，避免误伤源码目录 cmd/quant/（其 *_test.go 需纳入版本控制）
+/quant
+dist/
+
+# 前端依赖
+node_modules/
+
+# 运行数据
+.quant-trading-v2/
+*.log
+monitor_logs/
+nohup.out
+
+# 运行时数据库（含真实持仓/成交，禁止入库）
+data.db
+*.db
+*.sqlite
+*.sqlite3
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+
+# Python
+__pycache__/
+*.pyc
+# pytest 会自带 .gitignore 兜底，这里显式声明以防裸 pytest 版本不写（缓存可随时重建，不入库）
+.pytest_cache/
+
+# 本地回测工具（不入库）
+bt_jq/
+
+# Android 移动端构建产物（源码入库，构建输出不入库）
+mobile/.gradle/
+mobile/build/
+mobile/app/build/
+mobile/local.properties
+mobile/.kotlin/
+mobile/keystore*.jks
+mobile/gradle/wrapper/gradle-wrapper.jar
+mobile/gradle/wrapper/gradle-wrapper.jar.*
+# APK 内嵌的前端产物（由 build_apk.sh 从 web/dist 生成，不入库）
+mobile/app/src/main/assets/
+
+# go build ./cmd/research 产物（与包目录同名的本地构建二进制）
+/research
+
+# §GAP2-W1 签名口令文件（随机生成，仅本机）
+mobile/keystore.pass
+
+# §安全：QMT 网关本地配置（含 token/账户，禁止入库）
+qmt_gateway/config.xt.json
+
+# 构建产物 / 二进制（不入库，避免大体积与机密泄漏）
+*.exe
+*.zip
+/qmtctl
+mobile/app/src/debug/
+mobile/app/src/release/
+
+# 一次性调试脚本归档（本地工具，不入库）
+scripts/qmt-debug/
+
+# 构建/冒烟产物目录（如 bin/quant-staging 本地二进制），不入库
+bin/
+
+# §F6 Playwright 冒烟产物（报告/trace/截图，不入库）
+web/test-results/
+web/playwright-report/
+web/playwright/.cache/
+web/.auth/
+
+# §FIX-5 UAT 自举的临时栈（独立数据目录 + 构建产物 + 日志，不入库）
+.uat-data/
+
+# 本地 QMT 网关 mock（UAT 用二进制，不入库）
+/qmt-mock
+# §AUDIT-PM 2026-09-15 仓库卫生：根目录大二进制产物（同 /quant /qmt-mock 口径），勿再裸提交
+/backtest
+/news_signal_latency
+/researchd
+/replay
+/dataload
+/fixturecapture
+/commentcheck
+/pydata
+/backtest_params.json.bak*
+
+# 文件桥测试/运行期命令中转文件（qmt_gateway 测试在 cwd 落盘，非仓库资产）
+qmt_gateway/bridge_cmd.json

@@ -1,0 +1,355 @@
+// ── 自选股页面 Watchlist.jsx ──
+// 展示自选股多维评分（N形/龙头/双凸/龙回头/动量），支持添加/删除/排序、展开分时+盘口。
+// 纯 TDesign 组件（Table / Card / Tag / Button / Input / Dialog），无自定义 CSS。
+import React, { useState, useEffect, useRef } from 'react'
+import { Card, Table, Button, Input, Dialog, MessagePlugin } from 'tdesign-react'
+import * as api from '../api/index.js'
+import KLineChart from '../components/KLineChart.jsx'
+import DepthPanel from '../components/DepthPanel.jsx'
+import StockDetailDrawer from '../components/StockDetailDrawer.jsx'
+
+// 自选股列表的 localStorage 缓存键（账号后缀由 cacheKeyForAccount() 拼接）
+const CACHE_KEY = 'wl_cache_v1'
+
+// §F29 修复：自选股缓存按账号隔离——旧版共用 CACHE_KEY，同一浏览器切账号后
+// 首帧渲染会先闪出前一账号的自选列表（后端返回后被覆盖，但那一瞬已泄露）。
+// 迁移：读时若发现无账号后缀的旧键，一次性清除。
+// English: F29 — account-scoped watchlist cache; the legacy un-scoped key is purged on read.
+function cacheKeyForAccount() {
+  const acc = (typeof api.getAccount === 'function' && api.getAccount()) || ''
+  return acc ? CACHE_KEY + ':' + acc : CACHE_KEY
+}
+
+// 将自选股列表持久化到 localStorage
+function persistCache(stocks) {
+  try { localStorage.setItem(cacheKeyForAccount(), JSON.stringify(stocks)) } catch (_) {}
+}
+// 从 localStorage 读取自选股缓存
+function loadCache() {
+  try {
+    const legacy = localStorage.getItem(CACHE_KEY)
+    if (legacy) localStorage.removeItem(CACHE_KEY)
+    const raw = localStorage.getItem(cacheKeyForAccount())
+    const arr = raw ? JSON.parse(raw) : []
+    return Array.isArray(arr) ? arr : []
+  } catch (_) { return [] }
+}
+
+// 根据分数与阈值返回评分单元格的颜色样式
+function scoreStyle(score, pass, strongMin) {
+  if (!score || score <= 0) return { color: 'var(--app-text-2)', fontWeight: 600 }
+  if (score >= strongMin) return { color: 'var(--app-up)', fontWeight: 600 }
+  if (pass) return { color: 'var(--td-warning-color)', fontWeight: 600 }
+  return { color: 'var(--app-text-2)', fontWeight: 600 }
+}
+
+// 安全读取字段值
+function val(e, key) {
+  const v = e[key]
+  if (typeof v === 'string') return v || ''
+  return v || 0
+}
+
+/**
+ * 自选股页面组件
+ * 展示多维评分、支持添加/删除/排序与展开分时/盘口。
+ * @returns {JSX.Element}
+ */
+export default function Watchlist() {
+  // 自选股列表（含行情与各维度评分）
+  const [stocks, setStocks] = useState([])
+  // 新增输入框代码
+  const [newCode, setNewCode] = useState('')
+  // 添加请求进行中标记（防重复提交）
+  const [adding, setAdding] = useState(false)
+  // 已展开分时图的代码列表
+  const [expandedKeys, setExpandedKeys] = useState([])
+  // 移动端操作面板对应的自选股
+  const [sheetStock, setSheetStock] = useState(null)
+  // §F3 全局个股详情抽屉目标（{code,name,price,changePct}），null=关闭
+  const [detail, setDetail] = useState(null)
+  // 轮询定时器（30s）
+  const timer = useRef(null)
+  // §修复 P2#23：受控排序状态——点击表头排序后持久保留，避免 30s 数据轮询整体替换把排序重置
+  // English: P2#23 — controlled sort state keeps the user's column sort across the 30s data poll.
+  const [sort, setSort] = useState(null)
+
+  // 初始化：读取缓存、加载数据、启动 30s 轮询
+  useEffect(() => {
+    setStocks(loadCache())
+    load()
+    // 每 30s 轮询刷新自选股行情与评分
+    timer.current = setInterval(load, 60000) // §F5 兜底降为 60s
+    return () => { if (timer.current) clearInterval(timer.current) }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
+
+  // 自选股变动时持久化缓存
+  useEffect(() => { persistCache(stocks) }, [stocks])
+
+  // 按当前排序键计算展示列表，无排序键时按最高维度分倒序
+  const sortedEvals = (() => {
+    const arr = [...stocks]
+    return arr.sort((a, b) => {
+      const sa = Math.max(a.n_score || 0, a.dragon_score || 0, a.db_score || 0, a.dr_score || 0, a.m_score || 0)
+      const sb = Math.max(b.n_score || 0, b.dragon_score || 0, b.db_score || 0, b.dr_score || 0, b.m_score || 0)
+      return sb - sa
+    })
+  })()
+
+  // §WL-FIX（20260917）：库存经 stocksRef 供 load 读取——旧实现直接闭包引用 stocks，
+  // 60s 轮询持有的是首帧闭包（恒 []），「非交易时段且已有行情则跳过」的判定永远失真（恒不跳过）。
+  // English: WL-FIX — load reads stocksRef.current so the 60s poll no longer sees a stale closure.
+  const stocksRef = useRef([])
+  useEffect(() => { stocksRef.current = stocks }, [stocks])
+
+  // 加载自选行情、评估数据并合并快照信息
+  async function load() {
+    try {
+      const st = await api.fetchStatus()
+      const cur = stocksRef.current
+      const hasEmptyCode = cur.some((s) => !s.code)
+      // 非交易时段且已有关联行情时跳过刷新，避免无谓请求
+      if (!api.isTradingSession(st.session) && cur.length && !hasEmptyCode) return
+      api.setLastSession(st.session)
+      const [snap, wl, ev] = await Promise.all([
+        api.fetchSnapshot(), api.fetchWatchlist(), api.fetchEvaluations(),
+      ])
+      const wlStocks = (wl.stocks || []).map((c) => (typeof c === 'object' ? c : { code: c }))
+      // 归一为 {code} 形式的股票列表再取代码集合
+      const codes = wlStocks.map((c) => c.code)
+      if (!codes.length) { setStocks([]); return }
+      const wlMap = {}
+      wlStocks.forEach((c) => { wlMap[c.code] = c })
+      const evMap = {}
+      if (ev) ev.forEach((e) => { evMap[e.code] = e })
+      // §WL-FIX（20260917）：显式传递 wlMap/evMap——旧实现把 wlRow 定义在 load 内、
+      // 却被组件级 buildDisplayList 调用，属于跨作用域引用，首屏整表合并必抛
+      // ReferenceError(wlRow is not defined) 且被静默 catch 吞掉 → 永远渲染「暂无自选股」，
+      // 只有当次会话内手动添加的乐观行可见（即线上「看不到自选/添加后刷新即丢」的根因）。
+      // 组装最终展示列表：优先快照数据，回退评估数据，补全缺失股票
+      setStocks(buildDisplayList(snap, ev, codes, wlMap, evMap))
+    } catch (e) { console.warn('WL_LOAD_FAIL', e && (e.stack || e.message || String(e))) }
+  }
+
+  // 将快照/评估数据与自选股列表合并为统一展示行数组
+  // §WL-FIX：wlRow 提升为本函数内部闭包（同作用域），参数化 wlMap/evMap，不再依赖 load 局部变量。
+  function buildDisplayList(snap, ev, codes, wlMap, evMap) {
+    // 单行构造：行情快照、自选列表与评估数据合并，缺失字段兜底默认值
+    const wlRow = (c) => {
+      const code = typeof c === 'string' ? c : (c && c.code)
+      return {
+        code: typeof code === 'string' ? code : '',
+        name: wlMap[code]?.name || evMap[code]?.name || code,
+        price: Number(wlMap[code]?.price) || 0,
+        change_pct: Number(wlMap[code]?.change_pct) || 0,
+        n_score: evMap[code]?.n_score || 0, n_pass: evMap[code]?.n_pass || false,
+        dragon_score: evMap[code]?.dragon_score || 0, dragon_pass: evMap[code]?.dragon_pass || false,
+        db_score: evMap[code]?.db_score || 0, db_pass: evMap[code]?.db_pass || false,
+        dr_score: evMap[code]?.dr_score || 0, dr_pass: evMap[code]?.dr_pass || false,
+        m_score: evMap[code]?.m_score || 0, m_pass: evMap[code]?.m_pass || false,
+      }
+    }
+    // 快照数据优先：过滤出自选股范围内的股票，合并行情与评估数据
+    if (snap && snap.length) {
+      const list = snap
+        .filter((s) => codes.includes(s.code))
+        .map((s) => {
+          const base = wlRow(s.code)
+          return {
+            ...base,
+            name: s.name || base.name,
+            price: Number(s.price) || base.price,
+            // §WL-FIX：Number() 失败会得 NaN（旧写法 ?? 对 NaN 不兜底）→ 直接用 || 归零
+            change_pct: Number(s.change_pct) || 0,
+          }
+        })
+      // 补全快照中未覆盖的自选股
+      const known = {}
+      list.forEach((s) => { known[s.code] = true })
+      for (const c of codes) {
+        if (!known[c]) list.push(wlRow(c))
+      }
+      return list
+    }
+    // 回退到评估数据
+    if (ev && ev.length) {
+      return ev.filter((e) => codes.includes(e.code)).map((e) => wlRow(e.code))
+    }
+    return []
+  }
+
+  // 添加新自选股代码并立即同步后端
+  async function add() {
+    const code = (newCode || '').trim()
+    if (!code || adding) return
+    setAdding(true)
+    try {
+      // 调用后端添加接口，返回新股票信息
+      const res = await api.addWatchlist(code)
+      setNewCode('')
+      if (res && res.stock) {
+        // 后端返回完整股票信息：用返回数据构建展示行
+        const row = {
+          code: res.stock.code || code,
+          name: res.stock.name || code,
+          price: res.stock.price || 0,
+          change_pct: res.stock.change_pct || 0,
+          // 各维度评分初始化为 0，等待下一轮评估刷新
+          n_score: 0, n_pass: false,
+          dragon_score: 0, dragon_pass: false,
+          db_score: 0, db_pass: false,
+          dr_score: 0, dr_pass: false,
+          m_score: 0, m_pass: false,
+        }
+        // 去重后追加到列表末尾
+        setStocks((prev) => [...prev.filter((s) => s.code !== row.code), row])
+      } else if (!res || !res.duplicate) {
+        // 后端未返回股票信息且非重复：仅用代码构建基础行
+        setStocks((prev) => [...prev, { code, name: code, price: 0, change_pct: 0 }])
+      }
+      MessagePlugin.success('已添加 ' + code)
+    } catch (e) { MessagePlugin.error('添加失败: ' + (e.message || '')) }
+    setAdding(false)
+  }
+
+  // 删除指定自选股
+  async function remove(code) {
+    try {
+      await api.removeWatchlist(code)
+      setStocks((prev) => prev.filter((s) => s.code !== code))
+      MessagePlugin.success('已移除 ' + code)
+    } catch (e) { MessagePlugin.error('删除失败: ' + (e.message || '')) }
+  }
+
+  // 展开/收起指定代码的分时图
+  function toggleKline(code) {
+    setExpandedKeys((prev) => prev.includes(code) ? prev.filter((c) => c !== code) : [...prev, code])
+  }
+
+  // 移动端点击行时打开底部操作面板（桌面端不响应）
+  function onRowTap(e) {
+    if (window.innerWidth > 768) return
+    setSheetStock(e)
+  }
+
+  // 自选股表格列定义：代码、名称、现价、涨跌，以及 N形/龙头/双凸/龙回头/动量
+  // 五个维度评分（可排序），K线展开与删除操作
+  const columns = [
+    // 代码列：蓝色等宽字体展示，支持按代码排序
+    { colKey: 'code', title: '代码', width: 90, sorter: (a, b) => (a.code || '').localeCompare(b.code || ''), cell: ({ row }) => <span role="button" title="查看个股详情" onClick={(e) => { e.stopPropagation(); setDetail({ code: row.code, name: row.name, price: row.price, changePct: row.change_pct }) }} style={{ color: 'var(--app-accent)', fontFamily: 'monospace', cursor: 'pointer' }}>{row.code}</span> },
+    // 名称列：灰色字体，支持按名称排序
+    { colKey: 'name', title: '名称', width: 90, sorter: (a, b) => (a.name || '').localeCompare(b.name || ''), cell: ({ row }) => <span style={{ color: 'var(--app-faint)' }}>{row.name || '-'}</span> },
+    // 现价列：带人民币符号，支持按价格排序
+    { colKey: 'price', title: '现价', width: 90, sorter: (a, b) => (a.price || 0) - (b.price || 0), cell: ({ row }) => '¥' + (row.price || 0).toFixed(2) },
+    // 涨跌幅列：红涨绿跌配色，支持按涨跌排序
+    { colKey: 'change_pct', title: '涨跌', width: 100, sorter: (a, b) => (a.change_pct || 0) - (b.change_pct || 0), cell: ({ row }) => <span style={{ color: (row.change_pct || 0) >= 0 ? 'var(--app-up)' : 'var(--app-down)', fontWeight: 600 }}>{(row.change_pct || 0) > 0 ? '+' : ''}{(row.change_pct || 0).toFixed(2)}%</span> },
+    // N形评分列：≥80红色强势，≥60黄色达标，<60灰色偏低
+    { colKey: 'n_score', title: 'N≥60', width: 70, sorter: (a, b) => (a.n_score || 0) - (b.n_score || 0), cell: ({ row }) => { const c = scoreStyle(row.n_score, row.n_pass, 80); return <span style={c}>{row.n_score > 0 ? row.n_score.toFixed(0) : '—'}</span> } },
+    // 龙头评分列：≥70买入，50-70观察
+    { colKey: 'dragon_score', title: '龙≥70', width: 70, sorter: (a, b) => (a.dragon_score || 0) - (b.dragon_score || 0), cell: ({ row }) => { const c = scoreStyle(row.dragon_score, row.dragon_pass, 80); return <span style={c}>{row.dragon_score > 0 ? row.dragon_score.toFixed(0) : '—'}</span> } },
+    // 双凸评分列：≥70买入，50-70观察
+    { colKey: 'db_score', title: '凸≥70', width: 70, sorter: (a, b) => (a.db_score || 0) - (b.db_score || 0), cell: ({ row }) => { const c = scoreStyle(row.db_score, row.db_pass, 80); return <span style={c}>{row.db_score > 0 ? row.db_score.toFixed(0) : '—'}</span> } },
+    // 龙回头评分列：≥60入场信号
+    { colKey: 'dr_score', title: '回≥60', width: 70, sorter: (a, b) => (a.dr_score || 0) - (b.dr_score || 0), cell: ({ row }) => { const c = scoreStyle(row.dr_score, row.dr_pass, 80); return <span style={c}>{row.dr_score > 0 ? row.dr_score.toFixed(0) : '—'}</span> } },
+    // 动量评分列：≥50关注
+    { colKey: 'm_score', title: '量≥50', width: 70, sorter: (a, b) => (a.m_score || 0) - (b.m_score || 0), cell: ({ row }) => { const c = scoreStyle(row.m_score, row.m_pass, 70); return <span style={c}>{row.m_score > 0 ? row.m_score.toFixed(0) : '—'}</span> } },
+    // K线展开按钮：点击展开/收起分时图与盘口
+    { colKey: 'kline', title: 'K线', width: 80, cell: ({ row }) => <Button size="small" variant="outline" theme="primary" onClick={(e) => { e.stopPropagation(); toggleKline(row.code) }}>{expandedKeys.includes(row.code) ? '收起' : '分时'}</Button> },
+    // 删除按钮：从自选股列表中移除该股票
+    { colKey: 'op', title: '操作', width: 70, cell: ({ row }) => <Button size="small" variant="outline" theme="danger" onClick={(e) => { e.stopPropagation(); remove(row.code) }}>✕</Button> },
+  ]
+
+  // 渲染自选股表格：可排序列、展开行显示分时图与盘口面板
+  function renderStockTable() {
+    // 展开行内容：左侧K线分时图 + 右侧盘口深度面板
+    const expandedContent = ({ row }) => (
+      <div style={{ display: 'flex', gap: 12, alignItems: 'stretch', flexWrap: 'wrap' }}>
+        <div style={{ flex: '1 1 auto', minWidth: 0 }}><KLineChart key={row.code} code={row.code} name={row.name} /></div>
+        <div style={{ flex: '0 0 300px' }}><DepthPanel code={row.code} name={row.name} /></div>
+      </div>
+    )
+    // 表格排序变化回调
+    const handleSortChange = (val) => setSort(val)
+    // 展开行变化回调
+    const handleExpandChange = (keys) => setExpandedKeys(keys)
+    // 表格主体：支持列排序、展开行、30s 轮询数据刷新
+    const tableBody = (
+      <Table
+        data={sortedEvals}
+        columns={columns}
+
+        sort={sort}
+        onSortChange={handleSortChange}
+
+        rowKey="code"
+        size="small"
+        pagination={false}
+        // §F1 自选列表固定表头（自选多时表头随滚消失）
+        fixedHeader
+        maxHeight="calc(100vh - 300px)"
+
+        // §F1 展开为受控模式：整行点击不展开（避免与移动端 onRowTap 打开底部面板冲突），
+        // 分时行的展开/收起只由「K线」列按钮与底部面板经 toggleKline 改 expandedKeys
+        expandOnRowClick={false}
+        expandedRowKeys={expandedKeys}
+        onExpandChange={handleExpandChange}
+        expandedRow={expandedContent}
+      />
+    )
+    return <Card>{tableBody}</Card>
+  }
+
+  /* 自选股页面主渲染：工具栏 → 表格(可展开分时+盘口) → 评分图例 → 移动端操作面板 */
+  return (
+    <div className="page">
+      {/* 顶部工具栏：标题 + 新增自选股输入框 */}
+      <Card style={{ marginBottom: 16 }}>
+        <div className="toolbar" style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', flexWrap: 'wrap', gap: 8 }}>
+          <h2 style={{ fontSize: 18, fontWeight: 600, margin: 0 }}>自选股</h2>
+          <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+            <Input value={newCode} placeholder="输入代码 (如 000001)" onChange={(v) => setNewCode(v)} onEnter={() => add()} disabled={adding} style={{ width: 200 }} />
+            <Button theme="primary" onClick={add} loading={adding}>{adding ? '添加中…' : '添加'}</Button>
+          </div>
+        </div>
+      </Card>
+
+      {/* 自选股表格：可排序列、展开行显示分时图与盘口面板 */}
+      {stocks.length > 0 ? renderStockTable() : (
+        <Card><div className="muted" style={{ padding: 24, textAlign: 'center' }}>暂无自选股，输入代码添加</div></Card>
+      )}
+
+      {/* 评分图例：颜色含义 + 各维度操作阈值说明 */}
+      <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', fontSize: 12, color: 'var(--app-muted)', marginTop: 12 }}>
+        <span style={{ color: 'var(--app-up)' }}>≥80 强势</span>
+        <span style={{ color: 'var(--td-warning-color)' }}>≥门槛 达标</span>
+        <span style={{ color: 'var(--app-text-2)' }}>&lt;门槛 偏低</span>
+        <span style={{ color: 'var(--app-text-2)' }}>|</span>
+        <span>N形≥60操作, 龙头≥70买入/≥50观察, 双凸≥70买入/50-70观察, 回头≥60入场, 动量≥50关注</span>
+        <span style={{ color: 'var(--app-text-2)' }}>|</span>
+        <span>点击表头排序</span>
+      </div>
+
+      {/* 移动端底部操作面板：展开分时、删除、取消 */}
+      <Dialog
+        visible={!!sheetStock}
+        header={(sheetStock ? sheetStock.code : '') + ' ' + (sheetStock ? sheetStock.name || '' : '')}
+        onClose={() => setSheetStock(null)}
+        footer={false}
+      >
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
+          {/* 分时展开/收起按钮 */}
+          <Button theme="primary" variant="outline" onClick={() => { if (sheetStock) toggleKline(sheetStock.code); setSheetStock(null) }}>
+            {sheetStock && expandedKeys.includes(sheetStock.code) ? '收起分时' : '展开分时'}
+          </Button>
+          <Button theme="danger" variant="outline" onClick={() => { const c = sheetStock && sheetStock.code; setSheetStock(null); if (c) remove(c) }}>删除</Button>
+          <Button theme="default" onClick={() => setSheetStock(null)}>取消</Button>
+        </div>
+      </Dialog>
+
+      {/* §F3 全局个股详情抽屉：代码点开，实时价 + 分时/盘口 */}
+      <StockDetailDrawer open={!!detail} code={detail?.code} name={detail?.name}
+        price={detail?.price} changePct={detail?.changePct} onClose={() => setDetail(null)} />
+    </div>
+  )
+}

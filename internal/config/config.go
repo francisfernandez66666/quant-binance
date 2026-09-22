@@ -1,0 +1,2556 @@
+// Package config 提供配置管理：加载/保存 JSON 配置文件，支持策略、风控、板块、LLM 等配置。
+// 本文件定义了量化交易系统所需的全部配置结构体，包括：
+//   - 情绪周期阶段阈值（冰点/启动/发酵/高潮/背离/退潮）
+//   - 四大战法（龙头/双响炮/N形/龙回头）的独立参数
+//   - D1 事件评分规则集
+//   - 风控/止损/仓位管理参数
+//   - 模拟盘/实盘 QMT 交易配置
+//   - 运行时内存治理/数据源/调度器/通知推送等
+//
+// 顶层 Rules 结构体聚合所有配置，Manager 负责加载/保存/按账号隔离。
+//
+// 本包职责概览：
+//   - 配置加载：Load 从 JSON 文件读取 rules/d1 两段（文件缺失/损坏时保留内存现状）。
+//   - 配置保存：Save 以原子写（fsync+唯一临时名）落盘，quant 与 researchd 双进程共享同一文件。
+//   - 配置热更新：Watch 轮询文件内容变化（sha256 比对，默认 30s）自动重载，免重启生效。
+//   - 多账号隔离：Manager 借助 KVStore（auth.Manager 实现）为每个账号保存独立的 Rules 快照，
+//     读走 userRules（账号覆盖→系统级""键兼容回退→全局副本），写走各 SetXxxConfigFor 落库。
+//   - 运营数据归属：SetOperatorID 注入管理员 ID，运营配置（策略/LLM/D1/模拟盘等）系统级
+//     共享归属管理员；逐账号独享配置（QMT 实盘）走 GetQMTConfigFor/SetQMTConfigFor 按 ID 隔离。
+//   - 模拟盘配置更新：SetPaperStrategyFor 只改战法白名单+个股黑名单（§SIGNAL_CONTROLLER），
+//     SetPaperConfigFor（§F-4 20260917 缺陷修复批）按回调局部更新其余 paper 字段
+//     （总开关/自动卖出/资金规模/做空侧等），两者语义分离、互不踩踏。
+//   - 出厂默认：DefaultRules/DefaultSchedulerConfig/DefaultQMTConfig/DefaultDisciplineConfig
+//     提供零配置可运行的合理默认值；LoadSchedulerConfig 供独立研究服务按键增量解析。
+package config
+
+import (
+	"context"
+	"crypto/sha256"
+	"encoding/json"
+	"log"
+	"os"
+	"sync"
+	"time"
+
+	"quant-trading-v2/internal/fileutil"
+)
+
+// LaodengConfig Laodeng 评分系统配置。
+// （LaodengConfig is the configuration for the Laodeng scoring system.）
+type LaodengConfig struct {
+	// 是否启用 Laodeng 评分修正
+	Enabled bool `json:"enabled"`
+	// 最低流通市值（亿）
+	MarketCapMin float64 `json:"market_cap_min"`
+	// 最大市盈率阈值
+	PeMax float64 `json:"pe_max"`
+	// 最低换手率
+	TurnoverMin float64 `json:"turnover_min"`
+	// 技术面扣分系数
+	TechPenalty float64 `json:"tech_penalty"`
+	// 评分权重
+	WeightScore float64 `json:"weight_score"`
+}
+
+// Rules 顶层规则配置，包含情绪周期、策略、板块、风控等完整配置。
+// （Rules is the top-level rules config aggregating emotion cycle, strategy, sector, risk control, etc.）
+type Rules struct {
+	// 情绪周期阶段阈值
+	Emotion EmotionConfig `json:"emotion_cycle"`
+	// 各策略参数
+	Strategy StrategyConfig `json:"strategy"`
+	// Laodeng 评分
+	Laodeng LaodengConfig `json:"laodeng"`
+	// 主线板块配置
+	MainSector MainSectorConfig `json:"main_sector"`
+	// LLM 客户端配置
+	LLM LLMConfig `json:"llm"`
+	// 主题/黑名单配置
+	Theme ThemeConfig `json:"theme"`
+	// 风控参数
+	RiskCtrl RiskCtrlConfig `json:"risk_ctrl"`
+	// 仓位管理参数
+	Position PositionConfig `json:"position"`
+	// 通知推送参数
+	Notify NotifyConfig `json:"notify"`
+	// 研究调度器配置（quant-research 服务读取）
+	Scheduler SchedulerConfig `json:"scheduler"`
+	// 模拟盘/纸面交易配置
+	Paper PaperConfig `json:"paper"`
+	// 东莞证券 MiniQMT 实盘交易配置
+	QMT QMTConfig `json:"qmt"`
+	// AppRelease §APPVER 2026-09-22 C批：APK 服务端驱动强制更新发布单（公开端点
+	// GET /api/app/version 的唯一数据源）。零值=未发布（min=0 时客户端不拦，行为与无此
+	// 配置完全一致）；强制更新自 versionCode≥2 的 APK 起生效（v1 包不发版本头、无法自报
+	// 版本，只能由 owner 重装过渡）。供 APK 原生壳在**登录前**拉取做更新检查，故该端点
+	// 必须免鉴权（见 server.registerRoutes 注释）。
+	// English: §APPVER APK release manifest backing the public GET /api/app/version endpoint.
+	// Zero value = nothing published (min=0 → client never blocks); enforcement only applies from
+	// versionCode 2 upward; the endpoint stays auth-free because the native shell checks before login.
+	AppRelease AppReleaseConfig `json:"app_release,omitempty"`
+	// 运行时内存治理配置
+	Runtime RuntimeConfig `json:"runtime"`
+	// 数据源配置（§HITHINK_DATA_SOURCE_PLAN）
+	Data DataConfig `json:"data"`
+	// 宏观日历补充事件（§R3-8 P1-J 接线：此前类型定义存在但从未挂到 Rules）
+	Calendar CalendarConfig `json:"calendar"`
+	// 信号与战法增强开关组（§SIGNAL_EDGE_ENHANCEMENT_PLAN）：全部默认关闭，
+	// 关闭时对应逻辑零行为变化（零值 = 全禁用，向后兼容存量配置）。
+	// English: signal & tactic enhancement toggles (see SIGNAL_EDGE_ENHANCEMENT_PLAN).
+	// All default off; zero value = all disabled, backward compatible with existing configs.
+	Enhance EnhanceConfig `json:"enhance"`
+	// 信号控制器灰度配置（§SIGNAL_CONTROLLER_PLAN_20260917）：准入/持续性监测统一组件的
+	// 新行为观察期开关。战法白名单不受影响（始终硬拦），仅黑名单补齐类新行为可灰度。
+	// English: signal-controller rollout knobs — shadow-observation for newly enforced gates
+	// (blacklists on the signal side); strategy whitelist is always hard, unaffected.
+	SignalCtl SignalCtlConfig `json:"signal_ctl"`
+}
+
+// AppReleaseConfig §APPVER 2026-09-22 C批：APK 版本发布单，经公开端点
+// GET /api/app/version 暴露给原生壳做登录前强制更新检查。
+// （§APPVER APK release manifest, served by the public pre-auth version endpoint.）
+type AppReleaseConfig struct {
+	// MinVersionCode 最低可接受 versionCode：客户端 BuildConfig.VERSION_CODE 低于此值即弹
+	// 不可取消的强制更新框。0=未发布/不拦（默认，旧配置零行为变化）。
+	// 强制更新自 versionCode≥2 的 APK 起生效（v1 无版本头，服务端无法远程识别）。
+	// Minimum acceptable versionCode; 0 = nothing enforced (unpublished default).
+	MinVersionCode int `json:"min_version_code"`
+	// LatestVersionCode 当前最新发布 versionCode（客户端展示"最新版"用，不参与拦截判定）。
+	// Latest published versionCode (informational; never blocks by itself).
+	LatestVersionCode int `json:"latest_version_code"`
+	// ApkURL 新版 APK 下载地址（如 https://…/dl/quant-latest.apk）；空则客户端不显示下载按钮。
+	// Download URL of the latest APK; empty hides the download action in the update dialog.
+	ApkURL string `json:"apk_url"`
+	// Note 更新说明（弹窗文案，如"安全更新：登录凭据迁入系统级加密存储，请升级"）。
+	// Release note shown verbatim in the forced-update dialog.
+	Note string `json:"note"`
+}
+
+// SignalCtlConfig 信号控制器灰度配置（§SIGNAL_CONTROLLER_PLAN_20260917 §八）。
+// （Rollout knobs for the unified signal controller.）
+type SignalCtlConfig struct {
+	// ShadowBlacklist 黑名单影子模式（nil/true=默认影子）：个股/板块黑名单在信号控制器的命中
+	// 仅留痕观察不拦截——黑名单此前只在实盘下单侧消费，补齐到两通道属新行为，按方案要求
+	// 影子期验证后再切正式。战法白名单/确认窗不受本标志影响。
+	// 置 false 后控制器与风控闸的黑名单命中立即生效（重启/热更下一轮即达）。
+	// English: nil/true = blacklist hits on the signal side are recorded but not enforced (new
+	// behavior under observation per the plan); strategy whitelist & confirm windows are unaffected.
+	ShadowBlacklist *bool `json:"shadow_blacklist,omitempty"`
+}
+
+// BlacklistShadow 黑名单影子标志（nil 默认开=只留痕不拦）。
+// （Reports whether blacklist enforcement is still in shadow mode; nil defaults to shadow-on.）
+func (s SignalCtlConfig) BlacklistShadow() bool {
+	return s.ShadowBlacklist == nil || *s.ShadowBlacklist
+}
+
+// RuntimeConfig 运行时内存治理配置：盘后释放常驻服务内存，避免与夜间研究作业叠加触发 OOM。
+// 服务器物理内存仅 1.6GiB：quant 常驻服务盘后仅需展示数据快照（无需跑全量性能），
+// 主动把 Go 堆/缓存归还 OS，把物理内存让给盘后 research 作业。
+// English: runtime memory-governance config — releases the resident engine's memory after hours so it
+// doesn't stack with the nightly research job on the 1.6GiB box. After hours the engine only serves
+// data snapshots (no heavy work), so the Go heap/cache is returned to the OS for research to use.
+type RuntimeConfig struct {
+	// TrimAfterHours 盘后内存释放总开关（默认 true）：非活跃时段（盘后/休市）定时
+	// runtime.GC()+debug.FreeOSMemory() 把堆归还 OS；盘中不触发，不影响性能。
+	// English: after-hours memory-trim master switch (default true): outside active sessions the engine
+	// periodically runs runtime.GC()+debug.FreeOSMemory() to return the heap to the OS; never during
+	// trading hours, so live performance is unaffected.
+	// 盘后内存释放总开关
+	TrimAfterHours bool `json:"trim_after_hours"`
+	// TrimIntervalMin 盘后释放节流间隔（分钟，默认 15）。
+	// English: after-hours trim throttle interval in minutes (default 15).
+	// 盘后释放节流间隔（分钟）
+	TrimIntervalMin int `json:"trim_interval_min"`
+	// FeedIntervalSec 行情快照刷新间隔（秒，默认 0 → 回退 5s）。
+	// 降低可缩短"行情变化→信号检测"的感知延迟（信号→交易链路优化 A+B 之 B 快速执行器）。
+	// 注意：过低会加大上游行情源请求频率与 CPU 占用，生产需结合服务器资源验证后再启用。
+	// English: quote-snapshot refresh interval in seconds (0 → fallback 5s). Lowering it shortens the
+	// market-change → signal-detection latency (signal→trade optimization A+B / B: fast executor).
+	// Too-low values raise upstream request rate & CPU; validate against server resources in prod.
+	FeedIntervalSec int `json:"feed_interval_sec"`
+	// QMTFeedEnabled §ENH-5 批E：QMT Level-1 全推行情 feed 总开关（默认 false）。
+	// 开启且 qmt.gateway_url 非空时，引擎按 qmt_feed_interval_sec 轮询网关 /quotes，
+	// 命中代码覆盖行情快照（Source=QMT-L1）；feed 故障静默回退既有 5s 新浪链，不参与交易熔断。
+	// 仅生产决策机（Windows + qmt_gateway + xtquant）有意义，mac 开发态保持关闭。
+	// English: §ENH-5 master switch for the QMT Level-1 quote feed (default off, prod-only).
+	QMTFeedEnabled bool `json:"qmt_feed_enabled"`
+	// QMTFeedIntervalSec L1 feed 轮询间隔（秒，默认 0 → 取 3s；建议 1~3）。
+	// English: L1 feed polling interval in seconds (0 → 3s default; 1-3 recommended).
+	QMTFeedIntervalSec int `json:"qmt_feed_interval_sec"`
+	// ScoringIntervalSec 近实时 8a/8b 打分循环间隔（秒，默认 0 → 回退 5s）。
+	// 降低可让战法信号翻转更快被检出并触发下单（信号→交易链路优化 A+B 之 B）。
+	// English: near-realtime 8a/8b scoring-loop interval in seconds (0 → fallback 5s). Lowering it
+	// detects strategy signal flips (and fires orders) sooner (signal→trade optimization A+B / B).
+	ScoringIntervalSec int `json:"scoring_interval_sec"`
+	// ReviewEnabled §DAILY_REVIEW 盘后持仓综合复盘总开关（默认开）：交易日收盘后对
+	// "自选 ∪ 实盘持仓 ∪ 模拟盘持仓 ∪ 当日信号股"逐票算量化事实（量能/MACD/量价/均线/位置）
+	// 交 LLM 生成综合复盘正文 + 后市倾向，写入消息中心（每日一份、按日去重覆盖）。
+	// 需配置 LLM Key 才实际调用；无 Key 时静默跳过。显式 false 关闭盘后复盘。
+	// English: §DAILY_REVIEW per-account after-hours LLM position review. Once per trading day after
+	// close it reviews watchlist ∪ real held ∪ paper held ∪ today's signals with a merged LLM call
+	// (facts computed in Go: volume/MACD/price-volume/MA/position) into a review card per stock in the
+	// message center. No-ops when no LLM key is configured.
+	ReviewEnabled *bool `json:"review_enabled,omitempty"`
+	// ReviewMaxStocks §DAILY_REVIEW 单次复盘最多覆盖的股票数（默认 24，上限 50，<=0 用默认）：
+	// 持仓/信号/自选去重后按优先级（实盘>模拟>信号>自选）截断，约束单次合并 LLM 调用的上下文规模。
+	// English: max distinct stocks per review run (default 24, capped 50); truncates the deduped universe
+	// by priority real>paper>signal>watchlist to bound the merged LLM prompt size.
+	ReviewMaxStocks int `json:"review_max_stocks"`
+}
+
+// ReviewOn §DAILY_REVIEW 盘后复盘是否启用（*bool 语义：未配置=默认开启，显式 false 关闭）。
+// English: §DAILY_REVIEW switch — nil (absent in config) means ON; explicit false disables.
+func (r RuntimeConfig) ReviewOn() bool { return r.ReviewEnabled == nil || *r.ReviewEnabled }
+
+// ReviewMax §DAILY_REVIEW 单次复盘股票数上限（<=0 回退默认 24，硬上限 50 护栏）。
+// English: review universe cap per run; <=0 → default 24, hard-capped at 50.
+func (r RuntimeConfig) ReviewMax() int {
+	if r.ReviewMaxStocks <= 0 {
+		return 24
+	}
+	if r.ReviewMaxStocks > 50 {
+		return 50
+	}
+	return r.ReviewMaxStocks
+}
+
+// EnhanceConfig 信号与战法增强开关组（§SIGNAL_EDGE_ENHANCEMENT_PLAN_20260909 §7）。
+// 全部默认关闭；开启后才注入对应信号/战术逻辑，关闭路径零行为变化。
+// English: signal & tactic enhancement toggles. All default off; enabled toggles inject the
+// corresponding signal/tactic logic, disabled paths keep zero behavior change.
+type EnhanceConfig struct {
+	// NewsDecay 新闻时效衰减（P1.1）：事件按类型半衰期随年龄降权。
+	NewsDecay bool `json:"news_decay_enabled"`
+	// NewsDecayHalfLifeMin 半衰期覆盖（分钟，0=用类型默认表）。
+	NewsDecayHalfLifeMin int `json:"news_decay_half_life_min"`
+	// AuctionSignal 竞价信号（P1.2）：竞价强度分进打分池预排名/开盘确认。
+	AuctionSignal bool `json:"auction_signal_enabled"`
+	// FactorDedup 因子相关度去重（P1.3）。
+	FactorDedup bool `json:"factor_dedup_enabled"`
+	// NewsImpact 新闻影响率模型（P2.1）。
+	NewsImpact bool `json:"news_impact_enabled"`
+	// SectorLinkage 板块联动交易（P2.2）。
+	SectorLinkage bool `json:"sector_linkage_enabled"`
+	// MarketState 市场状态机（P2.3）。
+	MarketState bool `json:"market_state_enabled"`
+	// OrderFlow 盘口微观结构（P2.4）。
+	OrderFlow bool `json:"orderflow_enabled"`
+	// DynWeight 信号质量动态权重（P2.5）。
+	DynWeight bool `json:"dynweight_enabled"`
+	// T0 底仓 T+0（P3）。
+	T0 bool `json:"t0_enabled"`
+}
+
+// PaperConfig 模拟盘（纸面交易）配置：把 buy 信号按实时价自动撮合成虚拟持仓，独立于真实持仓。
+// 默认关闭（Enabled=false），开启后引擎在每轮信号产出时自动撮合。
+// English: paper-trading config — auto-fills buy signals at the live price into virtual positions,
+// isolated from the real book. Off by default; when enabled the engine fills each signal round.
+type PaperConfig struct {
+	// 总开关（默认 false）
+	Enabled bool `json:"enabled"`
+	// 每票固定买入资金（元，默认 10000）
+	FixedAmount float64 `json:"fixed_amount"`
+	// 最大并行持仓数（默认 10）
+	MaxPositions int `json:"max_positions"`
+	// 初始资金（元，默认 100000）
+	InitialCapital float64 `json:"initial_capital"`
+	// AutoSell 卖出信号自动成交开关（阶段1.1 全自动执行）：nil/未配置=开启。开启时 清仓/减仓/
+	// 硬止盈/硬止损 告警直接在模拟盘自动平仓；关闭则卖出仅提醒、仍需手动。
+	// English: auto-sell switch (full-auto execution); nil/unset = on. When on, 清仓/减仓/hard-TP/hard-SL
+	// alerts close paper positions automatically; when off, sells stay reminder-only (manual).
+	// 自动卖出
+	AutoSell *bool `json:"auto_sell,omitempty"`
+	// Discipline 统一止盈止损纪律（探针+扳机）参数。实盘与模拟盘共用同一套口径。
+	// English: unified stop-loss/take-profit discipline (probe+trigger) parameters; shared by real and paper.
+	Discipline DisciplineConfig `json:"discipline,omitempty"`
+	// §SIGNAL_CONTROLLER 模拟盘战法白名单（20260917，与实盘 /api/config/qmt.strategies 同构语义）：
+	// 空=默认全集（内置四形态+已启用库规则），动量/未知来源战法必须显式列名才允许撮合；
+	// 非空=显式权威（只有列名的战法买入信号可进模拟盘）。由信号控制器（internal/signalctl）
+	// 在 paper 通道执行准入，模拟盘引擎不再持有交易裁决逻辑。
+	// 战法池资金分配模板同步跟随：momentum 仅在显式列名时开立动量池（不再恒开）。
+	// English: paper-side strategy whitelist mirroring the live one (§SIGNAL_CONTROLLER_PLAN):
+	// empty = default set (4 built-in forms + enabled library rules; momentum must be explicit);
+	// non-empty = only listed strategies may fill. Drives the pool template too (momentum pool
+	// opened only when explicitly named).
+	Strategies []string `json:"strategies,omitempty"`
+	// §SIGNAL_CONTROLLER 模拟盘个股黑名单（纯代码比对，与实盘同口径 config.CodeInBlacklist）。
+	// 此前黑名单仅实盘下单侧消费；信号控制器把它统一进两通道（灰度由 rules.signal_ctl.shadow_blacklist 控制）。
+	// English: paper-side code blacklist, enforced on the signal-controller paper channel (shadow-rolled).
+	Blacklist []string `json:"blacklist,omitempty"`
+	// §SHORT-3 融券做空侧（决策④）：ShortCapital>0 才开设做空池（默认 0=整侧关闭，影子期安全）。
+	// 保证金率/年化费率/单笔名义预算/止损涨幅可配，零值走 paper.DefaultConfig 真实券商口径。
+	// English: §SHORT-3 margin-short side — the pool is funded only when ShortCapital>0 (0 = side off,
+	// the safe shadow default); rate/budget/stop normalize to broker-real defaults when zero.
+	ShortEnabled     *bool   `json:"short_enabled,omitempty"` // 融券开关（nil=启用，配合 ShortCapital>0）
+	ShortCapital     float64 `json:"short_capital"`           // 做空池预算（元；0=不开设）
+	ShortMarginRate  float64 `json:"short_margin_rate"`       // 保证金率（默认 0.5）
+	ShortFeeAnnual   float64 `json:"short_fee_annual"`        // 融券年化费率（默认 0.083）
+	ShortFixedAmount float64 `json:"short_fixed_amount"`      // 单笔融券名义预算（元；0=回退 FixedAmount）
+	ShortStopLossPct float64 `json:"short_stop_loss_pct"`     // 做空止损涨幅%（默认 8）
+}
+
+// QMTAdviceConfig 持仓处理分析层（实盘持仓）规则参数：加仓/格局判定阈值。
+// English: position-advice layer rules for the real book: add-position and hold(格局) thresholds.
+type QMTAdviceConfig struct {
+	// AddReopenDrawdownPct 加仓判定：现价相对持仓最高价（highest_price）回撤不超过该值才允许加仓
+	// （负值表示回撤幅度上限，如 -5 表示回撤超 5% 后不再建议加仓）。
+	// 加仓判定：现价相对最高价回撤上限(%)
+	AddReopenDrawdownPct float64 `json:"add_reopen_drawdown_pct"`
+	// AddSignalActive 加仓判定：是否要求该股信号仍活跃（StockScores.SignalActive）。
+	// 加仓是否要求信号仍活跃
+	AddSignalActive bool `json:"add_signal_active"`
+	// HoldMinProfitPct 格局判定：现价相对成本盈利不低于该值（%）才建议格局（继续持有）。
+	// 格局判定：相对成本最低盈利(%)
+	HoldMinProfitPct float64 `json:"hold_min_profit_pct"`
+}
+
+// QMTConfig 东莞证券 MiniQMT 实盘交易配置：把首尔侧的决策（信号/持仓建议）转发给国内 Windows 网关执行真实下单，
+// 网关回报（成交/持仓/断线）经 /api/qmt/report 回传。与纸面账本（PaperConfig）完全独立（双账本并存）。
+// English: Guoxin MiniQMT live-trading config — forwards Seoul-side decisions (signals / position advice)
+// to the domestic Windows gateway for real orders; gateway reports (fills/positions/disconnect) come back
+// via /api/qmt/report. Fully independent of the paper book (PaperConfig); the two books coexist.
+type QMTConfig struct {
+	// Enabled 总开关：是否传递信号/建议给交易服务器（热加载）。false 时实盘链路整体停用，纸面不受影响。
+	// 是否启用
+	Enabled bool `json:"enabled"`
+	// Mode auto=全自动（信号 emit 直接下单）/ manual=半自动（前端确认后下单）。默认 manual。
+	// 模式
+	Mode string `json:"mode"`
+	// GatewayURL 国内网关地址（如 https://<国内IP>:8789）。
+	// 国内 QMT 网关地址
+	GatewayURL string `json:"gateway_url"`
+	// Token 与网关双向鉴权的 Bearer token。
+	// 鉴权Token
+	Token string `json:"token"`
+	// PriceType market=对手价（网关取实时盘口）/ limit=按信号参考价限价。默认 market。
+	// 价格类型
+	PriceType string `json:"price_type"`
+	// FixedAmount 单票买入金额（元，默认 10000）。
+	// 固定金额
+	FixedAmount float64 `json:"fixed_amount"`
+	// MaxPositions 最大并行实盘持仓数（默认 10，双端校验）。
+	// 最大持仓数
+	MaxPositions int `json:"max_positions"`
+	// InitialCapital 初始实盘资金（元，默认 100000，用于仓位约束预检）。
+	// 初始资金
+	InitialCapital float64 `json:"initial_capital"`
+	// Strategies 转发策略白名单（空=全部）。
+	// 策略白名单
+	Strategies []string `json:"strategies"`
+	// StrategyAmounts 每战法单票金额覆盖（元）：键=战法名（与 strategies 白名单同源），
+	// 缺省或 <=0 时回落全局 fixed_amount。供量化交易页「每个战法独立仓位大小」。
+	// 战法Amounts
+	StrategyAmounts map[string]float64 `json:"strategy_amounts,omitempty"`
+	// TimeoutSec 下单请求超时秒数（默认 10）。
+	// 超时秒数
+	TimeoutSec int `json:"timeout_sec"`
+	// MissHeartbeatSec 心跳超时秒数：网关 /health 连续失联超过该值 → 熔断暂停下单并告警（默认 120）。
+	// 心跳超时秒数
+	MissHeartbeatSec int `json:"miss_heartbeat_sec"`
+	// DailyMaxBuys 单日累计买入笔数上限（§GAP1.4 实盘买入纪律；0=不设限，默认 20）。
+	// **按今日已成交笔数计**（fills 表，同一委托的多次部分成交算 1 笔）——2026-09-18 口径修正：
+	// 原按「今日已报」委托数计，报单即占额度，一笔被券商废掉或挂着没成交的报单同样吃掉一天额度，
+	// 会把买入权锁死。金额类闸（DailyBudgetAmount 与可用资金）仍按已报金额+在途冻结占用额度，
+	// 信号风暴由金额闸兜住。
+	// English: daily cap on *filled* buys for the real book (0 = unlimited, default 20) — counts
+	// today's fills, deduped per order, so an unfilled/rejected submission does not burn the quota;
+	// the amount-based gates still reserve in-flight submissions.
+	// 日最大买入笔数
+	DailyMaxBuys int `json:"daily_max_buys"`
+	// DailyBudgetAmount 单日累计买入金额预算（元；0=不设限，默认 100000）。
+	// 按当日已报买单 Price×Qty 累计，超出后拒绝新买入（卖出不受影响）。
+	// English: daily buy budget in yuan (0 = unlimited, default 100000); accumulates today's placed
+	// buy orders (Price×Qty) and rejects new buys past the cap (sells unaffected).
+	// 日买入预算
+	DailyBudgetAmount float64 `json:"daily_budget_amount"`
+	// AutoSell 实盘卖出自动化开关（§GAP1.1，默认开启）：mode=auto 时，止损级建议
+	// （止损/清仓类）自动全仓卖出，止盈/减仓保持提醒半自动。signal_id 按日幂等防重。
+	// English: auto-sell switch for the real book (default on): in auto mode, stop-loss-class advice
+	// closes the position automatically; TP/trim stay reminder-only. Idempotent per day via signal_id.
+	// 自动卖出
+	AutoSell bool `json:"auto_sell"`
+	// SellUnifiedMode §SELLPOINT-UNIFY（2026-09-21）卖出统一裁决灰度开关：
+	// shadow（默认）=signalctl 卖出裁决层影子运行，只留痕对照、不改现行展示与执行；
+	// on = 卖出建议/自动卖出全部改由裁决层 pass 处置驱动（五路直连拼装退役）。
+	// English: §SELLPOINT-UNIFY staged rollout — "shadow" (default) runs the unified sell judge in
+	// signalctl for audit comparison only; "on" switches advice + auto-sell to judge-driven disposals.
+	// 卖出统一裁决模式
+	SellUnifiedMode string `json:"sell_unified_mode,omitempty"`
+	// Blacklist §GAP1.7 下单黑名单（纯数字或带后缀代码均可）：命中即拒绝下单。
+	// 引擎每轮把 Theme.BlackList 一并同步进来；也可在 qmt 段单独配置。
+	// English: §GAP1.7 order blacklist; the engine merges Theme.BlackList in every cycle.
+	// 黑名单
+	Blacklist []string `json:"blacklist,omitempty"`
+	// Advice 持仓处理分析层（实盘持仓）规则参数。
+	// 持仓处理分析层规则参数
+	Advice QMTAdviceConfig `json:"advice"`
+	// Discipline 统一止盈止损纪律（探针+扳机）参数，实盘与模拟盘共用同一套口径。
+	// English: unified stop-loss/take-profit discipline (probe+trigger) params, shared with the paper book.
+	Discipline DisciplineConfig `json:"discipline,omitempty"`
+	// Halted §R4-1 kill-switch（人工紧急停止）：true 时拒绝一切新下单（auto 与手动全路径），
+	// 已报未成交委托由撤单闭环/停机清单处理。经 POST /api/qmt/halt 切换并持久化。
+	// English: §R4-1 kill switch — when true every new order (auto & manual) is rejected;
+	// unfilled tickets are handled by the cancel sweep / close list. Toggled via POST /api/qmt/halt.
+	Halted bool `json:"halted"`
+	// CancelStaleSec §R4-1 未成交自动撤单阈值（秒）：已报超过该秒数仍未成交/未推进状态即自动撤单
+	//（0=默认 120；-1=关闭自动撤单，仅保留收盘清单）。
+	// English: §R4-1 stale-order auto-cancel threshold in seconds (0 = default 120; -1 disables).
+	CancelStaleSec int `json:"cancel_stale_sec"`
+	// CloseSweepAt §R4-1 收盘清单时刻（北京时 HHMM）：到达后对当日全部"已报"未成交委托撤单
+	//（0=默认 1452；-1=关闭收盘清单）。
+	// English: §R4-1 close-list time (Beijing HHMM) — cancels all unfilled 已报 orders of the day
+	// (0 = default 1452; -1 disables).
+	CloseSweepAt int `json:"close_sweep_at"`
+	// EnforceT1 §WS-A T+1 可卖量守卫开关：nil=默认开启（A 股 T+1 制度恒真）；显式 false 关闭，
+	// 退回券商柜台终裁（当日买入误卖会收到废单回报，不作为本地硬闸）。
+	// English: §WS-A T+1 sell-guard switch — nil means enabled by default (A-share T+1 is universal);
+	// explicit false disables the local hard gate and falls back to the broker's rejection.
+	EnforceT1 *bool `json:"enforce_t1,omitempty"`
+	// Money §WS-M 资金管理：现金缓冲 + 本地在途冻结动态占用。
+	// Money = capital buffer + dynamic local frozen-in-transit accounting (§WS-M).
+	Money MoneyMgmtConfig `json:"money,omitempty"`
+	// Settle §WS-B 券商交割单三方对账（默认关闭：启用后才拉交割单+告警+可选补记）。
+	// English: §WS-B daily three-way settlement reconciliation (off by default; enabling pulls the
+	// broker settlement, persists diffs, alerts, and optionally backfills missing fills).
+	Settle SettleConfig `json:"settle,omitempty"`
+	// RiskGate §WS-C 风控闸口参数（零值=全部关闭，保持现状行为；开启的闸命中即拒单+记录+告警）。
+	// English: §WS-C risk-gate params (zero-value = all off, legacy behavior; an enabled gate that
+	// trips rejects the order, records a hit and alerts).
+	RiskGate RiskGateConfig `json:"risk_gate,omitempty"`
+	// AutoRiskCaution §MARKET_RISK_GATE P4 auto-buy 谨慎层第二道闸（裁决④：默认关闭，需影子验证后开启）。
+	// 开启后 auto 模式对做多买入叠加风险档处置：Red 当日拒开新仓、Yellow 按仓位档缩放买入金额。
+	// 与信号侧风险档（P3，默认开）独立——这里是"真金白银下单层"，保守默认关。
+	// English: P4 auto-buy caution layer (ruling ④: default OFF until shadow-validated). When on, auto mode
+	// adds tier handling to real buy orders — reject new opens on Red, scale buy amount on Yellow. Independent
+	// of the signal-side tier (P3, default on): this is the money path, so it stays conservative by default.
+	// 自动买谨慎层开关
+	AutoRiskCaution *bool `json:"auto_risk_caution,omitempty"`
+	// YellowPosScale Yellow 档买入金额缩放系数（默认 0.35，对齐状态机 range 档；0=用默认）。
+	// 实际系数优先取状态机 MaxPosPct（>0 时），否则回退本值。
+	// YellowPosScale buy-amount scale on Yellow (default 0.35, aligned with the range tier; the live
+	// state-machine MaxPosPct takes precedence when >0).
+	// Yellow 档降额系数
+	YellowPosScale float64 `json:"yellow_pos_scale,omitempty"`
+}
+
+// AutoCautionOn P4 自动买谨慎层是否启用（nil 默认 false=保守关闭，需显式开启）。
+// English: whether the P4 auto-buy caution layer is on (nil = false, conservative; must be enabled explicitly).
+func (q QMTConfig) AutoCautionOn() bool { return q.AutoRiskCaution != nil && *q.AutoRiskCaution }
+
+// YellowScale Yellow 档降额系数（默认 0.35）。
+func (q QMTConfig) YellowScale() float64 {
+	if q.YellowPosScale <= 0 || q.YellowPosScale > 1 {
+		return 0.35
+	}
+	return q.YellowPosScale
+}
+
+// RiskGateConfig §WS-C 机构级风控闸口参数。零值 = 闸全部关闭（现状行为不变，可随时开启、可回滚）。
+// 目标补齐：日内已实现亏损熔断、单票市值集中度、涨停/跌停不可追单、行情新鲜度硬闸——
+// 全部经 RiskGate.CheckLiveOrder 单一权威入口消费，命中即拒单并记录 risk_gates 命中计数。
+// English: §WS-C institutional risk-gate params. Zero-value = all gates off (legacy behavior; each
+// gate can be enabled independently and reverted). Covers: intraday realized-loss circuit breaker,
+// single-stock value concentration, limit-up/down chase blocking, and quote-staleness hard gate —
+// all consumed by the single authoritative RiskGate.CheckLiveOrder entry point, recording hits.
+type RiskGateConfig struct {
+	// DayLossLimitPct 日内已实现亏损熔断阈值（%）：0=关（默认）。
+	// 已实现亏损 = Σ今日卖出成交(fill价−成本)×数量；达到阈值 → 熔断当日新买入（卖出/清仓放行）+ P1 告警。
+	// English: intraday realized-loss circuit breaker threshold (%). 0 = off (default). Realized loss =
+	// Σ today's sell fills (fillPrice − cost)×qty; at threshold the day's new buys are circuit-broken
+	// (sells/liquidation stay open) with a P1 alert.
+	DayLossLimitPct float64 `json:"day_loss_limit_pct"`
+	// SingleStockValuePct 单票市值/总资产 集中度上限（%）：0=关（默认）。
+	// 买入后该股预计市值（持仓+本单）/ 总资产（可用现金+持仓市值）超过阈值 → 拒新买。
+	// English: single-stock market value / total assets concentration cap (%). 0 = off (default).
+	// If the projected value of the stock after this buy (held + this order) over total assets
+	// (available cash + held value) exceeds the cap, the buy is rejected.
+	SingleStockValuePct float64 `json:"single_stock_value_pct"`
+	// StaleQuoteMs 行情新鲜度硬闸（毫秒）：0=关（默认）。下单时快照陈旧度超过该值 → 拒单 + 告警
+	// （原 fetcher 只打日志不拦单）。
+	// English: quote-staleness hard gate (ms). 0 = off (default). If the snapshot staleness at order
+	// time exceeds this, the order is rejected + alerted (the fetcher used to only log).
+	StaleQuoteMs int64 `json:"stale_quote_ms"`
+	// LimitUpBlockBuy 涨停不可追买（默认关）：买入参考价 ≥ 昨收×(1+板感知涨停%) → 拒单。
+	// English: block chasing a limit-up buy (default off): buy reference price ≥ prevClose×(1+board
+	// limit-up%) → reject.
+	LimitUpBlockBuy bool `json:"limit_up_block_buy"`
+	// LimitDownBlockSell 跌停不可追卖（默认关）：卖出参考价 ≤ 昨收×(1−板感知涨停%) → 拒单。
+	// English: block chasing a limit-down sell (default off): sell reference price ≤ prevClose×(1−board
+	// limit-up%) → reject.
+	LimitDownBlockSell bool `json:"limit_down_block_sell"`
+	// MaxOrderAmount 单笔委托金额绝对帽（元，默认 0=关）：本单金额（qty×参考价，缺省回退）
+	// 超过该值 → 拒一切新委托（买卖双向）。定位：手动下单入口（/api/positions/execute）不设
+	// sizing 通道天然限额，胖手误（多打一个 0）唯一封顶手段；自动单同享此帽做双保险。
+	// English: absolute per-order amount cap (0 = off). Rejects any new order whose amount
+	// (qty × ref price) exceeds it — the only hard ceiling on the manual entry point.
+	MaxOrderAmount float64 `json:"max_order_amount"`
+	// CrossCheckPct §XCHECK 2026-09-22 C批：价格复核闸阈值（%），0=关（默认）。
+	// 委托参考价与独立复核源价（DataCoordinator.CrossCheckPrice，多源行情链独立于本单快照）
+	// 的偏离上限：|参考价−复核价|/复核价×100 超过该值即命中。为什么要这道闸：既有闸只判
+	// 「快照陈旧度」，判不了「两源同刻价差」（单源脏数据/除权错位价），复核闸补上这一维。
+	// 注意执行位点：本闸在 controller orderMu 锁内同步调一次行情 HTTP（GetRealtimeQuote 自带
+	// 超时链），低频可接受（下单本身即低频动作，一次秒级超时远小于锁内其它 DB 往返的累计耗时）。
+	// 影子期语义见 CrossCheckShadow：默认影子=命中仅 risk_gates 留痕放行，正式化后才拒单。
+	// English: §XCHECK price cross-check threshold in % (0 = off, default). Deviation cap between
+	// the order reference price and an independent quote source; runs synchronously inside the
+	// controller orderMu lock as one HTTP call with its own timeout — acceptable at order frequency.
+	CrossCheckPct float64 `json:"cross_check_pct"`
+	// CrossCheckShadow §XCHECK 2026-09-22 C批：价格复核闸影子模式（nil/true=默认影子）：
+	// 命中仅写 risk_gates 留痕（原因带 [shadow] 前缀）并放行，供 owner 观察误拦率；
+	// 置 false 切正式——命中即拒单+高优告警。仿 SignalCtlConfig.ShadowBlacklist 惯例：
+	// 新行为先影子验证再硬拦，零配置永不改变现有下单行为，可随时回滚。
+	// English: nil/true = cross-check hits are recorded ([shadow]-prefixed) but not enforced;
+	// explicit false turns the gate into a hard reject. Mirrors the shadow_blacklist convention.
+	CrossCheckShadow *bool `json:"cross_check_shadow,omitempty"`
+}
+
+// CrossCheckEnforce §XCHECK 价格复核闸是否已切正式（拒单）模式：仅显式 false 时为 true；
+// nil/true 均维持影子（命中留痕放行）。判定姿势与 ShadowBlacklist 同款。
+// English: reports whether the cross-check gate has left shadow mode and hard-rejects — only an
+// explicit cross_check_shadow=false enforces; unset/true keep record-and-pass behavior.
+func (r RiskGateConfig) CrossCheckEnforce() bool {
+	return r.CrossCheckShadow != nil && !*r.CrossCheckShadow
+}
+
+// AnyEnabled 是否开启了至少一道 RiskGate（供 UI/健康展示与短路）。
+// English: AnyEnabled reports whether at least one risk gate is enabled.
+func (r RiskGateConfig) AnyEnabled() bool {
+	return r.DayLossLimitPct > 0 || r.SingleStockValuePct > 0 || r.StaleQuoteMs > 0 ||
+		r.LimitUpBlockBuy || r.LimitDownBlockSell || r.MaxOrderAmount > 0 || r.CrossCheckPct > 0
+}
+
+// SettleConfig §WS-B 交割单三方对账参数。
+// English: §WS-B settlement params.
+type SettleConfig struct {
+	// Enabled 启用每日盘后交割单对账（默认 false）。
+	Enabled bool `json:"enabled"`
+	// Mode report_only=只出差异+告警（默认）；sync_fills=同时补记券商有本地无的成交。
+	Mode string `json:"mode"`
+	// At 每日对账时刻（北京时 HHMM，默认 1530）。
+	At int `json:"at"`
+}
+
+// MoneyMgmtConfig §WS-M 资金管理参数（默认零值=现状行为：无缓冲、无本地冻结叠加）。
+// 目标：①可配置"最低保留现金"（防把可用打到 0 满仓）；②在券商口径不可信时，
+// 用本地账本（已报未成交买单）显式计冻结，防止并发多信号超买；③明确不双扣——
+// 券商口径新鲜时信任其侧冻结，本地冻结仅在券商口径过期/缺失分支生效。
+// English: §WS-M money-management params (zero-value = legacy behavior). Adds an optional cash
+// reserve and, when broker cash is stale/missing, an explicit local frozen-in-transit deduction
+// (never double-counts — the broker's own freeze is trusted while its report is fresh).
+type MoneyMgmtConfig struct {
+	// CashReserveRatio 保留现金比例（0~1）：可下单资金 = 可用 × (1−ratio)。0=无缓冲（现状）。
+	// English: fraction of available cash held as a reserve (0~1). 0 = no buffer (legacy).
+	CashReserveRatio float64 `json:"cash_reserve_ratio"`
+	// MinReserveAmount 最低保留现金绝对值（元）：生效值取 max(ratio×可用, MinReserveAmount)。
+	// English: absolute floor for the cash reserve (yuan); effective reserve = max(ratio, min).
+	MinReserveAmount float64 `json:"min_reserve_amount"`
+	// TrustBrokerFreeze 券商口径新鲜（≤10min）时信任其侧已含冻结，不再叠加本地在途冻结。
+	// 默认 true（避免双扣）；false 时始终叠加本地冻结（更保守）。
+	// English: when the broker cash snapshot is fresh, trust that it already nets its own freeze and
+	// skip the local frozen-in-transit deduction. Default true (no double count); false always deducts.
+	TrustBrokerFreeze *bool `json:"trust_broker_freeze,omitempty"`
+}
+
+// TrustBrokerFreezeEnabled §WS-M：是否信任券商侧冻结（nil 默认 true）。
+// English: reports whether the broker-side freeze is trusted; unset defaults to true.
+func (m MoneyMgmtConfig) TrustBrokerFreezeEnabled() bool {
+	if m.TrustBrokerFreeze == nil {
+		return true
+	}
+	return *m.TrustBrokerFreeze
+}
+
+// EffectiveReserve 计算生效保留额：max(可用×ratio, MinReserveAmount)。
+// English: effective reserve = max(available×ratio, MinReserveAmount).
+func (m MoneyMgmtConfig) EffectiveReserve(available float64) float64 {
+	r := m.CashReserveRatio
+	if r > 1 {
+		r = 1
+	}
+	if r < 0 {
+		r = 0
+	}
+	byRatio := available * r
+	if m.MinReserveAmount > byRatio {
+		return m.MinReserveAmount
+	}
+	return byRatio
+}
+
+// EnforceT1Enabled §WS-A 返回 T+1 守卫是否生效：nil（未配置）→ true（默认开）；显式布尔按值。
+// English: §WS-A reports whether the T+1 sell guard is active; unset defaults to true.
+func (c QMTConfig) EnforceT1Enabled() bool {
+	if c.EnforceT1 == nil {
+		return true
+	}
+	return *c.EnforceT1
+}
+
+// DisciplineConfig 统一止盈止损纪律参数（探针5s扫描 + 扳机确认窗）。
+// 判定线全部相对买入价：止损-6 / 止盈+15 / 移动止盈=最高价-6（突破+15后动态上移）/ 深破=-12(2×止损线)。
+// 触发后进入固定观察窗（不滚动）：窗内持续有同向信号→跟随；窗结算仍无信号→离场。
+// 实盘与模拟盘统一严格执行；战法自带止盈止损降级为触发通知。
+type DisciplineConfig struct {
+	// 止损线（%）：浮亏达此值触发止损判定（默认 6）
+	StopLossPct float64 `json:"stop_loss_pct"`
+	// 止盈线（%）：盈利达此值触发止盈判定（默认 15）
+	TakeProfitPct float64 `json:"take_profit_pct"`
+	// 移动止盈最大回撤（%）：突破止盈线后，按最高价-此值动态上移止盈点（默认 6）
+	MaxPullbackPct float64 `json:"max_pullback_pct"`
+	// 深破倍数：浮亏达 止损线×此倍数 触发深破判定（默认 2 → -12%），同样走观察窗确认
+	DeepStopMult float64 `json:"deep_stop_mult"`
+	// 低置信买入确认（分钟）：置信度<高置信阈值的买入信号需持续存在该时长才下单（默认 5）
+	BuyConfirmMin int `json:"buy_confirm_min"`
+	// 高置信买入观察（秒）：置信度≥高置信阈值的买入信号至少观察该秒数才下单（默认 30）
+	BuyConfirmHighSec int `json:"buy_confirm_high_sec"`
+	// 止损/止盈结算窗（分钟）：首触判定线锁死一个固定窗口，结算仍无信号即离场（默认 15）
+	ExitConfirmMin int `json:"exit_confirm_min"`
+	// 移动止盈洗盘过滤窗（分钟）：移动止盈用更长窗过滤主升浪中的回撤洗盘（默认 45，30-60 可选）
+	TrailConfirmMin int `json:"trail_confirm_min"`
+	// 探针频率（秒）：实时快照扫描间隔（默认 5）
+	ProbeSec int `json:"probe_sec"`
+	// 高置信度阈值（百分数）：≥此值视为高置信买入（默认 85）
+	HighConfThreshold float64 `json:"high_conf_threshold"`
+	// SellSignalMaxAgeSec §SELLPOINT-UNIFY 边界⑥（延持信号必须新鲜）：卖出观察窗内用做多
+	// SignalActive 判定延持时，信号产出时刻超过该秒数即按"无信号"处理（默认 300=一个打分周期，
+	// 防 5s 探针读到陈旧缓存信号导致该离场不退）。
+	// English: §unify boundary ⑥ — a bull signal older than this many seconds (default 300, one scoring
+	// cycle) counts as absent when the sell window decides whether to extend the hold.
+	// 卖出延持信号新鲜度上限秒数
+	SellSignalMaxAgeSec int `json:"sell_signal_max_age_sec"`
+}
+
+// DefaultQMTConfig 返回 QMT 实盘配置出厂默认：enabled=false（默认关闭）、manual 半自动、对手价。
+// English: returns factory-default QMT live-trading config: disabled, manual mode, market price.
+func DefaultQMTConfig() QMTConfig {
+	return QMTConfig{
+		Enabled:           false,
+		Mode:              "manual",
+		PriceType:         "market",
+		FixedAmount:       10000,
+		MaxPositions:      10,
+		InitialCapital:    100000,
+		TimeoutSec:        10,
+		MissHeartbeatSec:  120,
+		DailyMaxBuys:      20,
+		DailyBudgetAmount: 100000,
+		AutoSell:          true,
+		Advice: QMTAdviceConfig{
+			AddReopenDrawdownPct: -5,
+			AddSignalActive:      true,
+			HoldMinProfitPct:     0,
+		},
+		Discipline: DefaultDisciplineConfig(),
+	}
+}
+
+// DataConfig 数据源配置（§HITHINK_DATA_SOURCE_PLAN）。
+// PrimarySource：回测/研究取数的主源——hithink=同花顺（新）ths_ 表优先、缺口回退 baostock 旧表；
+// baostock=完全走旧表（一键切回开关）。
+// ThsFactorsReady：同花顺复权因子对账门禁——未通过(false)时 HfqBars 仍走旧表。
+type DataConfig struct {
+	// hithink(同花顺(新)优先) | baostock(旧表)
+	PrimarySource string `json:"primary_source"`
+	// 复权因子对账门禁（默认 false）
+	ThsFactorsReady bool `json:"ths_factors_ready"`
+	// 夜间链自动追加全库寻优步骤（默认 false=推荐制手动触发）
+	OptimizeEnabled bool `json:"optimize_enabled"`
+	// 择优结果自动应用（默认 false=推荐制需人工审批）
+	OptimizeAutoApply bool `json:"optimize_auto_apply"`
+	// RiskSourceHithink 风险因子盘口主源开关（§MARKET_RISK_GATE P0）：
+	// nil 或 true = 涨停/跌停/炸板池与涨跌家数以同花顺（新）hithink 为主源、东财兜底；
+	// 显式 false = 应急回退阀，全部改走旧的东财直连（行为与本方案前一致）。
+	// English: risk-factor board primary-source switch — nil/true = hithink primary + EastMoney
+	// fallback; explicit false = emergency rollback to the old EastMoney-direct path.
+	RiskSourceHithink *bool `json:"risk_source_hithink,omitempty"`
+}
+
+// RiskHithinkPrimary 返回风险盘口是否以同花顺为主源（nil 视为默认 true）。
+// English: whether the risk boards use hithink as primary (nil defaults to true).
+func (d DataConfig) RiskHithinkPrimary() bool {
+	return d.RiskSourceHithink == nil || *d.RiskSourceHithink
+}
+
+// SchedulerConfig 按时段切换的研究调度器配置（由独立的 quant-research 服务读取）。
+// 交易时段：只做 dataload 增量下载（绝不回测/研究）；盘后/周末：跑完整夜间研究作业。
+// English: session-based research scheduler config (read by the standalone quant-research service).
+// Trading hours run dataload incremental download only (never backtest/research); after-hours and
+// weekends run the full nightly research job.
+type SchedulerConfig struct {
+	// 总开关（默认 true）
+	Enabled bool `json:"enabled"`
+	// research 二进制路径
+	ResearchBin string `json:"research_bin"`
+	// dataload 二进制路径
+	DataloadBin string `json:"dataload_bin"`
+	// 研究库路径（trading.db）
+	DB string `json:"db"`
+	// baostock sidecar 地址（默认 http://127.0.0.1:8787）
+	PyURL string `json:"pyurl"`
+	// 盘后/周末夜间作业
+	Nightly NightlyConfig `json:"nightly"`
+	// 交易时段增量下载
+	DataloadDuringTrade DataloadDuringTradeConfig `json:"dataload_during_trading"`
+	// StepTimeoutMin 夜间作业单步超时（分钟，默认 90，0=用默认）：超时 kill 子进程并记 error，
+	// 防止单步挂死拖死整链（曾发生 dataload 因 baostock 封 IP 卡 21h、step_index 停在 0）。
+	// English: per-step timeout for the nightly job (minutes, default 90, 0 = default): on expiry the
+	// child is killed and the step errors out, so one hung step can't stall the whole chain (a dataload
+	// once hung 21h on a baostock IP ban with step_index stuck at 0).
+	// 夜间作业单步超时（分钟）
+	StepTimeoutMin int `json:"step_timeout_min"`
+	// TrimIntervalMin 盘中内存释放节流间隔（分钟，默认 15）：活跃时段 researchd 自身
+	// 定时 runtime.GC()+debug.FreeOSMemory() 并防御性清理残留的 research/discover 子进程，
+	// 保证研究绝不残留盘中（物理内存让给盘中的 quant 常驻服务）。
+	// English: in-session trim throttle in minutes (default 15): during active sessions the researchd
+	// daemon periodically GC+FreeOSMemory itself and defensively kills leftover research/discover child
+	// processes, so research never lingers during trading hours (leaving RAM to the quant engine).
+	// 盘中内存释放节流间隔（分钟）
+	TrimIntervalMin int `json:"trim_interval_min"`
+	// MinFreeMemMB 内存总闸阈值(MB)：系统可用内存低于该值时调度器不出队，任务留队列。
+	// English: memory gate — tasks stay queued when system MemAvailable drops below this.
+	// 内存总闸阈值（MB）
+	MinFreeMemMB int `json:"min_free_mem_mb"`
+	// ReplayThrottleMs 战法库全量回放逐股节流（毫秒/只）：>0 时回放循环每处理完一只股票
+	// sleep 该时长——盘后十几个小时足够，用拉长总时长换取对 quant/系统的瞬时 CPU 挤压最小化
+	// （2 核 4G 服务器上全池回放瞬时会把可用内存打到熔断线以下）。0=不节流。
+	// English: per-stock throttle (ms) for full-library replay — sleeping between stocks stretches
+	// the runtime over the long post-close window in exchange for much smaller instantaneous CPU/mem
+	// pressure on the box (a 2-core/4G server). 0 = no throttling.
+	ReplayThrottleMs int `json:"replay_throttle_ms"`
+	// §数据源路由（§HITHINK_DATA_SOURCE_PLAN）：研究/回测取数主源与复权门禁。
+	// hithink | baostock（默认 baostock=旧表，安全）
+	PrimarySource string `json:"primary_source"`
+	// 复权对账门禁：通过后置 true，HfqBars 才走 ths 因子
+	ThsFactorsReady bool `json:"ths_factors_ready"`
+	// 夜间自动寻优开关（默认 true，推荐制）
+	OptimizeEnabled bool `json:"optimize_enabled"`
+}
+
+// DiscoverConfig 因子/形态发现 + B4 回测 + 护栏参数（rules.nightly.discover）。
+// 2026-09-05 多轮自动发现：每夜按 variants 个变体任务 × 每变体 top_n 个排他最优组合产出互异候选。
+// English: factor/pattern discovery, B4 backtest and guardrail parameters (rules.nightly.discover).
+// Since 2026-09-05 multi-round discovery: `variants` variant tasks per night × `top_n` exclusive
+// top combos per variant produce mutually-distinct candidates.
+type DiscoverConfig struct {
+	// Horizons 多轮变体参数：前瞻天数列表（轮次 i 用 Horizons[i]，越界用默认 5）。
+	Horizons []int `json:"horizons"`
+	// StartWindows 多轮变体参数：窗口年数列表（1/2/3=近 N 年）。窗轮换使样本内每夜真前进，从源头避免滑窗贪心每晚选同一组合。
+	StartWindows []int `json:"start_windows"`
+	// Metrics 多轮变体参数：优化目标列表（ir|ic），轮次 i 用 Metrics[i]。
+	Metrics []string `json:"metrics"`
+	// FactorPools 多轮变体参数：风格子池名列表（""=全池；预设见 cmd/research 的 resolveFactorPool）。
+	FactorPools []string `json:"factor_pools"`
+	// TopN §S1 每变体排他重跑产出的互异最优组合数（默认 2）。与 variants 相乘 = 每晚候选数。
+	TopN int `json:"top_n"`
+	// MinStocks 每日最小样本（默认 20）
+	MinStocks int `json:"min_stocks"`
+	// MaxFactors 组合最大因子数（默认 8）
+	MaxFactors int `json:"max_factors"`
+	// Split 样本内占比（默认 0.7）
+	Split float64 `json:"split"`
+	// MinIR 护栏 |IR| 下限（默认 0.3）
+	MinIR float64 `json:"min_ir"`
+	// MinDays 护栏有效日下限（默认 30）
+	MinDays int `json:"min_days"`
+	// MinGenT 反推泛化 Welch t 护栏（默认 -2）
+	MinGenT float64 `json:"min_gen_t"`
+	// MinTrigger 形态战法最小触发次数（默认 20）
+	MinTrigger int `json:"min_trigger"`
+	// MinExcess 形态战法护栏最小平均超额（默认 0.01）
+	MinExcess float64 `json:"min_excess"`
+	// MinLimitUps B4 合成事件行业涨停家数下限（默认 3）
+	MinLimitUps int `json:"min_limit_ups"`
+	// TopK B4 每事件选股数（默认 5）
+	TopK int `json:"top_k"`
+	// MaxPerDay B4 每交易日最多事件数（默认 3，对齐 backtest.DefaultOptions。>1 才有多事件）。
+	MaxPerDay int `json:"max_per_day"`
+	// GuardStrong §C2 护栏分级：|IR| ≥ 记 strong（可审批）
+	GuardStrong float64 `json:"guard_strong"`
+	// GuardWeak §C2 护栏分级：|IR| ≥ 记 weak（进灰度观察区）
+	GuardWeak float64 `json:"guard_weak"`
+	// MinYrSign §C3a 分年度 IR 符号一致最少年数（0=不启用）
+	MinYrSign int `json:"min_yr_sign"`
+	// MinBtEvents §C3b B4 回测事件数护栏（< 则 reason 标注统计意义弱；0=不启用）
+	MinBtEvents int `json:"min_bt_events"`
+	// DedupJaccard §S2 近似重复 Jaccard 阈值（集合交/并 ≥ 则判定重复候选，默认 0.8）
+	DedupJaccard float64 `json:"dedup_jaccard"`
+	// ChangeGate §S3 变化门：最优组合与最近 pending 候选相同且新鲜时跳过（默认关→经观察后开）
+	ChangeGate bool `json:"change_gate"`
+	// StalenessDays §S3 变化门冷却（组合相同但候选超过该天数可重发，默认 30）
+	StalenessDays int `json:"staleness_days"`
+	// Hysteresis §C4 滞回：与已应用候选组合相同且 |ΔIR| < 时跳过（防边际改进顶掉已应用战法，默认 0.05）
+	Hysteresis float64 `json:"hysteresis"`
+}
+
+// NightlyConfig 夜间研究作业配置（盘后/周末触发）。
+type NightlyConfig struct {
+	// 交易日盘后启动时间 HHMM（默认 1530）
+	StartHHMM int `json:"start_hhmm"`
+	// 周末启动时间 HHMM（默认 1530，周六周日各跑一次）
+	WeekendStartHHMM int `json:"weekend_start_hhmm"`
+	// 步骤序列（dataload/sector_rebuild/discover_factors/discover_patterns/list）
+	Steps []string `json:"steps"`
+	// 单步失败是否终止整链（默认 false=记录后继续）
+	AbortOnError bool `json:"abort_on_error"`
+	// BacktestEnabled 是否在发现因子候选后追加一次 B4 全链路回测，把候选的「回测超额」
+	// （avg_excess）填上（前端原本显示"未测"）。默认 false（省时省 CPU）。
+	// English: when true, after factor discovery the nightly job also runs a B4 full-chain backtest
+	// on the newest proposed factor candidate, filling in its "回测超额" (avg_excess) — the field the
+	// UI shows as "未测" otherwise. Default false to save time/CPU.
+	// Backtest是否启用
+	BacktestEnabled bool `json:"backtest_enabled"`
+	// BacktestEvents B4 回测事件数上限（backtest_enabled 时生效；0=用默认合理值）。
+	// B4 回测事件数上限
+	BacktestEvents int `json:"backtest_events"`
+	// ResearchRounds 每晚因子发现候选轮数（默认 4 = 2 变体 × top_n=2 排他）。
+	// English: nightly factor-discovery candidate rounds (default 4 = 2 variants × top_n=2 exclusive).
+	ResearchRounds int `json:"research_rounds"`
+	// Discover 发现/护栏参数（多轮变体 + 护栏分级 + 去重阈值）。
+	Discover DiscoverConfig `json:"discover"`
+	// Lifecycle §GAP-P1 20260915：steps 含 "lifecycle" 时的衰退降级阈值
+	// （零值 = research.DemoteOpts 内置默认：连续 3 日低于线/胜率<35%/样本<3）。
+	// English: thresholds for the nightly lifecycle step (zero = evaluator defaults).
+	Lifecycle LifecycleConfig `json:"lifecycle"`
+}
+
+// LifecycleConfig 夜间生命周期任务（衰退自动降级）阈值；零值回落内置默认。
+// English: nightly lifecycle (strategy demotion) thresholds; zero values use built-in defaults.
+type LifecycleConfig struct {
+	// ConsecDays 连续低于阈值的交易日数（默认 3）
+	ConsecDays int `json:"consec_days"`
+	// MinIR 滚动 IR 下限（默认 0）
+	MinIR float64 `json:"min_ir"`
+	// MinWinRate 胜率下限（%，默认 35）
+	MinWinRate float64 `json:"min_win_rate"`
+	// MinDailyTrades 单日样本下限（默认 3）
+	MinDailyTrades int `json:"min_daily_trades"`
+	// DryRun 只报告不落库（上线初期观察用；确认误杀率后再关）
+	DryRun bool `json:"dry_run"`
+	// ZeroObsDays §RFIX-3 零观测告警阈值（天）：已启用战法连续零成交 ≥ 该天数 → 推送告警。
+	// 0=走 research 内置默认 30，负数=关闭告警。
+	ZeroObsDays int `json:"zero_obs_days"`
+	// PendingExpireDays §RFIX-4 寻优 pending 过期天数：夜间 lifecycle 步骤把超过该天数
+	// 仍未审批的 optimization_results 行置 expired。0=默认 30。
+	PendingExpireDays int `json:"pending_expire_days"`
+}
+
+// DataloadDuringTradeConfig 交易时段增量下载配置（只下载，不含任何研究/回测）。
+type DataloadDuringTradeConfig struct {
+	// 开关（默认 true）
+	Enabled bool `json:"enabled"`
+	// 间隔分钟（默认 30）
+	IntervalMinutes int `json:"interval_minutes"`
+}
+
+// DefaultSchedulerConfig 返回研究调度器出厂默认配置。
+// English: returns factory-default research-scheduler config.
+func DefaultSchedulerConfig() SchedulerConfig {
+	return SchedulerConfig{
+		Enabled:         true,
+		ResearchBin:     "research",
+		DataloadBin:     "dataload",
+		PrimarySource:   "baostock", // 安全默认：旧表；对账门禁通过后配置切 hithink
+		ThsFactorsReady: false,
+		OptimizeEnabled: true, // §O1 夜间自动寻优默认开启（推荐制——结果需人工审批应用）
+		PyURL:           "http://127.0.0.1:8787",
+		Nightly: NightlyConfig{
+			StartHHMM:        1530,
+			WeekendStartHHMM: 1530,
+			// 默认夜间研究步骤序列：行情装载 → 板块重建 → 因子挖掘 → 形态挖掘 → 模拟盘研究
+			// （读取盘后落库的模拟盘成交/净值生成信号质量报告）→ 生命周期评估（§GAP-P1
+			// 20260915：实盘战法衰退自动降级 + 灰度晋升候选生成）→ 候选列表汇总。
+			// backtest 由 BacktestEnabled 开关控制追加。
+			// English: default nightly steps — dataload → sector rebuild → factor discovery → pattern
+			// discovery → paper research → lifecycle (auto-demote declining strategies + promotion
+			// candidates) → candidate listing. The backtest step is appended by BacktestEnabled.
+			Steps:           []string{"dataload", "sector_rebuild", "discover_factors", "discover_patterns", "paper_research", "lifecycle", "list"},
+			AbortOnError:    false,
+			BacktestEnabled: false,
+			BacktestEvents:  0,
+			// 多轮自动发现：默认 4 轮 = 2 变体 × top_n=2 排他。
+			// English: multi-round default 4 = 2 variants × top_n=2 exclusive reruns.
+			ResearchRounds: 4,
+			Discover: DiscoverConfig{
+				Horizons:      []int{5, 10},
+				StartWindows:  []int{3, 1},
+				Metrics:       []string{"ir", "ir"},
+				FactorPools:   []string{"", "mom_liq"},
+				TopN:          2,
+				MinStocks:     20,
+				MaxFactors:    8,
+				Split:         0.7,
+				MinIR:         0.3,
+				MinDays:       30,
+				MinGenT:       -2,
+				MinTrigger:    20,
+				MinExcess:     0.01,
+				MinLimitUps:   3,
+				TopK:          5,
+				MaxPerDay:     3,
+				GuardStrong:   0.45,
+				GuardWeak:     0.20,
+				MinYrSign:     0,
+				MinBtEvents:   0,
+				DedupJaccard:  0.8,
+				ChangeGate:    false,
+				StalenessDays: 30,
+				Hysteresis:    0.05,
+			},
+		},
+		DataloadDuringTrade: DataloadDuringTradeConfig{
+			Enabled:         true,
+			IntervalMinutes: 30,
+		},
+		TrimIntervalMin: 15,
+	}
+}
+
+// NotifyConfig 通知推送配置：Webhook 回调地址列表（P1 清仓/止损强提醒时异步回调）。
+// （NotifyConfig holds notification settings, e.g. the Webhook callback URLs used when P1
+// close-out/stop-loss alerts fire.）
+type NotifyConfig struct {
+	// Webhook 地址列表（空则只走桌面/SSE）
+	WebhookURLs []string `json:"webhook_urls,omitempty"`
+	// 外部推送网关配置（APK 后台/离线触达）
+	Push PushConfig `json:"push,omitempty"`
+	// §GAP5.2 静默时段："HH:MM"~"HH:MM"（可跨午夜，如 22:00~08:00）；任一为空=不启用。
+	// 窗口内仅高级别（LevelHigh：交易信号/清仓/止损）放行，低/中级别本地日志留痕不推送。
+	// 静默时段开始（HH:MM）
+	QuietStart string `json:"quiet_start,omitempty"`
+	// 静默时段结束（HH:MM）
+	QuietEnd string `json:"quiet_end,omitempty"`
+	// §HARDENING ntfy 运维告警通道（与 APK 推送网关并行的独立冗余通道）：
+	// 主题名即凭证（随机串）；Topic 为空=不启用。URL 空默认公共服务器 https://ntfy.sh，
+	// 自托管后改此处即可，代码零改动。
+	NtfyURL string `json:"ntfy_url,omitempty"`
+	// ntfy 订阅主题（随机串，泄露=可伪造告警，勿入日志/前端）
+	NtfyTopic string `json:"ntfy_topic,omitempty"`
+}
+
+// PushConfig 外部推送网关配置。
+// Provider 为 "jpush" 时使用极光 REST API（AppKey+Secret 鉴权，Alias 指定推送目标设备别名）；
+// 否则使用通用 webhook 网关（URL 指向接收 JSON 的推送地址）。
+// Enabled 关闭时不启用推送网关。
+// （PushConfig configures the external push gateway. Provider "jpush" uses the JPush REST API
+// (AppKey+Secret auth, Alias targets the device alias); otherwise the generic webhook gateway
+// POSTs JSON to URL. Enabled=false disables the gateway.）
+type PushConfig struct {
+	// 是否启用外部推送网关
+	Enabled bool `json:"enabled"`
+	// 网关类型：jpush | webhook（默认 webhook）
+	Provider string `json:"provider"`
+	// webhook 推送接收地址（JSON POST）
+	URL string `json:"url,omitempty"`
+	// 极光 AppKey（服务端推送鉴权用）
+	AppKey string `json:"app_key,omitempty"`
+	// 极光 Master Secret（服务端推送鉴权用，勿入库/勿进 APK）
+	Secret string `json:"secret,omitempty"`
+	// 极光推送目标设备别名（默认 quant_owner）
+	Alias string `json:"alias,omitempty"`
+}
+
+// EmotionConfig 情绪周期六个阶段（冰点/启动/发酵/高潮/背离/退潮）的判定阈值。
+// 各阶段由涨停家数、炸板率、连板高度等市场情绪指标的上下限共同判定。
+// （EmotionConfig holds thresholds for the six emotion-cycle stages (ice/start/ferment/climax/
+// divergence/retreat), jointly determined by bounds on limit-up count, open-board rate, etc.）
+type EmotionConfig struct {
+	// 冰点期：涨停家数上限
+	EmoIceBoardMax int `json:"emo_ice_board_max"`
+	// 冰点期：连板高度上限
+	EmoIceLimitupMax int `json:"emo_ice_limitup_max"`
+	// 冰点期：炸板率下限
+	EmoIceBlastMin float64 `json:"emo_ice_blast_min"`
+	// 启动期：涨停家数上限
+	EmoStartBoardMax int `json:"emo_start_board_max"`
+	// 启动期：连板高度下限
+	EmoStartLimitupMin int `json:"emo_start_limitup_min"`
+	// 启动期：连板高度上限
+	EmoStartLimitupMax int `json:"emo_start_limitup_max"`
+	// 启动期：炸板率下限
+	EmoStartBlastMin float64 `json:"emo_start_blast_min"`
+	// 启动期：炸板率上限
+	EmoStartBlastMax float64 `json:"emo_start_blast_max"`
+	// 发酵期：涨停家数上限
+	EmoFermentBoardMax int `json:"emo_ferment_board_max"`
+	// 发酵期：连板高度下限
+	EmoFermentLimitupMin int `json:"emo_ferment_limitup_min"`
+	// 发酵期：连板高度上限
+	EmoFermentLimitupMax int `json:"emo_ferment_limitup_max"`
+	// 发酵期：炸板率上限
+	EmoFermentBlastMax float64 `json:"emo_ferment_blast_max"`
+	// 高潮期：涨停家数下限
+	EmoClimaxBoardMin int `json:"emo_climax_board_min"`
+	// 高潮期：连板高度下限
+	EmoClimaxLimitupMin int `json:"emo_climax_limitup_min"`
+	// 高潮期：炸板率上限
+	EmoClimaxBlastMax float64 `json:"emo_climax_blast_max"`
+	// 背离期：涨停家数相对峰值回落家数
+	EmoDivergeBoardDrop int `json:"emo_diverge_board_drop"`
+	// 背离期：连板高度相对峰值回落
+	EmoDivergeLimitupDrop int `json:"emo_diverge_limitup_drop"`
+	// 背离期：炸板率抬升幅度
+	EmoDivergeBlastRise float64 `json:"emo_diverge_blast_rise"`
+	// 退潮期：涨停家数上限
+	EmoRetreatBoardMax int `json:"emo_retreat_board_max"`
+	// 退潮期：连板高度上限
+	EmoRetreatLimitupMax int `json:"emo_retreat_limitup_max"`
+	// 退潮期：炸板率下限
+	EmoRetreatBlastMin float64 `json:"emo_retreat_blast_min"`
+	// §MARKET_RISK_GATE P1 情绪广度纠偏（涨停池口径只看涨停家数/连板，看不到全市场普跌）：
+	// 以下跌幅占比阈值 >0 时才生效（0/未配置=不纠偏，保持既有行为）；涨跌家数缺失时同样弃权。
+	//   下跌家数/(涨+跌) ≥ IceDownRatio → 强制"冰点"；≥ RetreatDownRatio → 至少降为"退潮"。
+	// English: P1 breadth correction — the limit-up-pool phase ignores market-wide declines. These
+	// thresholds only apply when >0 (0/unset = no correction, preserving existing behavior), and the
+	// correction abstains when up/down counts are missing. down/(up+down) ≥ Ice → force "ice";
+	// ≥ Retreat → demote to at least "retreat".
+	EmoBreadthIceDownRatio     float64 `json:"emo_breadth_ice_down_ratio"`     // 下跌占比达到此值强制判定"冰点"（0/未配置=不启用）
+	EmoBreadthRetreatDownRatio float64 `json:"emo_breadth_retreat_down_ratio"` // 下跌占比达到此值降级至少为"退潮"（0/未配置=不启用）
+	// BlockBuyPhases 禁止开仓的情绪周期阶段列表（C5）：这些阶段下四战法均不发买入信号
+	// （降级为 watch 观察）。空列表时默认仅 ["衰退"]（与 N 形既有情绪硬闸一致）。
+	// English: emotion phases in which buying is forbidden (C5) — all four strategies downgrade buy
+	// signals to watch under these phases. Empty falls back to ["衰退"] (matching N-shape's hard gate).
+	// 禁止开仓的情绪周期阶段列表
+	BlockBuyPhases []string `json:"block_buy_phases,omitempty"`
+}
+
+// MainSectorConfig 主线板块识别配置：涨停家数、成交量排名、涨幅等阈值。
+// Bull/Shock 两套阈值分别对应牛市强势行情与震荡行情的板块强度判定。
+// （MainSectorConfig configures main-sector identification via limit-up count, volume rank, gain
+// thresholds, etc.; Bull/Shock presets match strong bull vs. choppy sideways markets.）
+type MainSectorConfig struct {
+	// SectorConstituentTopN 每板块纳入可操作成分股的数量（板块→个股传播/成分股评分）。
+	// 默认 20：扩大覆盖使同板块强势股（如剑桥科技）能进打分池，避免只覆盖龙头前10而漏选。
+	// English: number of constituents per sector treated as actionable (sector→stock propagation /
+	// constituent scoring). Default 20 to widen coverage so more same-sector leaders like Cambridge reach
+	// the pool instead of only the top-10 leaders.
+	// 每板块纳入可操作成分股数量
+	SectorConstituentTopN int `json:"sector_constituent_top_n"`
+}
+
+// LLMConfig LLM 客户端连接配置。
+// （LLMConfig is the LLM client connection configuration.）
+type LLMConfig struct {
+	// LLM API 地址
+	APIURL string `json:"api_url"`
+	// 模型名称
+	Model string `json:"model"`
+	// 单次请求超时（秒），缺省 60
+	TimeoutSec int `json:"timeout_sec"`
+	// Stream 流式（SSE）响应开关。nil（缺省/未配置）= 开启（推理模型非流式首字极慢，
+	// 恒开流式 + 内部回落为默认策略）；显式 false = 关闭，走一次性非流式。
+	// 是否启用流式响应
+	Stream *bool `json:"stream,omitempty"`
+	// MaxRetryTimes D1 评分 LLM 调用轮询重试次数（含首次）。<=0 时回退默认 2（§信号速度 S5）。
+	// 当轮不反复死磕：失败股置 RetryPending 并入下轮重试队列，不丢分；配合增量 D1 提速。
+	// 重试防丢信号：LLM 偶发超时/限流时不再轻易丢弃重要 D1 评分。
+	// LLM 调用最大重试次数
+	MaxRetryTimes int `json:"max_retry_times"`
+	// BatchConcurrency 新闻归因（Stage0/Stage2）LLM 批量分析的最大并发批次数量。
+	// <=0 时回退默认 8；API 配额充足时调高可加快盘前新闻归因吞吐，前端可热改。
+	// LLM 批量分析最大并发批次
+	BatchConcurrency int `json:"batch_concurrency"`
+	// D1MaxTokens D1 评分 LLM 单次调用的 max_tokens（推理长度上限，§信号速度 S3）。
+	// <=0 时回退默认 2048。D1 评分输出为结构化 JSON，无需过长思维链，
+	// 限制长度可显著降低单股评分耗时（原非流式硬编码 4096）。前端可热改。
+	// English: max_tokens for D1 scoring LLM calls (reasoning-length cap, §speed S3). <=0 falls back to the
+	// default 2048. D1 outputs structured JSON needing no long chain-of-thought, so capping length cuts
+	// per-stock latency (previously hardcoded 4096 on the non-streaming path). Hot-adjustable in the UI.
+	D1MaxTokens int `json:"d1_max_tokens"`
+	// ClassifierModel 可选：新闻归因分类（Stage0/1 合并调用等"快速分类/初筛"）专用模型。
+	// 配置轻量/快速模型可显著加快分类吞吐，把主模型留给 D1/Stage2 等深度分析；留空与主模型一致。
+	// English: optional dedicated model for news-attribution classification (Stage0/1 combined calls and
+	// other cheap screening). A lighter/faster model speeds classification while the main model stays on
+	// deep work (D1/Stage2); empty falls back to the main model.
+	// 新闻分类专用模型
+	ClassifierModel string `json:"classifier_model"`
+	// §GAP5.1 成本治理：当日调用次数 / token 总量预算（0=不设限）。超限后当日新请求熔断，
+	// 次日自动恢复。LLM 是系统最大可变成本，此前用量完全不可见、无任何上限。
+	// 当日 LLM 调用次数预算
+	DailyCallBudget int64 `json:"daily_call_budget"`
+	// 当日 token 总量预算（0=不设限），超限当日熔断、次日自动恢复（§FIX-7 接线）。
+	// Daily token budget; 0 = unlimited; trips today, auto-recovers next day.
+	DailyTokenBudget int64 `json:"daily_token_budget"`
+	// StreamIdleTimeoutSec 流式"相邻分片空闲"阈值（秒）。<=0 时 llm 包回落默认 60s。
+	// §FIX-3(20260919) 语义修正后该值恢复本义：分片到达即重置，只掐"真的停止吐字"的卡流，
+	// 不再是整段硬超时（旧实现把慢而正常的长推理流式误杀）。
+	// Stream idle timeout in seconds
+	StreamIdleTimeoutSec int `json:"stream_idle_timeout_sec"`
+	// ConsultDailyCalls §FIX-7(20260919)：AI 顾问（咨询）单独的当日调用预算（0=不设限）。
+	// 咨询出呼走运营账号统一密钥、全体用户共用，总日预算之外再给咨询封顶，
+	// 防高频问答吃光新闻归因/D1 当日配额。超限当日 429，次日自动恢复。
+	// Consultation daily call budget
+	ConsultDailyCalls int64 `json:"consult_daily_calls"`
+}
+
+// StreamingEnabled 返回流式响应是否启用：未显式配置（nil）时默认开启。
+// （StreamingEnabled reports whether streaming is enabled; nil (unset) means enabled by default.）
+func (c *LLMConfig) StreamingEnabled() bool {
+	if c == nil || c.Stream == nil {
+		return true
+	}
+	return *c.Stream
+}
+
+// ThemeConfig 主题白名单和黑名单。
+// （ThemeConfig is the theme watch-list and black-list configuration.）
+type ThemeConfig struct {
+	// 排除主题黑名单
+	BlackList []string `json:"black_list"`
+}
+
+// DrawdownRule 回撤规则：触发阈值时执行对应操作。
+// （DrawdownRule defines a drawdown rule: when the threshold is hit, the action fires.）
+type DrawdownRule struct {
+	// 回撤百分比阈值
+	Pct float64 `json:"pct"`
+	// 触发操作（如 "减仓"/"清仓"）
+	Action string `json:"action"`
+}
+
+// ComplianceConfig 合规配置。
+// （ComplianceConfig is the compliance configuration.）
+type ComplianceConfig struct {
+	// 是否启用合规模式
+	ComplianceMode bool `json:"compliance_mode"`
+}
+
+// RiskCtrlConfig 风控配置：止损规则、合规模式、组合回撤限制等。
+// （RiskCtrlConfig is the risk-control config: stop-loss rules, compliance mode, portfolio drawdown cap, etc.）
+type RiskCtrlConfig struct {
+	// 合规模式
+	Compliance ComplianceConfig `json:"compliance"`
+	// 是否启用 M8 风控
+	M8Enabled bool `json:"m8_enabled"`
+	// 组合最大回撤百分比
+	M8PortfolioDrawdownPct float64 `json:"m8_portfolio_drawdown_pct"`
+	// 单只股票最大仓位比例
+	PerStockMax float64 `json:"per_stock_max"`
+}
+
+// StopLossConfig 止损配置：买入后回撤阶梯规则。
+// （StopLossConfig holds stop-loss rules as a ladder of post-buy drawdown thresholds.）
+type StopLossConfig struct {
+}
+
+// PositionConfig 仓位配置：总仓位上限 + 持仓当日跌幅提醒阈值。
+// （PositionConfig caps the total portfolio position and sets the daily-drop alert threshold.）
+type PositionConfig struct {
+	// 最大总仓位比例
+	MaxTotalPositionPct float64 `json:"max_total_position_pct"`
+	// AutoTrackSignals 买入信号自动纸面开仓（C3）：置真时引擎把 buy 信号写入持仓记录，
+	// 激活 CheckPositionsExits 离场路径（止盈/止损/超期提醒）。仅纸面记录，不真实下单。
+	// （AutoTrackSignals auto-paper-opens a position on buy signals (C3): the engine writes the buy into
+	// the holding log so the CheckPositionsExits exit path activates. Paper-only, never really orders.）
+	// 买入信号自动纸面开仓
+	AutoTrackSignals bool `json:"auto_track_signals"`
+	// ATREnabled ATR 动态止损开关（C4）：置真时以 ATRStopMult×ATR 替代固定百分比止损
+	// （龙头全出/双凸硬止损/N形硬止损/龙回头止损）。默认开。
+	// （ATREnabled turns on ATR-based dynamic stops (C4): ATRStopMult×ATR replaces the fixed-percentage
+	// stops — dragon full-out / double-bump hard stop / n-shape hard stop / dragon-return stop-loss.）
+	// ATR是否启用
+	ATREnabled bool `json:"atr_enabled"`
+	// ATRStopMult ATR 止损倍数（止损距离 = 该倍数 × ATR，默认 2.5）。
+	// （ATRStopMult is the ATR stop multiplier — stop distance = multiplier × ATR, default 2.5.）
+	// ATR 止损倍数
+	ATRStopMult float64 `json:"atr_stop_mult"`
+	// DailyDropAlertPct 持仓当日跌幅(%)提醒阈值：当日涨跌幅 ≤ -该值 时，
+	// 无论成本盈亏是否触及止损线，都在持仓提醒中提示（<=0 用默认 5）。
+	// （DailyDropAlertPct is the intraday daily-drop alert threshold for holdings: when a held stock's
+	// daily change ≤ -threshold, a holding alert fires regardless of cost-based P/L (<=0 defaults to 5).）
+	// 持仓当日跌幅提醒阈值(%)
+	DailyDropAlertPct float64 `json:"daily_drop_alert_pct"`
+}
+
+// StrategyConfig 各策略的独立参数配置。
+// （StrategyConfig holds the per-strategy parameter configuration.）
+type StrategyConfig struct {
+	// 龙头战法配置
+	Dragon DragonConfig `json:"dragon"`
+	// 双响炮战法配置
+	DoubleBump DoubleBumpConfig `json:"double_bump"`
+	// N 形战法配置
+	NShape NShapeConfig `json:"n_shape"`
+	// 龙回头战法配置
+	DragonReturn DragonReturnConfig `json:"dragon_return"`
+	// 动量分权重配置
+	Momentum MomentumConfig `json:"momentum"`
+	// 宏观利空门控配置
+	MacroGate MacroGateConfig `json:"macro_gate"`
+	// §SHORT-1 做空四战法配置（高位滞涨/放量破位/龙头断板/利好兑现砸盘）
+	Short ShortStrategiesConfig `json:"short"`
+}
+
+// ShortStrategiesConfig §SHORT-1 做空战法配置（docs/SHORT_STRATEGIES_PLAN_20260912.md）。
+// 做空信号定位=卖出侧决策：受全局 short_enabled 门控，本配置为战法层参数。
+// 阈值字段 ≤0 时走代码默认（60/60/65/60），保证旧配置零迁移兼容。
+// （ShortStrategiesConfig configures the four bear-side tactics; zero thresholds fall back to code
+// defaults so existing configs need no migration.）
+type ShortStrategiesConfig struct {
+	// Enabled 做空战法层开关（缺省 nil=启用；实际还受全局 short_enabled 总闸门控）
+	Enabled *bool `json:"enabled"`
+	// HighChurnMin 高位滞涨通过门槛（默认 60）
+	HighChurnMin float64 `json:"high_churn_min"`
+	// BreakDownMin 放量破位通过门槛（默认 60）
+	BreakDownMin float64 `json:"break_down_min"`
+	// LeaderDecayMin 龙头断板通过门槛（默认 65，四战法最严——断板有反包风险）
+	LeaderDecayMin float64 `json:"leader_decay_min"`
+	// GoodNewsFadeMin 利好兑现砸盘通过门槛（默认 60）
+	GoodNewsFadeMin float64 `json:"good_news_fade_min"`
+	// MarginRate 模拟盘融券开仓保证金率（默认 0.5=50%，占用=数量×开仓价×保证金率）
+	MarginRate float64 `json:"margin_rate"`
+	// AnnualFeeRate 融券年化费率（默认 0.083=8.3%，按自然日对开仓名义额计提）
+	AnnualFeeRate float64 `json:"annual_fee_rate"`
+}
+
+// ShortTacticsEnabled 返回做空战法层开关（nil=默认启用）。
+// （ShortTacticsEnabled reports the tactic-layer switch; nil defaults to enabled.）
+func (s *ShortStrategiesConfig) ShortTacticsEnabled() bool {
+	return s.Enabled == nil || *s.Enabled
+}
+
+// MacroGateConfig 宏观利空门控（E1）：股指期货交割日等高影响宏观事件作为整体利空，
+// 当日处于影响期时买入信号统一降级，仅超高置信度（"特别高质量信号"）放行。
+// 默认：交割日（contract）开启门控，放行置信度 ≥0.85，N 形超短在交割日一律 watch。
+// （MacroGateConfig configures the E1 macro bearish gate: on contract-delivery (交割日) or other
+// high-impact macro days, buy signals are downgraded as a whole unless they are exceptionally
+// high-confidence ("特别高质量信号"). Defaults: gate on for contract days, allow-through confidence
+// ≥0.85, and N-shape ultra-short is always watch on delivery days.）
+type MacroGateConfig struct {
+	// Enabled 总开关（默认 false：未配置时行为不变，保证向后兼容）。
+	// English: master switch (default false — no config means no behavior change, backward compatible).
+	// 是否启用
+	Enabled bool `json:"enabled"`
+	// Levels 触发门控的宏观事件级别（如 ["contract"]）；空时默认 ["contract"]。
+	// English: macro-event levels that trigger the gate (e.g. ["contract"]); empty defaults to ["contract"].
+	// 触发门控的宏观事件级别列表
+	Levels []string `json:"levels"`
+	// MinConfidence 放行买入信号的最低置信度（0~1，默认 0.85；低于此置信度的买入降级为 watch）。
+	// English: minimum confidence for a buy signal to pass the gate (0~1, default 0.85); buys below are downgraded to watch.
+	// 宏观门控放行买入最低置信度
+	MinConfidence float64 `json:"min_confidence"`
+	// BlockNShape 交割日是否对 N 形超短一律拦截（默认 true：超短对交割日波动最敏感）。
+	// nil 表示使用默认 true；显式 false 才取消拦截。
+	// English: whether N-shape ultra-short is always blocked on delivery days (default true — ultra-short is most sensitive to delivery-day swings). nil means default true; only an explicit false disables it.
+	// 交割日是否拦截 N 形超短
+	BlockNShape *bool `json:"block_n_shape,omitempty"`
+	// BlockMomentum 交割日是否拦截动量 watch 观察信号（默认 true）。
+	// nil 表示使用默认 true；显式 false 才取消拦截。
+	// English: whether the momentum watch signal is also blocked on delivery days (default true). nil means default true; only an explicit false disables it.
+	// 交割日是否拦截动量观察信号
+	BlockMomentum *bool `json:"block_momentum,omitempty"`
+
+	// ── §MARKET_RISK_GATE P3 风险档扩展（全部向后兼容：未配置即取下方默认）──
+
+	// RiskGateEnabled 分层风险档总开关（裁决④/§九：默认 true=上线即保护）。
+	// nil 或 true=启用 Red/Yellow 风险档收紧；显式 false=应急一键回退（风险档不参与信号降级，退回旧 E1 纯宏观门控语义）。
+	// English: master switch for the tiered risk gate. nil/true = Red/Yellow tightening active (protection on by default); an explicit false = emergency rollback to the old E1 pure-macro-gate behavior.
+	// 风险档总开关
+	RiskGateEnabled *bool `json:"risk_gate_enabled,omitempty"`
+	// EmotionEnabled 情绪相位是否参与风险档合成（裁决④：默认 true）。false 时仅宏观事件+市场状态定档，
+	// 冰点/退潮/背离不再触发降级——这是"情绪维度误伤"的独立热回退阀。
+	// English: whether the emotion phase feeds the tier. false = only macro events + market state decide, i.e. an independent hot-rollback for over-eager emotion downgrades.
+	// 情绪相位参与风险档开关
+	EmotionEnabled *bool `json:"emotion_enabled,omitempty"`
+	// EmotionLevels 参与风险档合成的情绪相位集合（默认 ["冰点","退潮","背离"]）。
+	// EmotionLevels emotion phases that feed tier synthesis (default ice/retreat/divergence).
+	// 参与合成的情绪相位列表
+	EmotionLevels []string `json:"emotion_levels,omitempty"`
+	// YellowConfidence Yellow 档放行买入的最低置信度（默认 0.90；低于此降级 watch）。
+	// YellowConfidence minimum buy confidence to pass a Yellow day (default 0.90).
+	// Yellow 档放行置信度门槛
+	YellowConfidence float64 `json:"yellow_confidence,omitempty"`
+	// RedConfidence Red 档放行买入的最低置信度（默认 0.92；系统性风险日门槛更高）。
+	// RedConfidence minimum buy confidence to pass a Red day (default 0.92 — stricter on systemic-risk days).
+	// Red 档放行置信度门槛
+	RedConfidence float64 `json:"red_confidence,omitempty"`
+	// BreadthWeakUpRatio "震荡且上涨占比偏弱"判定的上涨占比阈值（默认 0.40；range 且 up/(up+down) < 此值 → Yellow）。
+	// 家数缺失（upRatio=NaN）时该条件弃权，不触发。
+	// BreadthWeakUpRatio up-share threshold for the "range + weak breadth" Yellow trigger (default 0.40); abstains when the ratio is NaN (counts missing).
+	// range 弱势广度阈值
+	BreadthWeakUpRatio float64 `json:"breadth_weak_up_ratio,omitempty"`
+	// MacroSectorMap 板块级映射（中观层，差距5）：宏观事件级别/情绪 → 受影响板块名列表；
+	// 风险日命中这些板块的买入信号门槛再上浮一档（Yellow→按 Red 对待）。默认空=板块层不生效（显式配置才启用，避免上线即误伤）。
+	// MacroSectorMap maps a macro level / emotion to affected sector names; on risk days buys in those
+	// sectors take one tier stricter (Yellow→treated as Red). Default empty = sector layer off until configured.
+	// 板块级风险映射
+	MacroSectorMap map[string][]string `json:"macro_sector_map,omitempty"`
+	// HighImpactLevels 视为"高影响"的宏观事件级别（默认 ["cpi","fomc","nfp"]；用于 Red 的"高影响事件×退潮/背离"组合与 Yellow）。
+	// HighImpactLevels event levels treated as high-impact (default cpi/fomc/nfp) for the Red combo and Yellow.
+	// 高影响宏观事件级别列表
+	HighImpactLevels []string `json:"high_impact_levels,omitempty"`
+	// ContractLevel 股指期货交割日的事件级别名（默认 "contract"）——Red 的"交割日当日"与 Yellow 的"交割影响期"据此识别。
+	// ContractLevel is the event-level name for index-futures delivery day (default "contract").
+	// 交割日事件级别名
+	ContractLevel string `json:"contract_level,omitempty"`
+	// CalibrateEnabled §MARKET_RISK_GATE P6 日历校准开关（默认 true）：true=每日一次用外部API/LLM 校准
+	// CPI/FOMC/NFP/交割日真实发布日（失败静默降级公式，不阻断）；false=纯公式估算（行为=校准前）。
+	// nil 视为默认 true。
+	// English: P6 calendar-calibration switch (nil/true = calibrate real CPI/FOMC/delivery dates once per
+	// day via external API/LLM with silent formula fallback; false = formula-only, the pre-calibration behavior).
+	// 日历校准开关
+	CalibrateEnabled *bool `json:"calibrate_enabled,omitempty"`
+	// CalibrateMonths 校准前瞻月数（默认 3，仅取未来 N 个月事件节省 LLM token）。
+	// CalibrateMonths is the forward horizon in months for calibration (default 3).
+	// 校准前瞻月数
+	CalibrateMonths int `json:"calibrate_months,omitempty"`
+	// CalibrateAPIURL 外部宏观日历 API（返回 JSON 事件数组；空=不用 API，仅走 LLM）。
+	// CalibrateAPIURL is an optional external macro-calendar API (JSON array); empty = LLM only.
+	// 外部日历API地址
+	CalibrateAPIURL string `json:"calibrate_api_url,omitempty"`
+	// WarnDays §三 作用层6（差距4）前瞻预警窗口：距高影响事件（交割日/CPI/FOMC/NFP）≤ 该天数时，
+	// 每日出一条"临近高影响事件"提醒（默认 3；<=0 回退 3，上限 7）。
+	// English: the P5 forward-warning window — when a high-impact event (delivery/CPI/FOMC/NFP) is at most
+	// this many days away (default 3, clamped 1~7), a daily "upcoming event" reminder is emitted.
+	// 前瞻预警窗口天数
+	WarnDays int `json:"warn_days,omitempty"`
+}
+
+// WarnWindow 前瞻预警窗口（默认 3，夹在 1~7）。
+func (m MacroGateConfig) WarnWindow() int {
+	if m.WarnDays <= 0 {
+		return 3
+	}
+	if m.WarnDays > 7 {
+		return 7
+	}
+	return m.WarnDays
+}
+
+// CalibrateOn 日历校准是否启用（nil 默认 true）。
+func (m MacroGateConfig) CalibrateOn() bool { return m.CalibrateEnabled == nil || *m.CalibrateEnabled }
+
+// CalibrateHorizonMonths 校准前瞻月数（默认 3）。
+func (m MacroGateConfig) CalibrateHorizonMonths() int {
+	if m.CalibrateMonths <= 0 || m.CalibrateMonths > 12 {
+		return 3
+	}
+	return m.CalibrateMonths
+}
+
+// ── §MARKET_RISK_GATE P3 默认值访问器（nil/零值 → 出厂默认，保证向后兼容且默认 ON）──
+
+// RiskGateOn 风险档总开关（nil 默认 true）。
+func (m MacroGateConfig) RiskGateOn() bool { return m.RiskGateEnabled == nil || *m.RiskGateEnabled }
+
+// EmotionOn 情绪维度是否参与合成（nil 默认 true）。
+func (m MacroGateConfig) EmotionOn() bool { return m.EmotionEnabled == nil || *m.EmotionEnabled }
+
+// EmotionLevelSet 参与合成的情绪相位集合（默认 冰点/退潮/背离）。
+func (m MacroGateConfig) EmotionLevelSet() map[string]bool {
+	levels := m.EmotionLevels
+	if len(levels) == 0 {
+		levels = []string{"冰点", "退潮", "背离"}
+	}
+	set := make(map[string]bool, len(levels))
+	for _, l := range levels {
+		set[l] = true
+	}
+	return set
+}
+
+// YellowMinConf Yellow 档放行置信度（默认 0.90）。
+func (m MacroGateConfig) YellowMinConf() float64 {
+	if m.YellowConfidence <= 0 {
+		return 0.90
+	}
+	return m.YellowConfidence
+}
+
+// RedMinConf Red 档放行置信度（默认 0.92）。
+func (m MacroGateConfig) RedMinConf() float64 {
+	if m.RedConfidence <= 0 {
+		return 0.92
+	}
+	return m.RedConfidence
+}
+
+// WeakBreadthUpRatio range 弱势广度阈值（默认 0.40）。
+func (m MacroGateConfig) WeakBreadthUpRatio() float64 {
+	if m.BreadthWeakUpRatio <= 0 {
+		return 0.40
+	}
+	return m.BreadthWeakUpRatio
+}
+
+// HighImpactSet 高影响事件级别集合（默认 cpi/fomc/nfp）。
+func (m MacroGateConfig) HighImpactSet() map[string]bool {
+	levels := m.HighImpactLevels
+	if len(levels) == 0 {
+		levels = []string{"cpi", "fomc", "nfp"}
+	}
+	set := make(map[string]bool, len(levels))
+	for _, l := range levels {
+		set[l] = true
+	}
+	return set
+}
+
+// ContractLevelName 交割日级别名（默认 contract）。
+func (m MacroGateConfig) ContractLevelName() string {
+	if m.ContractLevel == "" {
+		return "contract"
+	}
+	return m.ContractLevel
+}
+
+// MomentumConfig 动量分权重配置（默认 量价40 + MACD30 + 走势30，合计≤100）。
+// （MomentumConfig defines momentum-score weights; defaults: price-volume 40 + MACD 30 + trend 30, total ≤ 100.）
+type MomentumConfig struct {
+	// 量价分权重（0~100）
+	VolumePriceWeight float64 `json:"volume_price_weight"`
+	// MACD分权重（0~100）
+	MACDWeight float64 `json:"macd_weight"`
+	// 走势分权重（0~100）
+	TrendWeight float64 `json:"trend_weight"`
+	// 动量分触发信号阈值（默认 60）
+	SignalThreshold float64 `json:"signal_threshold"`
+	// BuySignalThreshold 动量买入阈值：动量分 ≥ 此值且数据有效时发 buy 级信号（经信号控制器
+	// 白名单准入后归动量池撮合；动量永不在默认白名单全集内，需在战法开关面板显式开启）。
+	// 默认 75（高于 watch 阈值 60 一档，避免动量信号大量直接转买单）；≤0 时回退默认。
+	// English: momentum BUY threshold — score at/above this (with valid data) emits a buy signal that,
+	// once admitted by the signal controller whitelist (momentum is never in the default set), routes
+	// to the momentum pool. Default 75; <=0 falls back to default.
+	// 动量买入阈值
+	BuySignalThreshold float64 `json:"buy_signal_threshold"`
+	// MomentumGateEnabled 动量分"提升才提醒"门槛开关：开启后仅当动量分明显提升时
+	// 才放行 double_bump/龙头/龙回头 战法信号（N 形不套用）。可热更新，前端 Settings 动量分组内开关控制。
+	// English: momentum-gate switch — when on, only a meaningful momentum-score improvement lets the
+	// double-bump / dragon / dragon-return strategies pass their signal (N-shape is exempt).
+	// MomentumGate是否启用
+	MomentumGateEnabled bool `json:"momentum_gate_enabled"`
+	// MomentumDeltaTol 动量分回落容忍差：当前动量分 ≥ 上一轮 − 该值 视为"未明显回落"，仍算提升。
+	// 默认 5 分。English: momentum delta tolerance — current score >= prior - tolerance still counts as
+	// an improvement (no obvious fall). Default 5.
+	// 动量分回落容忍差
+	MomentumDeltaTol float64 `json:"momentum_delta_tol"`
+}
+
+// DragonConfig 龙头战法参数：多因子权重、回撤止盈止损阈值、买入条件等。
+// （DragonConfig tunes the dragon-leader strategy: multi-factor weights, drawdown/take-profit/stop-loss thresholds, buy conditions.）
+type DragonConfig struct {
+	// F1 封单强度权重
+	F1SealWeight float64 `json:"f1_seal_weight"`
+	// F2 板块共振权重
+	F2ResonanceWeight float64 `json:"f2_resonance_weight"`
+	// F3 溢价权重
+	F3PremiumWeight float64 `json:"f3_premium_weight"`
+	// F4 相对强度(RS)权重
+	F4RsWeight float64 `json:"f4_rs_weight"`
+	// 买入后最大回撤容忍比例
+	PullbackMaxPct float64 `json:"pullback_max_pct"`
+	// 破板跌幅达此值减半仓
+	BreakerSellHalfPct float64 `json:"breaker_sell_half_pct"`
+	// 破板跌幅达此值清仓
+	BreakerSellAllPct float64 `json:"breaker_sell_all_pct"`
+	// 买入后回撤减半仓阈值
+	BuyPullbackSellHalfPct float64 `json:"buy_pullback_sell_half_pct"`
+	// 买入后回撤清仓阈值
+	BuyPullbackSellAllPct float64 `json:"buy_pullback_sell_all_pct"`
+	// 买入日收盘低于买入价比例止损
+	BuyDayCloseBelow float64 `json:"buy_day_close_below"`
+	// 次日开盘低于此比例则卖出
+	NextOpenIfBelow float64 `json:"next_open_if_below"`
+	// 止盈比例(%)，浮盈达此值落袋（默认 10）
+	TakeProfitPct float64 `json:"take_profit_pct"`
+	// §扫参应用（STRATEGY_OPTIMIZE_PLAN）：移动止盈回撤%(从阶段高点)与最长持仓天数。
+	// 0=不启用（保持既有退出规则不变）；>0 时由 CheckExit 在既有规则之前执行——
+	// 与扫参的统一出场引擎同语义，寻优冠军参数可一键应用到实盘且口径一致。
+	// English: sweep-aligned trailing-stop %% and max-hold-days knobs; 0 = disabled (legacy rules only).
+	// 移动止盈回撤幅度(%)
+	TrailingDrawbackPct float64 `json:"trailing_drawback_pct,omitempty"`
+	// 最长持仓天数
+	MaxHoldDays int `json:"max_hold_days,omitempty"`
+}
+
+// DoubleBumpConfig 双响炮战法参数：一突/二突放量倍数、调整周期、仓位比例等。
+// （DoubleBumpConfig tunes the double-bump strategy: first/second breakout volume multiples, adjustment window, position ratios.）
+type DoubleBumpConfig struct {
+	// 一突放量倍数阈值
+	FirstBreakVolumeMultiple float64 `json:"first_break_volume_multiple"`
+	// 二突放量倍数阈值
+	SecondBreakVolumeMultiple float64 `json:"second_break_volume_multiple"`
+	// 调整期最大量比
+	AdjustVolRatioMax float64 `json:"adjust_vol_ratio_max"`
+	// 调整超期天数（超期判弱）
+	AdjustDaysOverflow int `json:"adjust_days_overflow"`
+	// 第二波当日最低涨跌幅(%)：<=该值判无效，水下不评买入
+	MinChangePct float64 `json:"min_change_pct"`
+	// 仓位因子权重
+	PositionWeight float64 `json:"position_weight"`
+	// 均线因子权重
+	MAWeight float64 `json:"ma_weight"`
+	// 量能因子权重
+	VolumeWeight float64 `json:"volume_weight"`
+	// 双响炮止盈比例
+	DoubleBumpTakeProfitPct float64 `json:"double_bump_take_profit_pct"`
+	// §扫参应用（STRATEGY_OPTIMIZE_PLAN）：移动止盈回撤%(从阶段高点)与最长持仓天数。
+	// 0=不启用（保持既有退出规则不变）；>0 时由 CheckExit 在既有规则之前执行——
+	// 与扫参的统一出场引擎同语义，寻优冠军参数可一键应用到实盘且口径一致。
+	// English: sweep-aligned trailing-stop %% and max-hold-days knobs; 0 = disabled (legacy rules only).
+	// 移动止盈回撤幅度(%)
+	TrailingDrawbackPct float64 `json:"trailing_drawback_pct,omitempty"`
+	// 最长持仓天数
+	MaxHoldDays int `json:"max_hold_days,omitempty"`
+}
+
+// NShapeConfig N 形战法参数：D1~D4 评分阈值、旗形整理区间、突破量比等。
+// （NShapeConfig tunes the N-shape strategy: D1-D4 score thresholds, flag-consolidation window, breakout volume ratios.）
+type NShapeConfig struct {
+	// N 形形态总分阈值
+	NPatternScoreThreshold float64 `json:"n_pattern_score_threshold"`
+	// 硬止损比例
+	HardStopLoss float64 `json:"hard_stop_loss"`
+	// §扫参应用（STRATEGY_OPTIMIZE_PLAN）：移动止盈回撤%(从阶段高点)与最长持仓天数。
+	// 0=不启用（保持既有退出规则不变）；>0 时由 CheckExit 在既有规则之前执行——
+	// 与扫参的统一出场引擎同语义，寻优冠军参数可一键应用到实盘且口径一致。
+	// English: sweep-aligned trailing-stop %% and max-hold-days knobs; 0 = disabled (legacy rules only).
+	// 移动止盈回撤幅度(%)
+	TrailingDrawbackPct float64 `json:"trailing_drawback_pct,omitempty"`
+	// 最长持仓天数
+	MaxHoldDays int `json:"max_hold_days,omitempty"`
+}
+
+// DragonReturnConfig 龙回头战法参数：回调幅度、量缩比、止盈止损、持仓天数等。
+// （DragonReturnConfig tunes the dragon-return strategy: pullback depth, volume-shrink ratio, take-profit/stop-loss, hold days.）
+type DragonReturnConfig struct {
+	// 止损比例
+	StopLossPct float64 `json:"stop_loss_pct"`
+	// 止盈比例
+	TakeProfitPct float64 `json:"take_profit_pct"`
+	// 最长持仓天数
+	MaxHoldDays int `json:"max_hold_days"`
+	// 目标价 1 倍数
+	Target1Multiplier float64 `json:"target1_multiplier"`
+	// 目标价 2 倍数
+	Target2Multiplier float64 `json:"target2_multiplier"`
+	// 移动止盈回撤幅度
+	TrailingDrawback float64 `json:"trailing_drawback"`
+}
+
+// D1Rule D1 事件匹配规则：模式匹配、方向、评分、是否阻断。
+// （D1Rule is an event-matching rule for D1 scoring: pattern, direction, score and block flag.）
+type D1Rule struct {
+	// 方向：利好/利空
+	Direction string `json:"direction"`
+	// 匹配得分
+	Score float64 `json:"score"`
+	// 是否阻断（负面事件）
+	Blocked bool `json:"blocked,omitempty"`
+}
+
+// D1Config D1 事件匹配规则集 + 四战法软加成配置。
+// （D1Config is the set of D1 event-matching rules plus the C1 cross-strategy soft-boost settings.）
+type D1Config struct {
+	// D1 规则列表
+	Rules []D1Rule `json:"rules"`
+
+	// BoostWeight 四战法 D1 软加成权重（C1）：非 N 战法总分 ×(1+BoostWeight×D1/40)，封顶 100。
+	// ≤0 表示关闭加成（默认 0.15）。
+	// （BoostWeight is the C1 soft-boost weight applied to non-N strategy totals; ≤0 disables it.）
+	// 四战法 D1 软加成权重
+	BoostWeight float64 `json:"boost_weight,omitempty"`
+	// BoostThreshold 加成门槛：D1 分（0~40）低于该值时不做加成（默认 8）。
+	// （BoostThreshold is the minimum D1 score (0~40) to trigger the soft boost.）
+	// D1 软加成门槛
+	BoostThreshold float64 `json:"boost_threshold,omitempty"`
+}
+
+// normalizeD1 填充 D1Config 缺失的默认值（零值视为未配置）。
+// （normalizeD1 fills D1Config defaults when fields are left at zero.）
+func normalizeD1(d *D1Config) {
+	if d.BoostWeight <= 0 {
+		d.BoostWeight = 0.15
+	}
+	if d.BoostThreshold <= 0 {
+		d.BoostThreshold = 8
+	}
+}
+
+// KVStore 配置持久化抽象：按 userID 读写任意 key-value。
+// 由 auth.Manager 实现（其 auth.json 已支持 per-user 配置项），使 config.Manager
+// 可为每个账号保存独立的 Rules/D1 快照，实现多账号多配置。
+// （KVStore abstracts per-user key-value persistence, implemented by auth.Manager so that
+// config.Manager can keep an independent Rules/D1 snapshot per account.）
+type KVStore interface {
+	// SetConfig 写入某账号指定 key 的配置值。
+	SetConfig(userID, key, value string) error
+	// GetConfig 读取某账号指定 key 的配置值（不存在时 ok=false）。
+	GetConfig(userID, key string) (string, bool)
+}
+
+// perUserKey 每账号配置在 KVStore 中的键。
+// （perUserKey is the KVStore key holding a per-account config snapshot.）
+const perUserKey = "quant_config_json_v1"
+
+// perUserD1Key 每账号 D1 规则在 KVStore 中的键。
+// （perUserD1Key is the KVStore key holding a per-account D1 rules snapshot.）
+const perUserD1Key = "quant_config_d1_v1"
+
+// perUserLongShortKey 每账号做多/做空开关在 KVStore 中的键。
+// （perUserLongShortKey is the KVStore key holding a per-account long/short toggle snapshot.）
+const perUserLongShortKey = "quant_config_longshort_v1"
+
+// LongShortConfig 每账号做多/做空开关状态。
+// （LongShortConfig holds the per-account long/short toggle state.）
+type LongShortConfig struct {
+	// 做多开关（默认开）
+	LongEnabled bool `json:"long_enabled"`
+	// 做空开关（默认关）
+	ShortEnabled bool `json:"short_enabled"`
+}
+
+// Manager 配置管理器，负责 JSON 配置文件的加载、保存和查询。
+// 全局默认配置来自文件；每个账号可在 KVStore 中保存独立覆盖（多账号多配置）。
+// （Manager is the config manager responsible for loading, saving and querying the JSON config file.
+// Global defaults come from the file; each account may store its own override in the KVStore.）
+type Manager struct {
+	// 主规则配置
+	Rules *Rules
+	// D1 事件匹配规则
+	D1    *D1Config
+	path  string       // 配置文件路径（全局默认）
+	mu    sync.RWMutex // 保护 store/规则指针的读写锁
+	store KVStore      // per-user 配置存储（可为 nil，表示不支持账号级隔离）
+	// operatorID 运营数据归属账号（管理员）ID。所有运营数据（量化/模拟盘/看板/告警/LLM）
+	// 统一归属该账号，后端按角色做访问控制：管理员可读写，子账号仅可读公开部分。
+	// 由 main 在启动后注入 auth.AdminID()。为空时回退到调用方传入的 userID（兼容旧路径）。
+	operatorID string
+}
+
+// NewManager 创建配置管理器，加载指定路径的 JSON 配置文件。
+// （NewManager creates a config manager and loads the JSON config from the given path.）
+func NewManager(path string) *Manager {
+	m := &Manager{
+		Rules: DefaultRules,
+		D1:    &D1Config{},
+		path:  path,
+	}
+	normalizeD1(m.D1)
+	m.Load()
+	normalizeD1(m.D1)
+	return m
+}
+
+// SetStore 注入 per-user 配置存储（auth.Manager）。
+// （SetStore injects the per-user config store, i.e. the auth.Manager.）
+func (m *Manager) SetStore(s KVStore) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.store = s
+}
+
+// SetOperatorID 设置运营数据归属账号（管理员）ID。注入后，量化/模拟盘等运营配置统一
+// 归属该账号，后端按角色鉴权：管理员可读写，子账号按权限仅可读公开部分。
+// （SetOperatorID sets the operator (admin) account that owns all operational data.）
+func (m *Manager) SetOperatorID(id string) {
+	m.mu.Lock()
+	m.operatorID = id
+	m.mu.Unlock()
+}
+
+// ownerOf 返回运营数据归属账号：已注入 operatorID 时优先，否则回退到调用方传入的 userID。
+// 这是“运营数据系统级共享、后端按角色鉴权”的核心：所有账号看到的量化/模拟盘/看板/告警/LLM
+// 都是同一份（归属管理员），前端只负责展示，权限由后端在接口层判定。
+// （ownerOf resolves the operational-data owner: injected operatorID first, else the caller's userID.）
+func (m *Manager) ownerOf(userID string) string {
+	if m.operatorID != "" {
+		return m.operatorID
+	}
+	return userID
+}
+
+// userRules 返回指定账号的规则快照；未配置账号级覆盖时回退全局 Rules。
+// 快照来自 KVStore 中的 JSON，反序列化为副本，避免污染全局。
+// （userRules returns the rules snapshot for a user, falling back to global Rules when
+// the account has no override; the snapshot is a deserialized copy.）
+// userRules 返回账号级规则快照（账号级覆盖优先，否则返回全局配置的堆副本）。
+// 关键不变量：
+//  1. 始终返回堆分配的 *Rules，避免调用方通过 &userRules(userID).X 取到悬垂指针（此前反序列化分支返回局部变量地址，属未定义行为）。
+//  2. 无账号级覆盖时返回全局 m.Rules 的副本而非其地址，避免 SetXxxConfigFor 改账号级配置时副作用改写全局（§全局指针副作用）。
+//
+// English: returns the account's rules snapshot (per-user override first, else a heap copy of global).
+// Invariants: (1) always heap-allocated so &userRules(userID).X is never dangling; (2) when there is no
+// per-user override we return a COPY of global (not its address) so account-scoped setters never mutate the
+// global rules as a side effect.
+// storedUserRules 读取账号自身已持久化的规则快照（不含回退）；无覆盖或解析失败返回 (nil,false)。
+// §2026-09-07 多账号实盘：供 GetQMTConfigFor 等区分「账号自身覆盖」与「回退」，实现逐账号实盘配置。
+// English: reads an account's own persisted rules snapshot without fallbacks — lets per-account
+// readers (e.g. QMT config) tell "account override exists" apart from "fall back".
+func (m *Manager) storedUserRules(userID string) (*Rules, bool) {
+	if m.store == nil || userID == "" {
+		return nil, false
+	}
+	m.mu.RLock()
+	raw, ok := m.store.GetConfig(userID, perUserKey)
+	m.mu.RUnlock()
+	if !ok || raw == "" {
+		return nil, false
+	}
+	r := new(Rules)
+	if err := json.Unmarshal([]byte(raw), r); err != nil {
+		log.Printf("[config] 账号 %s 配置反序列化失败, 回退全局: %v", userID, err)
+		return nil, false
+	}
+	return r, true
+}
+
+// userRules 返回指定账号的规则快照（账号级覆盖优先，否则回退系统级键/全局副本）。
+func (m *Manager) userRules(userID string) *Rules {
+	if m.store == nil || userID == "" {
+		return m.Rules
+	}
+	if r, ok := m.storedUserRules(userID); ok {
+		return r
+	}
+	// §回退系统级覆盖：历史版本曾把账号级配置写到 userID="" 的键下。
+	// 若本账号无独立覆盖，则回退到系统级键，避免配置在重启/重载后“丢失”
+	// （表现为开关被自动关闭）。这属于兼容回退，不影响正常账号级覆盖优先级。
+	// English: fall back to the system-level (empty userID) override so legacy
+	// configs written under "" are still honored and survive restarts.
+	if r, ok := m.storedUserRules(""); ok {
+		return r
+	}
+	cp := new(Rules)
+	*cp = *m.Rules
+	return cp
+}
+
+// saveUserRules 将账号规则快照持久化到 KVStore。
+// （saveUserRules persists an account's rules snapshot to the KVStore.）
+func (m *Manager) saveUserRules(userID string, r *Rules) {
+	if m.store == nil || userID == "" {
+		return
+	}
+	data, err := json.Marshal(r)
+	if err != nil {
+		log.Printf("[config] 账号 %s 配置序列化失败: %v", userID, err)
+		return
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if err := m.store.SetConfig(userID, perUserKey, string(data)); err != nil {
+		log.Printf("[config] 账号 %s 配置保存失败: %v", userID, err)
+	}
+}
+
+// Get 返回当前全局规则配置指针。
+// （Get returns a pointer to the current global rules config.）
+func (m *Manager) Get() *Rules { return m.Rules }
+
+// GetRulesFor 返回指定账号的交易规则快照（账号级覆盖优先，否则全局）。
+// English: returns the trading-rules snapshot for a user (per-user override first, else global).
+func (m *Manager) GetRulesFor(userID string) *Rules {
+	if m.store == nil || userID == "" {
+		return m.Rules
+	}
+	return m.userRules(userID)
+}
+
+// GetStrategyConfigFor 返回指定账号的策略参数配置（账号级覆盖优先，否则全局）。
+// （GetStrategyConfigFor returns the strategy config for a user (account override wins, else global).）
+// GetStrategyConfigFor 返回运营数据归属账号（管理员）的策略参数（运营配置系统级共享）。
+func (m *Manager) GetStrategyConfigFor(userID string) *StrategyConfig {
+	return &m.userRules(m.ownerOf(userID)).Strategy
+}
+
+// SetStrategyConfigFor 更新运营数据归属账号（管理员）的策略参数并持久化（系统级共享）。
+func (m *Manager) SetStrategyConfigFor(userID string, cfg *StrategyConfig) {
+	oid := m.ownerOf(userID)
+	if m.store == nil || oid == "" {
+		m.Rules.Strategy = *cfg
+		m.Save()
+		return
+	}
+	r := m.userRules(oid)
+	r.Strategy = *cfg
+	m.saveUserRules(oid, r)
+}
+
+// GetLLMConfigFor 返回运营数据归属账号（管理员）的 LLM 配置（运营配置系统级共享）。
+//
+// §警告 返回的是**内部结构的指针**，不是拷贝：调用方必须**立即取值拷贝**再使用，
+// 更不能通过它写字段（那样会绕过持久化，只在内存里生效，进程重启即丢）。
+// 需要改配置一律走 SetLLMConfigFor（传值拷贝进去）。
+// English: returns a pointer INTO the live config — copy the value out immediately and never
+// mutate through it; all writes must go through SetLLMConfigFor.
+func (m *Manager) GetLLMConfigFor(userID string) *LLMConfig {
+	return &m.userRules(m.ownerOf(userID)).LLM
+}
+
+// ConfigOwnerID 返回该账号的运营数据归属账号：所有账号的 LLM / 量化 / 看板配置都写入
+// 归属账号名下（见 ownerOf）。管理端在改某个账号的 LLM 配置前必须据此判断"这次写入到底
+// 会不会改变全局运行时配置"——归属账号就是运营账号时，它与设置页改的是同一份配置，
+// 就必须走同一套「探测 → 热切换 → 落库」，否则会出现"管理端改了不生效"的第二个入口。
+// English: resolves which account actually owns the config; used by the admin endpoint to tell
+// whether a write touches the global runtime LLM config (and therefore must hot-apply too).
+func (m *Manager) ConfigOwnerID(userID string) string {
+	return m.ownerOf(userID)
+}
+
+// SetLLMConfigFor 更新运营数据归属账号（管理员）的 LLM 配置并持久化（系统级共享）。
+func (m *Manager) SetLLMConfigFor(userID string, cfg *LLMConfig) {
+	oid := m.ownerOf(userID)
+	if m.store == nil || oid == "" {
+		m.Rules.LLM = *cfg
+		m.Save()
+		return
+	}
+	r := m.userRules(oid)
+	r.LLM = *cfg
+	m.saveUserRules(oid, r)
+}
+
+// StoredLLMConfig 返回该账号（解析到运营归属账号）是否显式保存过 LLM 配置及其快照。
+// 供启动装配区分「UI 真实保存过」与「无保存回退全局」——§UI-AUTHORITATIVE 修复：
+// 设置页保存过的配置重启后必须优先于环境变量，不再被 NSSM 里硬编码的旧 LLM_* 顶掉。
+// English: reports whether the account (resolved to its operator owner) explicitly saved an
+// LLM config, plus the snapshot; used to give UI-saved config precedence over env at startup.
+func (m *Manager) StoredLLMConfig(userID string) (*LLMConfig, bool) {
+	oid := m.ownerOf(userID)
+	if m.store == nil || oid == "" {
+		return nil, false
+	}
+	if r, ok := m.storedUserRules(oid); ok {
+		cp := r.LLM // 拷贝返回，避免调用方改写内存快照
+		return &cp, true
+	}
+	return nil, false
+}
+
+// GetQMTConfigFor 返回指定账号的 QMT 实盘配置（§2026-09-07 多账号实盘）。
+// 解析优先级：① 账号自身覆盖 → ② 运营账号覆盖（存量单账号行为：所有账号共享运营账号配置）
+// → ③ 全局 rules.qmt。引擎构建/热同步（registry.go:706、engine.go syncAccountConfig）按此
+// 取每账号独立 gateway/token/资金，逐账号独立下单。
+// English: returns an account's QMT live-trading config — account override first, then the operator's
+// (legacy single-account behavior), then global. Every engine's controller is wired from this so each
+// account can trade against its own gateway/capital.
+func (m *Manager) GetQMTConfigFor(userID string) *QMTConfig {
+	if m.store == nil || userID == "" {
+		return &m.Rules.QMT
+	}
+	if r, ok := m.storedUserRules(userID); ok {
+		return &r.QMT
+	}
+	if oid := m.ownerOf(userID); oid != "" && oid != userID {
+		if r, ok := m.storedUserRules(oid); ok {
+			return &r.QMT
+		}
+	}
+	return &m.Rules.QMT
+}
+
+// SetQMTConfigFor 更新指定账号的 QMT 实盘配置并持久化到该账号的规则快照（5s 热加载生效）。
+// §2026-09-07 从「运营账号系统级共享」改为「按账号落库」：管理员经
+// /api/admin/users/{id}/config/qmt 逐账号配置；账号所有者经 /api/config/qmt 配自己的。
+// 调用方负责校验取值合法性（mode/price_type 枚举、白名单过滤等），这里只做落库。
+// English: persists an account's QMT live-trading config to that account's rules snapshot
+// (hot-reloaded within 5s). Callers must validate enum/whitelist values — this method only stores.
+func (m *Manager) SetQMTConfigFor(userID string, cfg *QMTConfig) {
+	if m.store == nil || userID == "" {
+		m.Rules.QMT = *cfg
+		m.Save()
+		return
+	}
+	r := m.userRules(userID)
+	r.QMT = *cfg
+	m.saveUserRules(userID, r)
+}
+
+// SetPaperStrategyFor 更新指定账号的模拟盘战法准入配置（§SIGNAL_CONTROLLER P3：
+// rules.paper.strategies 白名单 + rules.paper.blacklist 个股黑名单），仅改这两个字段、
+// 其余 paper 配置保持原值，落该账号规则快照（信号控制器 paper 通道 5s 内读到新值）。
+// 调用方负责白名单条目合法性校验（knownStrategyIDSet），这里只做落库。
+// English: persists an account's paper-side strategy admission (whitelist + code blacklist),
+// leaving the rest of rules.paper untouched; the signal controller picks it up on its next feed.
+func (m *Manager) SetPaperStrategyFor(userID string, strategies, blacklist []string) {
+	if m.store == nil || userID == "" {
+		m.Rules.Paper.Strategies = strategies
+		m.Rules.Paper.Blacklist = blacklist
+		m.Save()
+		return
+	}
+	r := m.userRules(userID)
+	r.Paper.Strategies = strategies
+	r.Paper.Blacklist = blacklist
+	m.saveUserRules(userID, r)
+}
+
+// SetPaperConfigFor §F-4（20260917 缺陷修复批）：按回调局部更新指定账号的 rules.paper
+// （总开关/自动卖出/单笔资金/初始资金/做空侧参数等），战法白名单与黑名单不经此路径
+// （走 SetPaperStrategyFor，语义已独立）。store 缺席时落全局快照（测试/单文件部署）。
+// English: §F-4 — mutator-style partial update of an account's rules.paper (master switch,
+// auto-sell, sizing, short-side params); strategies/blacklist keep their dedicated setter.
+func (m *Manager) SetPaperConfigFor(userID string, mutate func(*PaperConfig)) {
+	if mutate == nil {
+		return
+	}
+	if m.store == nil || userID == "" {
+		mutate(&m.Rules.Paper)
+		m.Save()
+		return
+	}
+	r := m.userRules(userID)
+	mutate(&r.Paper)
+	m.saveUserRules(userID, r)
+}
+
+// GetD1ConfigFor 返回运营数据归属账号（管理员）的 D1 事件匹配规则（运营配置系统级共享）。
+func (m *Manager) GetD1ConfigFor(userID string) *D1Config {
+	oid := m.ownerOf(userID)
+	if m.store == nil || oid == "" {
+		return m.D1
+	}
+	m.mu.RLock()
+	raw, ok := m.store.GetConfig(oid, perUserD1Key)
+	m.mu.RUnlock()
+	if !ok || raw == "" {
+		return m.D1
+	}
+	var d D1Config
+	if err := json.Unmarshal([]byte(raw), &d); err != nil {
+		log.Printf("[config] 账号 %s D1 配置反序列化失败, 回退全局: %v", oid, err)
+		return m.D1
+	}
+	normalizeD1(&d)
+	return &d
+}
+
+// SetD1ConfigFor 更新运营数据归属账号（管理员）的 D1 规则并持久化（系统级共享）。
+func (m *Manager) SetD1ConfigFor(userID string, cfg *D1Config) {
+	oid := m.ownerOf(userID)
+	if m.store == nil || oid == "" {
+		m.D1 = cfg
+		m.Save()
+		return
+	}
+	data, err := json.Marshal(cfg)
+	if err != nil {
+		log.Printf("[config] 账号 %s D1 配置序列化失败: %v", oid, err)
+		return
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if err := m.store.SetConfig(oid, perUserD1Key, string(data)); err != nil {
+		log.Printf("[config] 账号 %s D1 配置保存失败: %v", oid, err)
+	}
+}
+
+// GetLongShortConfigFor 返回运营数据归属账号（管理员）的做多/做空开关（运营配置系统级共享，
+// 默认做多开/做空关）。
+func (m *Manager) GetLongShortConfigFor(userID string) LongShortConfig {
+	def := LongShortConfig{LongEnabled: true, ShortEnabled: false}
+	oid := m.ownerOf(userID)
+	if m.store == nil || oid == "" {
+		return def
+	}
+	m.mu.RLock()
+	raw, ok := m.store.GetConfig(oid, perUserLongShortKey)
+	m.mu.RUnlock()
+	if !ok || raw == "" {
+		return def
+	}
+	var c LongShortConfig
+	if err := json.Unmarshal([]byte(raw), &c); err != nil {
+		log.Printf("[config] 账号 %s 做多/做空配置反序列化失败, 回退默认: %v", oid, err)
+		return def
+	}
+	return c
+}
+
+// SetLongShortConfigFor 更新运营数据归属账号（管理员）的做多/做空开关并持久化（系统级共享）。
+func (m *Manager) SetLongShortConfigFor(userID string, c LongShortConfig) {
+	oid := m.ownerOf(userID)
+	if m.store == nil || oid == "" {
+		return
+	}
+	data, err := json.Marshal(c)
+	if err != nil {
+		log.Printf("[config] 账号 %s 做多/做空配置序列化失败: %v", oid, err)
+		return
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if err := m.store.SetConfig(oid, perUserLongShortKey, string(data)); err != nil {
+		log.Printf("[config] 账号 %s 做多/做空配置保存失败: %v", oid, err)
+	}
+}
+
+// GetStrategyConfig 返回全局策略参数配置（无账号隔离时使用）。
+// （GetStrategyConfig returns the global strategy config.）
+func (m *Manager) GetStrategyConfig() *StrategyConfig {
+	return &m.Rules.Strategy
+}
+
+// SetStrategyConfig 更新全局策略参数并持久化到文件。
+// （SetStrategyConfig updates the global strategy params and persists them.）
+func (m *Manager) SetStrategyConfig(cfg *StrategyConfig) {
+	m.Rules.Strategy = *cfg
+	m.Save()
+}
+
+// GetD1Config 返回全局 D1 事件匹配规则配置。
+// （GetD1Config returns the global D1 event-matching rules config.）
+func (m *Manager) GetD1Config() *D1Config {
+	return m.D1
+}
+
+// SetSchedulerConfig 更新全局研究调度器配置（rules.scheduler）并持久化到文件。
+// 用于前端"全量回测全局开关"等调度选项的读写。
+// English: updates the global research-scheduler config (rules.scheduler) and persists it, used by the
+// frontend "full-backtest global toggle" and other scheduler options.
+func (m *Manager) SetSchedulerConfig(cfg *SchedulerConfig) {
+	if cfg == nil {
+		return
+	}
+	m.mu.Lock()
+	m.Rules.Scheduler = *cfg
+	m.mu.Unlock()
+	m.Save()
+}
+
+// SetD1Config 更新全局 D1 规则并持久化到文件。
+// （SetD1Config updates the global D1 rules and persists them.）
+func (m *Manager) SetD1Config(cfg *D1Config) {
+	m.D1 = cfg
+	m.Save()
+}
+
+// GetLLMConfig 返回全局 LLM 客户端配置。
+// （GetLLMConfig returns the global LLM client config.）
+func (m *Manager) GetLLMConfig() *LLMConfig {
+	return &m.Rules.LLM
+}
+
+// GetNotifyConfig 返回通知推送配置。
+// （GetNotifyConfig returns the notification config.）
+func (m *Manager) GetNotifyConfig() *NotifyConfig {
+	return &m.Rules.Notify
+}
+
+// SetNotifyConfig 更新通知配置并持久化到文件。
+// （SetNotifyConfig updates the notification config and persists it.）
+func (m *Manager) SetNotifyConfig(cfg *NotifyConfig) {
+	m.Rules.Notify = *cfg
+	m.Save()
+}
+
+// SetLLMConfig 更新全局 LLM 配置并持久化到文件。
+// （SetLLMConfig updates the global LLM config and persists it.）
+func (m *Manager) SetLLMConfig(cfg *LLMConfig) {
+	m.Rules.LLM = *cfg
+	m.Save()
+}
+
+// Load 从配置文件读取并解析 JSON，更新 Rules 和 D1 配置。
+// 文件缺失/不可读时静默保留内存现状（首次启动即用 DefaultRules）；
+// 解析失败仅记日志不清空已有配置；未出现的段不覆盖。
+// （Load reads and parses the JSON config file, updating the Rules and D1 config.）
+func (m *Manager) Load() {
+	data, err := os.ReadFile(m.path)
+	if err != nil {
+		return // 文件不存在/不可读：保留内存中的当前配置（首次启动即用出厂默认）
+	}
+	// wrapper 外层包装：JSON 根对象按 {"rules":..., "d1":...} 两段解析，未出现的段保留原值。
+	var wrapper struct {
+		Rules *Rules    `json:"rules"`
+		D1    *D1Config `json:"d1"`
+	}
+	if err := json.Unmarshal(data, &wrapper); err != nil {
+		log.Printf("[config] 解析配置文件失败: %v", err)
+		return
+	}
+	if wrapper.Rules != nil {
+		m.Rules = wrapper.Rules
+	}
+	if wrapper.D1 != nil {
+		m.D1 = wrapper.D1
+	}
+	log.Printf("[config] 已加载配置文件: %s", m.path)
+}
+
+// Save 将当前配置序列化为 JSON 并写入文件。// （Save serializes the current config to JSON and writes it to the file.）
+func (m *Manager) Save() {
+	wrapper := struct {
+		Rules *Rules    `json:"rules"` // 全局规则配置段
+		D1    *D1Config `json:"d1"`    // D1 事件匹配规则段
+	}{
+		Rules: m.Rules,
+		D1:    m.D1,
+	}
+	data, err := json.MarshalIndent(wrapper, "", "  ")
+	if err != nil {
+		log.Printf("[config] 序列化失败: %v", err)
+		return
+	}
+	// §W3-c 统一原子写（fsync+唯一临时名）：config.json 由 quant 与 researchd 双进程写，
+	// 固定 .tmp 名会互相踩踏；截断则全部账号配置回退默认。
+	if err := fileutil.AtomicWrite(m.path, data, 0644); err != nil {
+		log.Printf("[config] 写入失败: %v", err)
+		return
+	}
+	log.Printf("[config] 已保存配置文件: %s", m.path)
+}
+
+// Watch §P1-6 配置热重载：轮询配置文件（默认 30s），内容变更（sha256 比对）时自动调用 Load()
+// 重载全局 rules/d1，无需重启进程。ctx 取消即停止轮询。采用轮询而非 fsnotify 以避免引入额外依赖，
+// 且对网络挂载/容器卷等 inotify 不可靠场景更稳健。
+// English: P1-6 hot-reload — polls the config file (default 30s); on content change (sha256 compare)
+// it reloads global rules/d1 without a restart. Polling avoids extra deps and works on volumes where
+// inotify is unreliable. Stop on ctx cancellation.
+func (m *Manager) Watch(ctx context.Context, interval time.Duration) {
+	if m.path == "" {
+		return // 无配置文件路径则无需监听
+	}
+	if interval <= 0 {
+		interval = 30 * time.Second // 默认轮询周期 30s
+	}
+	last := m.checksum()
+	go func() {
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return // 上下文取消即停止监听
+			case <-ticker.C:
+				cur := m.checksum()
+				if cur == "" || cur == last {
+					continue // 未变化或读取失败则跳过
+				}
+				last = cur
+				m.Load() // 内容变更 → 热重载
+			}
+		}
+	}()
+}
+
+// checksum 返回配置文件的 sha256（用于变更检测）；文件不可读时返回空串。
+func (m *Manager) checksum() string {
+	data, err := os.ReadFile(m.path)
+	if err != nil {
+		return ""
+	}
+	sum := sha256.Sum256(data)
+	return string(sum[:])
+}
+
+// LoadSchedulerConfig 从配置文件读取 rules.scheduler（供独立研究服务 quant-research 使用）。
+// 只覆盖 JSON 中显式出现的字段，其余回退 DefaultSchedulerConfig；文件缺失/解析失败整体回退默认。
+// 解析策略：先读 rules.data（数据源路由），再按 key 逐个解析 scheduler 段内的子对象。
+// English: reads rules.scheduler from the config file (for the standalone quant-research service).
+// Only fields explicitly present in JSON are applied; the rest fall back to DefaultSchedulerConfig;
+// a missing/unparseable file returns defaults wholesale.
+func LoadSchedulerConfig(path string) SchedulerConfig {
+	def := DefaultSchedulerConfig()
+	data, err := os.ReadFile(path)
+	if err != nil {
+		log.Printf("[scheduler] 读取配置 %s 失败(用默认): %v", path, err)
+		return def
+	}
+	// wrapper 解析根对象：rules.scheduler 段留作原始 JSON 逐键覆盖，rules.data 段做数据源路由。
+	var wrapper struct {
+		Rules struct {
+			Scheduler json.RawMessage `json:"scheduler"` // scheduler 段原文（延迟解析，保缺省字段不覆盖默认）
+			Data      struct {
+				PrimarySource   string  `json:"primary_source"`    // 研究取数主源：hithink | baostock
+				ThsFactorsReady bool    `json:"ths_factors_ready"` // 复权因子对账门禁
+				OptimizeEnabled *bool   `json:"optimize_enabled"`  // 夜间自动寻优开关（nil=未配置，不覆盖默认）
+				HithinkQPS      float64 `json:"hithink_qps"`       // 同花顺源限流阈值（本段未消费，仅解析透传）
+			} `json:"data"`
+		} `json:"rules"`
+	}
+	if err := json.Unmarshal(data, &wrapper); err != nil {
+		log.Printf("[scheduler] 解析配置 %s 失败(用默认): %v", path, err)
+		return def
+	}
+	// 覆盖 data 段字段（仅显式出现的项生效）。
+	if wrapper.Rules.Data.OptimizeEnabled != nil {
+		def.OptimizeEnabled = *wrapper.Rules.Data.OptimizeEnabled
+	}
+	if wrapper.Rules.Data.PrimarySource != "" {
+		def.PrimarySource = wrapper.Rules.Data.PrimarySource
+	}
+	def.ThsFactorsReady = wrapper.Rules.Data.ThsFactorsReady
+	// scheduler 段缺失/为 null 时直接返回默认值。
+	raw := wrapper.Rules.Scheduler
+	if len(raw) == 0 || string(raw) == "null" {
+		return def
+	}
+	var m map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &m); err != nil {
+		log.Printf("[scheduler] 解析 scheduler 段失败(用默认): %v", err)
+		return def
+	}
+	// 逐项覆盖顶层 scheduler 字段与嵌套 nightly / dataload_during_trading 子段。
+	out := def
+	if v, ok := cfgBool(m, "enabled"); ok {
+		out.Enabled = v
+	}
+	if v, ok := cfgBool(m, "optimize_enabled"); ok {
+		out.OptimizeEnabled = v
+	}
+	if v, ok := cfgStr(m, "research_bin"); ok && v != "" {
+		out.ResearchBin = v
+	}
+	if v, ok := cfgStr(m, "dataload_bin"); ok && v != "" {
+		out.DataloadBin = v
+	}
+	if v, ok := cfgStr(m, "db"); ok && v != "" {
+		out.DB = v
+	}
+	if v, ok := cfgStr(m, "pyurl"); ok && v != "" {
+		out.PyURL = v
+	}
+	if sub, ok := cfgObject(m, "nightly"); ok {
+		if v, ok := cfgInt(sub, "start_hhmm"); ok {
+			out.Nightly.StartHHMM = v
+		}
+		if v, ok := cfgInt(sub, "weekend_start_hhmm"); ok {
+			out.Nightly.WeekendStartHHMM = v
+		}
+		if v, ok := cfgBool(sub, "abort_on_error"); ok {
+			out.Nightly.AbortOnError = v
+		}
+		if v, ok := cfgBool(sub, "backtest_enabled"); ok {
+			out.Nightly.BacktestEnabled = v
+		}
+		if v, ok := cfgInt(sub, "backtest_events"); ok {
+			out.Nightly.BacktestEvents = v
+		}
+		if v, ok := cfgInt(sub, "research_rounds"); ok && v > 0 {
+			out.Nightly.ResearchRounds = v
+		}
+		if v, ok := cfgStrs(sub, "steps"); ok && len(v) > 0 {
+			out.Nightly.Steps = v
+		}
+		// §2026-09-05 多轮发现/护栏参数子块 rules.nightly.discover。
+		// English: multi-round discovery + guardrail parameter block rules.nightly.discover.
+		if dsub, ok := cfgObject(sub, "discover"); ok {
+			applyDiscoverConfig(&out.Nightly.Discover, dsub)
+		}
+	}
+	if sub, ok := cfgObject(m, "dataload_during_trading"); ok {
+		if v, ok := cfgBool(sub, "enabled"); ok {
+			out.DataloadDuringTrade.Enabled = v
+		}
+		if v, ok := cfgInt(sub, "interval_minutes"); ok {
+			out.DataloadDuringTrade.IntervalMinutes = v
+		}
+	}
+	// 单步超时（分钟）：此前漏解析导致配置值永远不生效、worker 恒走 90min 兜底，
+	// discover_factors 全市场窗口在 90min 处被误杀（实录 #45/#66 两次超时）。
+	if v, ok := cfgInt(m, "step_timeout_min"); ok {
+		out.StepTimeoutMin = v
+	}
+	if v, ok := cfgInt(m, "trim_interval_min"); ok {
+		out.TrimIntervalMin = v
+	}
+	// 内存总闸阈值（MB）：此前遗漏解析导致配置值永远不生效、恒走默认 400——
+	// 服务器实际空闲可用内存仅几百 MB，400 兜底无法按需留足 quant 余量。
+	if v, ok := cfgInt(m, "min_free_mem_mb"); ok {
+		out.MinFreeMemMB = v
+	}
+	if v, ok := cfgInt(m, "replay_throttle_ms"); ok {
+		out.ReplayThrottleMs = v
+	}
+	return out
+}
+
+// cfgStr 返回字符串字段（非字符串或不存在时 ok=false）。
+func cfgStr(m map[string]json.RawMessage, key string) (string, bool) {
+	raw, ok := m[key]
+	if !ok {
+		return "", false
+	}
+	var s string
+	if err := json.Unmarshal(raw, &s); err != nil {
+		return "", false
+	}
+	return s, true
+}
+
+// cfgBool 返回布尔字段（非布尔或不存在时 ok=false）。
+func cfgBool(m map[string]json.RawMessage, key string) (bool, bool) {
+	raw, ok := m[key]
+	if !ok {
+		return false, false
+	}
+	var v bool
+	if err := json.Unmarshal(raw, &v); err != nil {
+		return false, false
+	}
+	return v, true
+}
+
+// cfgInt 返回整数字段（非整数或不存在时 ok=false）。
+func cfgInt(m map[string]json.RawMessage, key string) (int, bool) {
+	raw, ok := m[key]
+	if !ok {
+		return 0, false
+	}
+	var v int
+	if err := json.Unmarshal(raw, &v); err != nil {
+		return 0, false
+	}
+	return v, true
+}
+
+// cfgStrs 返回字符串数组字段（非数组或不存在时 ok=false）。
+func cfgStrs(m map[string]json.RawMessage, key string) ([]string, bool) {
+	raw, ok := m[key]
+	if !ok {
+		return nil, false
+	}
+	var v []string
+	if err := json.Unmarshal(raw, &v); err != nil {
+		return nil, false
+	}
+	return v, true
+}
+
+// cfgInts 返回整数数组字段（非数组或不存在时 ok=false）。
+// English: reads an int-array field; ok=false when missing or not an int array.
+func cfgInts(m map[string]json.RawMessage, key string) ([]int, bool) {
+	raw, ok := m[key]
+	if !ok {
+		return nil, false
+	}
+	var v []int
+	if err := json.Unmarshal(raw, &v); err != nil {
+		return nil, false
+	}
+	return v, true
+}
+
+// cfgFloats 返回浮点数组字段（非数组或不存在时 ok=false）。
+// English: reads a float-array field; ok=false when missing or not a float array.
+func cfgFloats(m map[string]json.RawMessage, key string) ([]float64, bool) {
+	raw, ok := m[key]
+	if !ok {
+		return nil, false
+	}
+	var v []float64
+	if err := json.Unmarshal(raw, &v); err != nil {
+		return nil, false
+	}
+	return v, true
+}
+
+// cfgFloat 返回浮点字段（非数值或不存在时 ok=false）。
+func cfgFloat(m map[string]json.RawMessage, key string) (float64, bool) {
+	raw, ok := m[key]
+	if !ok {
+		return 0, false
+	}
+	var v float64
+	if err := json.Unmarshal(raw, &v); err != nil {
+		return 0, false
+	}
+	return v, true
+}
+
+// applyDiscoverConfig 把 rules.nightly.discover 子块各字段覆盖到默认 DiscoverConfig。
+// 仅显式出现的 JSON 键生效；负数/空数组跳过（保留默认）。
+// English: overlays rules.nightly.discover onto the default DiscoverConfig; only explicitly
+// present keys apply, empty/negative values keep factory defaults.
+func applyDiscoverConfig(d *DiscoverConfig, m map[string]json.RawMessage) {
+	if v, ok := cfgInts(m, "horizons"); ok && len(v) > 0 {
+		d.Horizons = v
+	}
+	if v, ok := cfgInts(m, "start_windows"); ok && len(v) > 0 {
+		d.StartWindows = v
+	}
+	if v, ok := cfgStrs(m, "metrics"); ok && len(v) > 0 {
+		d.Metrics = v
+	}
+	if v, ok := cfgStrs(m, "factor_pools"); ok && len(v) > 0 {
+		d.FactorPools = v
+	}
+	if v, ok := cfgInt(m, "top_n"); ok && v > 0 {
+		d.TopN = v
+	}
+	if v, ok := cfgInt(m, "min_stocks"); ok && v > 0 {
+		d.MinStocks = v
+	}
+	if v, ok := cfgInt(m, "max_factors"); ok && v > 0 {
+		d.MaxFactors = v
+	}
+	if v, ok := cfgFloat(m, "split"); ok && v > 0 && v < 1 {
+		d.Split = v
+	}
+	if v, ok := cfgFloat(m, "min_ir"); ok && v > 0 {
+		d.MinIR = v
+	}
+	if v, ok := cfgInt(m, "min_days"); ok && v > 0 {
+		d.MinDays = v
+	}
+	if v, ok := cfgFloat(m, "min_gen_t"); ok && v < 0 {
+		d.MinGenT = v
+	}
+	if v, ok := cfgInt(m, "min_trigger"); ok && v > 0 {
+		d.MinTrigger = v
+	}
+	if v, ok := cfgFloat(m, "min_excess"); ok {
+		d.MinExcess = v
+	}
+	if v, ok := cfgInt(m, "min_limit_ups"); ok && v > 0 {
+		d.MinLimitUps = v
+	}
+	if v, ok := cfgInt(m, "top_k"); ok && v > 0 {
+		d.TopK = v
+	}
+	if v, ok := cfgInt(m, "max_per_day"); ok && v > 0 {
+		d.MaxPerDay = v
+	}
+	if v, ok := cfgFloat(m, "guard_strong"); ok && v >= 0 {
+		d.GuardStrong = v
+	}
+	if v, ok := cfgFloat(m, "guard_weak"); ok && v >= 0 {
+		d.GuardWeak = v
+	}
+	if v, ok := cfgInt(m, "min_yr_sign"); ok {
+		d.MinYrSign = v
+	}
+	if v, ok := cfgInt(m, "min_bt_events"); ok {
+		d.MinBtEvents = v
+	}
+	if v, ok := cfgFloat(m, "dedup_jaccard"); ok && v > 0 && v <= 1 {
+		d.DedupJaccard = v
+	}
+	if v, ok := cfgBool(m, "change_gate"); ok {
+		d.ChangeGate = v
+	}
+	if v, ok := cfgInt(m, "staleness_days"); ok && v > 0 {
+		d.StalenessDays = v
+	}
+	if v, ok := cfgFloat(m, "hysteresis"); ok && v >= 0 {
+		d.Hysteresis = v
+	}
+}
+
+// cfgObject 返回子对象字段的 map（不存在或非对象时 ok=false）。
+func cfgObject(m map[string]json.RawMessage, key string) (map[string]json.RawMessage, bool) {
+	raw, ok := m[key]
+	if !ok {
+		return nil, false
+	}
+	var sub map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &sub); err != nil {
+		return nil, false
+	}
+	return sub, true
+}
+
+// CalendarEvent 宏观日历事件条目。
+// （CalendarEvent is an entry of a macro-calendar event.）
+type CalendarEvent struct {
+	// 事件日期（YYYY-MM-DD）
+	Date string `json:"date"`
+	// 事件标题
+	Title string `json:"title"`
+	// 影响程度（high/medium/low）
+	Impact string `json:"impact"`
+	// 提前提醒天数
+	DaysAdvance int `json:"days_advance"`
+}
+
+// CalendarConfig 宏观日历配置。
+// （CalendarConfig is the macro-calendar configuration.）
+type CalendarConfig struct {
+	// 是否启用日历告警
+	Enabled bool `json:"enabled"`
+	// 事件列表
+	Events []CalendarEvent `json:"events"`
+}
+
+// DefaultRules 默认交易规则实例（未初始化字段为零值）。
+// （DefaultRules is the default trading-rules instance; unset fields retain zero values.）
+var DefaultRules = &Rules{
+	Strategy: defaultStrategyConfig(),
+	Position: PositionConfig{
+		AutoTrackSignals:  true,
+		ATREnabled:        true,
+		ATRStopMult:       2.5,
+		DailyDropAlertPct: 5,
+	},
+	Scheduler: DefaultSchedulerConfig(),
+	Paper:     PaperConfig{Enabled: false, FixedAmount: 10000, MaxPositions: 10, InitialCapital: 100000, Discipline: DefaultDisciplineConfig()},
+	QMT:       DefaultQMTConfig(),
+	Runtime:   RuntimeConfig{TrimAfterHours: true, TrimIntervalMin: 15, ReviewMaxStocks: 24},
+}
+
+// DefaultDisciplineConfig 统一止盈止损纪律的出厂默认（可后台配置覆盖）：
+// 止损-6 / 止盈+15 / 移动回撤-6 / 深破2×(-12) / 低置信买入确认5min / 高置信观察30s /
+// 止损止盈结算窗15min / 移动止盈洗盘过滤45min / 探针5s / 高置信阈值85。
+func DefaultDisciplineConfig() DisciplineConfig {
+	return DisciplineConfig{
+		StopLossPct:       6,
+		TakeProfitPct:     15,
+		MaxPullbackPct:    6,
+		DeepStopMult:      2,
+		BuyConfirmMin:     5,
+		BuyConfirmHighSec: 30,
+		ExitConfirmMin:    15,
+		TrailConfirmMin:   45,
+		ProbeSec:          5,
+		HighConfThreshold: 85,
+		// §SELLPOINT-UNIFY 边界⑥：延持信号默认一个打分周期（5min）内有效
+		SellSignalMaxAgeSec: 300,
+	}
+}
+
+// defaultStrategyConfig 四战法出厂默认参数（可在前端 Settings 调整并持久化）。
+// Dragon 权重为 e2e 验证过的 F1~F4 组合；DoubleBump 权重用于总分构成（Volume/Position/MA）。
+// （defaultStrategyConfig returns the factory-default parameters for the four strategies, tunable
+// and persistable from the frontend Settings. Dragon weights are the e2e-verified F1-F4 combo.）
+func defaultStrategyConfig() StrategyConfig {
+	return StrategyConfig{
+		Dragon: DragonConfig{
+			F1SealWeight:           0.30,
+			F2ResonanceWeight:      0.25,
+			F3PremiumWeight:        0.20,
+			F4RsWeight:             0.25,
+			PullbackMaxPct:         0.05,
+			BreakerSellHalfPct:     0.08,
+			BreakerSellAllPct:      0.12,
+			BuyPullbackSellHalfPct: 0.05,
+			BuyPullbackSellAllPct:  0.08,
+			BuyDayCloseBelow:       0.03,
+			NextOpenIfBelow:        0.05,
+			TakeProfitPct:          10,
+		},
+		DoubleBump: DoubleBumpConfig{
+			FirstBreakVolumeMultiple:  1.5,
+			SecondBreakVolumeMultiple: 1.5,
+			AdjustVolRatioMax:         3,
+			AdjustDaysOverflow:        6,
+			MinChangePct:              0,
+			PositionWeight:            0.3,
+			MAWeight:                  0.3,
+			VolumeWeight:              0.4,
+		},
+		NShape: NShapeConfig{
+			NPatternScoreThreshold: 60,
+			HardStopLoss:           0.08,
+		},
+		DragonReturn: DragonReturnConfig{
+			StopLossPct:       0.05,
+			TakeProfitPct:     0.25,
+			MaxHoldDays:       8,
+			Target1Multiplier: 1.0,
+			Target2Multiplier: 1.25,
+			TrailingDrawback:  0.08,
+		},
+		Momentum: MomentumConfig{
+			VolumePriceWeight:   40,
+			MACDWeight:          30,
+			TrendWeight:         30,
+			SignalThreshold:     60,
+			BuySignalThreshold:  75,   // 动量买入阈值：≥75 发 buy 进模拟盘动量池（§动量入模拟盘）
+			MomentumGateEnabled: true, // 动量"提升才提醒"默认开启
+			MomentumDeltaTol:    5,
+		},
+	}
+}

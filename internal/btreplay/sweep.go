@@ -1,0 +1,1088 @@
+// sweep.go 参数扫参优化引擎（§P2 STRATEGY_OPTIMIZE_PLAN）。
+//
+// 目标：回答"什么战法配什么出场参数在历史上表现最好"——跨全库战法（四大内置 +
+// 库启用因子/形态规则）× 止盈回撤 × 最大持仓 × 入场门槛的网格搜索。
+//
+// 性能设计：触发判定与出场参数无关 → 全库 K 线一次性载入内存、逐 adapter 预计算
+// 触发事件；每个参数组合只做廉价的统一出场模拟（移动止盈+超期），500 组合秒级完成。
+// 统一出场引擎让跨战法排名口径一致（同入场逻辑、同出场规则，只比战法本身与参数）。
+//
+// English: parameter-sweep optimizer. Triggers are pre-computed once (they don't depend on
+// exit params); every combo then runs a cheap uniform trailing-stop + timeout exit simulation
+// over cached klines, so a few hundred combos finish in seconds with an apples-to-apples ranking.
+package btreplay
+
+import (
+	"encoding/json"
+	"fmt"
+	"log"
+	"math"
+	"sort"
+	"strings"
+
+	data "quant-trading-v2/internal/data"
+	"quant-trading-v2/internal/indicator"
+	"quant-trading-v2/internal/store"
+)
+
+// SweepConfig 扫参模式配置；网格由系统自动推导（用户零配置，决策记录 #4）。
+type SweepConfig struct {
+	Objective string // "profitFactor"(默认) | "winRate" | "avgWin"；空串取默认
+	TopN      int    // 输出前 N 名，默认 10
+	// §WS-H C2 多重检验校正开关：开启时 SWEEP_JSON 输出 Bonferroni 校正后 p 值简报
+	// （校正因子=该战法本次测试组合数）。默认关=现状不改变输出形状。
+	// English: WS-H C2 multiple-comparison correction switch — when enabled, the SWEEP_JSON payload
+	// includes a Bonferroni-corrected p-value (factor = combos tested for that strategy).
+	MCC bool
+	// §W7 最小触发样本：触发次数低于该阈值的组合直接排除出冠军竞争，
+	// 防"5× 盈利 / 3 次触发"这类统计噪声压过"3× 盈利 / 1000+ 次触发"的稳健解。
+	// 0 = 走 minTriggersForObj(obj) 的按目标默认（winrate/avgwin/calmar 更严）。
+	// English: W7 minimum trigger count — combos below this are excluded from champion contention;
+	// 0 uses per-objective defaults.
+	MinTriggers int
+}
+
+// minTriggersForObj 按目标函数取默认最小样本量：
+// 目标越依赖分布尾部（胜率、平均盈利、卡玛比率需要回撤样本长），门槛越高。
+// English: per-objective default minimum trigger count.
+func minTriggersForObj(obj string) int {
+	switch obj {
+	case "winrate":
+		return 20
+	case "avgwin":
+		return 20
+	case "calmar":
+		return 30
+	case "expectancy":
+		return 15
+	default: // profitfactor
+		return 15
+	}
+}
+
+// 策略自有寻优池：每个战法独立设定止盈线/止损线/兜底天数的搜索范围（§用户反馈）。
+// 不同战法出发点不同，参数范围理应不同——波动突破需要宽止损，N形需要紧止损。
+// 未在表中的战法使用 defaultPool。
+// strategyPool 单个战法的独立寻优池：止盈线/止损线候选值 + 固定兜底天数。
+type strategyPool struct {
+	tpRange []float64 // 止盈线候选值%
+	slRange []float64 // 止损线候选值%
+	maxHold int       // 兜底天数（固定值，不搜索）
+}
+
+// strategyPools 各战法独立寻优池（§用户反馈：分战法回测）。
+// 不同战法出发点不同，参数范围理应不同——波动突破需要宽止盈宽止损，
+// N形需要紧止损。键=战法显示名（与 adapter.Name() 一致），未命中走 defaultPool。
+var strategyPools = map[string]strategyPool{
+	"波动突破战法": {tpRange: stepRange(10, 30, 5), slRange: stepRange(5, 15, 2.5), maxHold: 30},
+	"双响炮":    {tpRange: stepRange(5, 15, 2.5), slRange: stepRange(3, 12, 3), maxHold: 25},
+	"龙头":     {tpRange: stepRange(3, 12, 3), slRange: stepRange(3, 10, 2), maxHold: 20},
+	"龙回头":    {tpRange: stepRange(5, 15, 2.5), slRange: stepRange(3, 10, 2), maxHold: 25},
+	"N形":     {tpRange: stepRange(3, 10, 2), slRange: stepRange(2, 6, 1), maxHold: 15},
+}
+
+// defaultPool 库规则（因子/形态战法）等未在 strategyPools 中登记的战法的默认寻优池。
+var defaultPool = strategyPool{
+	tpRange: stepRange(5, 25, 5),
+	slRange: stepRange(3, 12, 3),
+	maxHold: 30,
+}
+
+// stepRange 按 (起点, 终点, 步长) 生成连续候选值序列（步进形式搜索空间），
+// 保留两位小数规避浮点累加误差；终点含入（+0.001 容差）。
+func stepRange(from, to, step float64) []float64 {
+	var out []float64
+	for v := from; v <= to+0.001; v += step {
+		out = append(out, math.Round(v*100)/100)
+	}
+	return out
+}
+
+// poolFor 返回战法对应的寻优池，未知战法返回 defaultPool。
+func poolFor(name string) strategyPool {
+	if p, ok := strategyPools[name]; ok {
+		return p
+	}
+	return defaultPool
+}
+
+// sweepMinTrades 进入排名的最低触发数——几笔交易 100% 胜率的组合没有统计意义。
+const sweepMinTrades = 20
+
+// scoreQuantiles 从触发分数里取自适应阈值：p40/p60/p80/p95 分位数（去重升序）。
+// 样本不足或分布无区分度（全同分）返回 nil——调用方跳过门槛维。
+// 保证每档阈值都真实切分该战法的分数分布，而不是落在分布外产生完全相同的重复组合。
+// English: adaptive thresholds from trigger-score quantiles (p40/p60/p80/p95, deduped);
+// nil when there aren't enough samples or the distribution has no spread.
+func scoreQuantiles(scores []float64) []float64 {
+	if len(scores) < sweepMinTrades {
+		return nil
+	}
+	sorted := append([]float64(nil), scores...)
+	sort.Float64s(sorted)
+	pick := func(p float64) float64 {
+		idx := int(p * float64(len(sorted)-1))
+		v := sorted[idx]
+		return math.Round(v)
+	}
+	out := make([]float64, 0, 4)
+	for _, p := range []float64{0.40, 0.60, 0.80, 0.95} {
+		v := pick(p)
+		if v > 0 && (len(out) == 0 || out[len(out)-1] != v) {
+			out = append(out, v)
+		}
+	}
+	if len(out) < 2 {
+		return nil // 分布挤在一起（如全部顶格）——门槛维无意义，跳过
+	}
+	return out
+}
+
+// sweepMaxCacheStocks 扫参 K 线缓存的全局护栏：防止 CLI 直跑（MaxStocks=0=全市场）
+// 把研究侧 cgroup 挤爆。English: hard cap on the sweep kline cache.
+const sweepMaxCacheStocks = 500
+
+// sweepTrigger 预计算的入场事件（与出场参数无关，只算一次）。
+// §回测自动增强 A：滑点/成交比例在触发预算时一次定档（只依赖成交额与名义额、
+// 不依赖出场参数），逐组合模拟零额外开销；旧路径恒为 5/5/1。
+type sweepTrigger struct {
+	ad       int     // adapter 序号
+	code     string  // 股票代码（裸码）
+	sigIdx   int     // 触发信号日下标（次日开盘入场）
+	entry    float64 // 入场价 = 次日开盘
+	score    float64 // 入场评分（-1=该战法无连续分，如形态区间命中）
+	highest  float64 // 信号日高点基准（移动止盈起点）
+	buySlip  float64 // 买入滑点（bp，动态定档；旧路径=5）
+	sellSlip float64 // 卖出滑点（bp，动态定档；旧路径=5）
+	fillR    float64 // 部分成交比例（0~1；旧路径/关闭=1）
+}
+
+// sweepResult 单个组合的单战法汇总。
+type sweepResult struct {
+	Name           string  // 战法名称
+	Kind           string  // 规则 ID（fac_N/pat_N）；内置战法为空
+	Trail          float64 `json:"trail_pct"`     // 移动止盈比例
+	Hold           int     `json:"hold_days"`     // 最大持仓天数
+	MinScore       float64 `json:"min_score"`     // 最低得分门槛
+	Count          int     `json:"trigger_count"` // 触发次数
+	Win            int     `json:"win"`           // 盈利次数
+	Loss           int     `json:"loss"`          // 亏损次数
+	WinRate        float64 `json:"win_rate"`      // 胜率（%）
+	AvgWinPct      float64 `json:"avg_win_pct"`   // 平均盈利百分比
+	AvgLossPct     float64 `json:"avg_loss_pct"`  // 平均亏损百分比
+	ProfitFactor   float64 `json:"profit_factor"` // 盈亏比
+	Expectancy     float64 `json:"expectancy"`    // 期望收益率
+	StopLossPct    float64 `json:"stop_loss_pct"` // 止损比例
+	AvgHold        float64 `json:"avg_hold_days"` // 平均持仓天数
+	ObjectiveScore float64 `json:"-"`             // 目标函数得分（不入库）
+
+	// §Phase3 ATR 动态止损维：ATR×mult 距离（0=禁用，回退固定百分比止损）
+	// English: Phase-3 ATR dynamic stop — distance as ATR×mult (0 = disabled, fixed-pct fallback).
+	AtrStopMult float64 `json:"atr_stop_mult"` // ATR 止损倍数
+
+	// §GAP4.5 风险调整指标（随 SWEEP_JSON 落库展示）
+	Sharpe          float64 `json:"sharpe"`            // 年化夏普比率
+	MaxDrawdownPct  float64 `json:"max_drawdown_pct"`  // 复利净值最大回撤%（正数）
+	AnnualReturnPct float64 `json:"annual_return_pct"` // 年化收益率（%）
+	Calmar          float64 `json:"calmar"`            // 卡玛比率（年化收益/最大回撤）
+
+	// §WS-H C2 多重检验：单组合 t 检验 p 值（均值>0 双尾）；Bonferroni 校正值在
+	// SWEEP_JSON 输出时按该战法组合数计算（见 runSweep 2g）。
+	// English: WS-H C2 multiple-comparison — per-combo one-sample t-test p (two-sided mean>0);
+	// the Bonferroni-adjusted value is applied at JSON output using the strategy's tested-combo count.
+	PValue float64 `json:"p_value"` // 逐笔净收益均值>0 的双尾 t 检验 p 值
+}
+
+// runSweep 扫参主流程。codes 为裸码列表；industryChg 与普通回放同构。
+func (o *Options) runSweep(db *store.DB, codes []string, ads []adapter,
+	industryChg map[string]map[string]float64) error {
+
+	obj := strings.ToLower(strings.TrimSpace(o.Sweep.Objective))
+	if obj == "" {
+		obj = "profitfactor"
+	}
+	objName := map[string]string{"profitfactor": "盈亏比", "winrate": "胜率", "avgwin": "平均盈利", "expectancy": "期望收益", "calmar": "卡玛比率"}[obj]
+	if objName == "" {
+		return fmt.Errorf("未知优化目标: %s（可选 profitFactor/winRate/avgWin/expectancy/calmar）", o.Sweep.Objective)
+	}
+	// §W7 生效最小触发样本：显式配置优先，否则按目标默认。低于阈值的组合不参与冠军竞争，
+	// 也不进 Pareto/all 池（避免小样本解占据前沿、把稳健解挤下去）。
+	// English: W7 — effective min-triggers gate: explicit override or per-objective default;
+	// sub-threshold combos are excluded from champion contention AND from the Pareto pool.
+	minTriggers := o.Sweep.MinTriggers
+	if minTriggers <= 0 {
+		minTriggers = minTriggersForObj(obj)
+	}
+	if objName != "" {
+		fmt.Printf("最小触发样本：%d（目标 %s；低于此样本量的组合视为统计噪声，不入冠军候选）\n", minTriggers, objName)
+	}
+
+	// ── 1) K 线一次性载入内存 ──
+	if len(codes) > sweepMaxStocksLimit(o.MaxStocks) {
+		codes = codes[:sweepMaxStocksLimit(o.MaxStocks)]
+	}
+	// §回测自动增强 A0：生效配置（nil=全部旧行为，输出与基线逐字节一致的回归保证）
+	bt := o.activeBacktest()
+	amountFixed := 0 // Risk-1 千元口径归一的股票计数
+	klines := make(map[string][]data.KLine, len(codes))
+	// §Phase3 ATR 动态止损维：与 K 线同序预计算每只股票 ATR14 序列（网格模拟动态止损复用）
+	// English: Phase-3 ATR dynamic stop — precompute each stock's ATR14 series alongside the bars.
+	atrs := make(map[string][]float64, len(codes))
+	for _, tsCode := range codes {
+		// §GAP4 复权价：扫参与回放同用 HfqBars（除权缺口不再污染形态/止损判定）
+		bars, err := db.HfqBars(tsCode, o.Start, o.End)
+		if err != nil || len(bars) < 15 {
+			continue
+		}
+		code := strings.Split(tsCode, ".")[0]
+		k := toDataKLine(bars)
+		// §Risk-1 单位自校：tushare 口径库 amount=千元，均价带判定后归一（仅增强模式）
+		if bt != nil && fixAmountScale(k) {
+			amountFixed++
+		}
+		klines[code] = k
+		hs, ls, cs := make([]float64, len(k)), make([]float64, len(k)), make([]float64, len(k))
+		for i, b := range k {
+			hs[i], ls[i], cs[i] = b.High, b.Low, b.Close
+		}
+		atrs[code] = indicator.ATR14(hs, ls, cs)
+	}
+	if amountFixed > 0 {
+		// §Risk-1：daily 表若由 tushare 装载则 amount=千元（与契约"元"差 1000 倍），
+		// 不归一会让日均成交额被低估、滑点罚档跳最差、回测过保守。
+		log.Printf("Risk-1 单位自校：%d 只股票 amount 按千元口径归一（×1000）", amountFixed)
+	}
+
+	// ── 2) 逐战法独立优化：四维步进网格 → 分批护栏 → 批冠军淘汰赛 → 冠军实盘口径复核 ──
+	// §OPTIMIZE_POOL_INTEGRATION_PLAN D2：
+	//   搜索空间 = 止盈线% × 止损线% × 持仓天数 × 门槛分数（sweep_pool_configs 可自定义，
+	//   未配置走内置默认池）；网格扫参统一用 uniformExitV2 轻量出场（触发预计算一次，
+	//   分数过滤在触发上做，不重跑 Trigger）；全组合按批(≤5000)切分，批内取最优为批冠军，
+	//   批冠军间按目标函数 PK 出全局冠军；冠军再经真实 adapter.Exit 回放一遍复核并标注。
+	for ai, ad := range ads {
+		fmt.Printf("\n══════════════════════════════════════════\n")
+		fmt.Printf("【%s】独立寻优\n", ad.Name())
+		fmt.Printf("══════════════════════════════════════════\n")
+
+		kind := ""
+		if kp, ok := ad.(kindProvider); ok {
+			kind = kp.Kind()
+		}
+
+		// 2a) 触发预计算（入场与出场参数无关，一次算完全程复用）
+		// §回测自动增强：滑点上下文按战法构建（paper_trades 校准合并基准），
+		// 一字板预筛/逐笔定档在 sweepTriggersOf 内完成。
+		sc, calibBrief := o.buildSlipCtx(db, ad.Name(), kind)
+		o.slip = sc // 冠军复核（simulateCombo→backtestStock）同口径
+		var trigs []sweepTrigger
+		for code, kls := range klines {
+			trigs = append(trigs, o.sweepTriggersOf(ad, ai, code, kls, industryChg[code], sc)...)
+		}
+		sort.Slice(trigs, func(i, j int) bool { return trigs[i].sigIdx < trigs[j].sigIdx })
+		log.Printf("触发预算 %s：%d 个入场事件", ad.Name(), len(trigs))
+
+		// 2b) 搜索空间解析：DB 配置优先，回退内置默认池
+		poolCfg := defaultPoolConfig(ad.Name())
+		if c, err := db.GetSweepPoolConfig(ad.Name()); err == nil && c != nil {
+			poolCfg = c // 用户自定义覆盖（PUT /api/research/sweep-pools）
+		}
+		tps := stepRangeF(poolCfg.TpFrom, poolCfg.TpTo, poolCfg.TpStep)
+		sls := stepRangeF(poolCfg.SlFrom, poolCfg.SlTo, poolCfg.SlStep)
+		holds := stepRangeI(poolCfg.HoldFrom, poolCfg.HoldTo, poolCfg.HoldStep)
+
+		// 门槛维：有连续入场分的战法用用户配置区间；无分战法只跑 0 档（配置无效自动降级）
+		hasScore := false
+		for _, t := range trigs {
+			if t.score >= 0 {
+				hasScore = true
+				break
+			}
+		}
+		scores := []float64{0}
+		if hasScore {
+			scores = stepRangeF(poolCfg.ScoreFrom, poolCfg.ScoreTo, poolCfg.ScoreStep)
+		}
+
+		// §Phase3 ATR 动态止损维：默认单档 0=禁用（回退固定百分比止损）；多档启用动态止损搜索
+		// English: Phase-3 ATR dynamic-stop dimension — single 0 level = disabled (fixed-pct fallback);
+		// multi-level ranges enable dynamic ATR-stop search.
+		atrMults := stepRangeF(poolCfg.AtrFrom, poolCfg.AtrTo, poolCfg.AtrStep)
+
+		// 2c) 全组合枚举（指数级：|tp|×|sl|×|hold|×|score|×|atr|，护栏由保存端校验 ≤10万）
+		type combo5 struct {
+			tp, sl, score, atr float64
+			hold               int
+		}
+		var combos []combo5
+		for _, tp := range tps {
+			for _, sl := range sls {
+				for _, h := range holds {
+					for _, s := range scores {
+						for _, a := range atrMults {
+							combos = append(combos, combo5{tp, sl, s, a, h})
+						}
+					}
+				}
+			}
+		}
+		fmt.Printf("搜索空间：%d 组合（止盈%d档×止损%d档×持仓%d档×门槛%d档×ATR%d档）\n",
+			len(combos), len(tps), len(sls), len(holds), len(scores), len(atrMults))
+
+		// 2d) 分批锦标赛：每批 ≤5000 全量模拟出批冠军，批冠军间 PK 出全局冠军
+		const batchSize = 5000                     // §护栏：单批组合上限（分批全量模拟，非抽样）
+		var champions []sweepResult                // champions[bi] = 第 bi 批冠军（值语义，避免切片扩容指针失效）
+		all := make([]sweepResult, 0, len(combos)) // 全量留存供热力网格聚合（10万条 ≈ 12MB）
+		done := 0
+		lowSample := 0                   // §W7 被样本门槛剔除的组合数（供兜底/审计）
+		var fallbackChampion sweepResult // §W7 门槛杀光全部时的兜底冠军（未过门槛的原始最优）
+		var hasFallback bool
+		lastPct := -10
+		// 分批全量模拟：每批选批冠军，进度按完成百分比每 10% 打印一次。
+		for bi := 0; bi*batchSize < len(combos); bi++ {
+			lo, hi := bi*batchSize, min((bi+1)*batchSize, len(combos))
+			bestInBatch := sweepResult{}
+			hasChamp := false
+			for ci := lo; ci < hi; ci++ {
+				cb := combos[ci]
+				r := simulateUniform(ad.Name(), kind, trigs, klines, cb.tp, cb.sl, cb.hold, cb.score, cb.atr, atrs, o.RiskFreeRate, sc)
+				// §W7 小样本剔除：低于门槛的组合不入 all 池（也不参与 Pareto 前沿），
+				// 只在**全部**组合都低于门槛时兜底保留原始冠军，防止前端看到零结果。
+				// English: W7 sub-threshold combos skipped; if everything is below the gate we fall
+				// back to the raw champion so the UI doesn't see zero rows.
+				if r.Count < minTriggers {
+					lowSample++
+					rv := objectiveValue(obj, &r)
+					if !hasFallback || rv > objectiveValue(obj, &fallbackChampion) {
+						fallbackChampion = r
+						hasFallback = true
+					}
+					done++
+					continue
+				}
+				r.ObjectiveScore = objectiveValue(obj, &r)
+				all = append(all, r)
+				cur := &all[len(all)-1]
+				if !hasChamp || betterOf(obj, cur, &bestInBatch) == cur {
+					bestInBatch = *cur
+					hasChamp = true
+				}
+				done++
+				if pct := done * 100 / len(combos); pct >= lastPct+10 {
+					lastPct = pct
+					fmt.Printf("参数优化进度 %d%%（第%d/%d批）\n", pct, bi+1, (len(combos)+batchSize-1)/batchSize)
+				}
+			}
+			if hasChamp {
+				champions = append(champions, bestInBatch)
+			}
+		}
+		if len(all) == 0 {
+			// §W7 兜底分支：
+			//   - 完全零触发（lowSample=0）：无信号；
+			//   - 全部低样本被门槛剔除（lowSample>0）：把未过门槛的原始最优作为 fallback 输出，
+			//     带 insufficient_sample=true 标记，前端展示"样本不足以推荐"但保留数字可查。
+			// English: W7 fall-back path — when the gate prunes everything, emit the raw best
+			// combo with an insufficient_sample flag so the UI can distinguish "no triggers"
+			// from "only noise-level samples".
+			noSignal := lowSample == 0
+			msg := "无有效组合"
+			if !noSignal {
+				msg = fmt.Sprintf("全部 %d 组合触发数 < 最小样本 %d，无可用冠军", lowSample, minTriggers)
+			}
+			fmt.Printf("%s。\n", msg)
+			var resRows []map[string]any
+			if hasFallback {
+				resRows = []map[string]any{{
+					"strategy":            ad.Name(),
+					"strategy_kind":       kind,
+					"insufficient_sample": true,
+					"min_triggers":        minTriggers,
+					"trigger_count":       fallbackChampion.Count,
+					"win_rate":            fallbackChampion.WinRate,
+					"profit_factor":       fallbackChampion.ProfitFactor,
+					"expectancy":          fallbackChampion.Expectancy,
+					"params": map[string]any{
+						"take_profit_pct": fallbackChampion.Trail,
+						"stop_loss_pct":   fallbackChampion.StopLossPct,
+						"hold_days":       fallbackChampion.Hold,
+						"min_score":       fallbackChampion.MinScore,
+						"atr_stop_mult":   fallbackChampion.AtrStopMult,
+					},
+				}}
+			} else {
+				resRows = []map[string]any{
+					{"strategy": ad.Name(), "strategy_kind": kind, "no_signal": true, "trigger_count": 0},
+				}
+			}
+			lowOut := struct {
+				Strategy      string           `json:"strategy"`
+				Objective     string           `json:"objective"`
+				NoSignal      bool             `json:"no_signal,omitempty"`
+				Insufficient  bool             `json:"insufficient_sample,omitempty"`
+				MinTriggers   int              `json:"min_triggers,omitempty"`
+				LowSampleSeen int              `json:"low_sample_combos,omitempty"`
+				Results       []map[string]any `json:"results"`
+			}{
+				Strategy: ad.Name(), Objective: obj, NoSignal: noSignal,
+				Insufficient: !noSignal, MinTriggers: minTriggers, LowSampleSeen: lowSample,
+				Results: resRows,
+			}
+			if bj, jerr := json.Marshal(lowOut); jerr == nil {
+				fmt.Printf("SWEEP_JSON:%s\n", bj)
+			}
+			continue
+		}
+		// 批冠军终选（平局以触发数多者胜——与 betterOf 同口径）
+		global := champions[0]
+		for i := 1; i < len(champions); i++ {
+			if betterOf(obj, &champions[i], &global) == &champions[i] {
+				global = champions[i]
+			}
+		}
+		best := &global
+
+		// 2e) 冠军实盘口径复核：真实 adapter.Exit 注入冠军参数后整库回放一遍。
+		// 网格用统一出场引擎保证梯度有效；复核让落地数字与实盘同口径、两种口径都留档。
+		// §Phase3 ATR 冠军的实盘口径复核仍走固定止损（真实 adapter 的动态 ATR 止损
+		// 位于运行期 ExitContext，网格层以固定比例复现其等价距离，标注在 params.atr_stop_mult）。
+		verify := verifyChampion(ad, kind, o, klines, industryChg,
+			best.Trail, best.StopLossPct, best.Hold)
+		atrNote := ""
+		if best.AtrStopMult > 0 {
+			atrNote = fmt.Sprintf(" ATR=%.1f×", best.AtrStopMult)
+		}
+		fmt.Printf("★ 冠军：止盈%.0f%% 止损%.0f%% 持仓%d天 门槛%.0f%s → 胜率%.2f%% 盈亏比%.2f 期望%+.2f%% 触发%d\n",
+			best.Trail, best.StopLossPct, best.Hold, best.MinScore, atrNote, best.WinRate, best.ProfitFactor, best.Expectancy, best.Count)
+		fmt.Printf("✓ 实盘口径复核：胜率%.2f%% 盈亏比%.2f 期望%+.2f%% 触发%d\n",
+			verify.WinRate, verify.ProfitFactor, verify.Expectancy, verify.Count)
+
+		// 2f) 止盈×止损热力网格（格值=该格跨持仓/门槛的最优期望）+ 批次冠军明细
+		type gridCell struct {
+			// §GAP 修复：Sl 原误标 json:"tp" 与 Tp 冲突，序列化后 sl 恒缺失——
+			// 前端热力网格（Research.vue optCurHeat 按 tp|sl 复合键查表）sl 维度全为 0。
+			Tp         float64 `json:"tp"`
+			Sl         float64 `json:"sl"`
+			Expectancy float64 `json:"expectancy"`
+			Triggers   int     `json:"triggers"`
+		}
+		gridMap := map[[2]float64]*gridCell{}
+		for i := range all {
+			r := &all[i]
+			key := [2]float64{r.Trail, r.StopLossPct}
+			g := gridMap[key]
+			if g == nil {
+				g = &gridCell{Tp: key[0], Sl: key[1], Expectancy: math.Inf(-1)}
+				gridMap[key] = g
+			}
+			if r.Expectancy > g.Expectancy {
+				g.Expectancy = r.Expectancy
+				g.Triggers = r.Count
+			}
+		}
+		grid := make([]gridCell, 0, len(gridMap))
+		for _, g := range gridMap {
+			grid = append(grid, *g)
+		}
+		sort.Slice(grid, func(a, b int) bool {
+			if grid[a].Tp != grid[b].Tp {
+				return grid[a].Tp < grid[b].Tp
+			}
+			return grid[a].Sl < grid[b].Sl
+		})
+
+		// 控制台热力图（人读）
+		fmt.Println("\n止盈×止损网格（跨持仓/门槛最优期望%）:")
+		fmt.Printf("止盈线→")
+		for _, tp := range tps {
+			fmt.Printf("  %5.0f%%", tp)
+		}
+		fmt.Println()
+		for _, sl := range sls {
+			fmt.Printf("止损%4.0f%%  ", sl)
+			for _, tp := range tps {
+				if g, ok := gridMap[[2]float64{tp, sl}]; ok && !math.IsInf(g.Expectancy, -1) {
+					fmt.Printf("%+5.2f%%", g.Expectancy)
+				} else {
+					fmt.Printf("   —  ")
+				}
+			}
+			fmt.Println()
+		}
+
+		// 2g) 输出该战法 SWEEP_JSON（worker 解析落库：冠军行 + grid/batches 附带信息）
+		// §WS-H C2 多重检验简报：p_value=单组合 t 检验 p；mcc=true 时附 Bonferroni 校正
+		// （×该战法组合数，封顶 1），未过校正（p_bonf≥0.05）标注 not_significant。
+		// English: WS-H C2 MCC brief — p_value from the per-combo t-test; with MCC on, add the
+		// Bonferroni-corrected p (× tested-combo count, capped at 1) plus a not_significant flag.
+		mccInfo := map[string]any{
+			"tested_combos": len(combos),
+			"p_value":       best.PValue,
+		}
+		if o.Sweep.MCC {
+			pBonf := bonferroniP(best.PValue, len(combos))
+			mccInfo["p_value_bonf"] = pBonf
+			mccInfo["corrected"] = true
+			if pBonf >= 0.05 {
+				mccInfo["not_significant"] = true
+			}
+		}
+		jsonResult := map[string]any{
+			"rank": 1, "strategy": ad.Name(), "strategy_kind": kind,
+			"params":        map[string]any{"take_profit_pct": best.Trail, "stop_loss_pct": best.StopLossPct, "hold_days": best.Hold, "min_score": best.MinScore, "atr_stop_mult": best.AtrStopMult},
+			"win_rate":      best.WinRate,
+			"profit_factor": best.ProfitFactor,
+			"expectancy":    best.Expectancy,
+			"win":           best.Win, "loss": best.Loss,
+			"avg_win_pct":   best.AvgWinPct,
+			"avg_loss_pct":  best.AvgLossPct,
+			"trigger_count": best.Count,
+			"avg_hold_days": best.AvgHold,
+			"mcc":           mccInfo,
+			// §F5 风险调整指标：finalizeResult 已算好 Sharpe/MDD/年化/Calmar，此前漏带出 SWEEP_JSON
+			// → worker 落库读到缺失字段恒为 0（optimization_results 531..527 全 0.0 的根因）。
+			// English: §F5 risk-adjusted metrics were computed by finalizeResult but never included in
+			// the SWEEP_JSON payload, so the worker persisted zeros (root cause of the all-zero rows).
+			"sharpe":            best.Sharpe,
+			"max_drawdown_pct":  best.MaxDrawdownPct,
+			"annual_return_pct": best.AnnualReturnPct,
+			"calmar":            best.Calmar,
+			// 实盘口径复核数字（前端冠军卡展示，与网格口径并列）
+			"verify_win_rate":      verify.WinRate,
+			"verify_profit_factor": verify.ProfitFactor,
+			"verify_expectancy":    verify.Expectancy,
+			"verify_trigger_count": verify.Count,
+		}
+		// §W7 门槛审计：本轮扫参被样本门槛剔除的组合数与生效门槛值，走 payload.sample 顶层
+		// 键（前端从 grid_json.sample 读取展示"剔除 N 个低样本组合"），不落 result 列避免 schema 迁移。
+		// English: W7 audit — combos pruned by the sample gate travel through payload.sample
+		// (persisted inside grid_json) rather than as new columns.
+		sampleBrief := map[string]any{
+			"min_triggers": minTriggers,
+			"low_sample":   lowSample,
+			"tested":       len(combos),
+		}
+		batchList := make([]map[string]any, 0, len(champions))
+		for i, ch := range champions {
+			batchList = append(batchList, map[string]any{
+				"batch": i + 1,
+				"tp":    ch.Trail, "sl": ch.StopLossPct,
+				"hold_days": ch.Hold, "min_score": ch.MinScore, "atr_stop_mult": ch.AtrStopMult,
+				"objective": ch.ObjectiveScore,
+			})
+		}
+		// §回测自动增强 C：Pareto 多目标前沿 + 推荐解（bt.Pareto.Enabled 才输出该段；
+		// worker 端 payload struct 必须同步加顶层字段，否则 json 解析静默丢弃）。
+		var paretoBrief any
+		if bt != nil && bt.Pareto.Enabled {
+			front := paretoFront(all, bt.Pareto.MaxFrontPoints)
+			rec := recommendedSolution(front, bt.Pareto)
+			paretoBrief = map[string]any{
+				"total": len(all), // 候选总点数（前端展示 N/M）
+				"gates": map[string]any{"min_win_rate": bt.Pareto.MinWinRate,
+					"min_profit_factor": bt.Pareto.MinProfitFactor,
+					"min_sharpe":        bt.Pareto.MinSharpe,
+					"min_calmar":        bt.Pareto.MinCalmar},
+				"front":       paretoPointsJSON(front),
+				"recommended": paretoPointJSON(rec), // nil → JSON null（前端降级为纯前沿展示）
+			}
+			log.Printf("Pareto 前沿 %s：%d 点，推荐解=%v", ad.Name(), len(front), rec != nil)
+		}
+		payload := struct {
+			Strategy  string           `json:"strategy"`
+			Objective string           `json:"objective"`
+			Batches   []map[string]any `json:"batches,omitempty"`
+			Grid      []gridCell       `json:"grid,omitempty"`
+			Results   []any            `json:"results"`
+			// §回测自动增强：顶层新增键（pareto 含 gates/front/recommended；
+			// slippage_calib=滑点校准审计；walk_forward A1 轮填充同容器捎带）。
+			// 三键全部 omitempty——增强关闭时载荷形状与基线逐字节一致（回归保证）。
+			Pareto        any `json:"pareto,omitempty"`
+			SlippageCalib any `json:"slippage_calib,omitempty"`
+			WalkForward   any `json:"walk_forward,omitempty"`
+			// §W7 样本门槛审计（min_triggers/low_sample/tested），worker 端透传进 grid_json.sample。
+			Sample any `json:"sample,omitempty"`
+		}{ad.Name(), obj, batchList, grid, []any{jsonResult}, paretoBrief, calibBrief, nil, sampleBrief}
+		if bj, jerr := json.Marshal(payload); jerr == nil {
+			fmt.Printf("SWEEP_JSON:%s\n", bj)
+		}
+	}
+
+	fmt.Printf("==============================================\n")
+	return nil
+}
+
+// sweepTriggersOf 单股单 adapter 的触发扫描（backtestStock 的无出场版）。
+// §回测自动增强 A：滑点/成交比例在触发预算时一次定档（与出场参数无关，热路径零额外开销）；
+// sc 非空时顺带执行入场流动性预筛——一字封死直接不生成 trigger（修复网格模式此前
+// 没有一字板过滤、比回放口径乐观的既有偏差），涨停打开可成交但买滑点加罚。
+// English: pre-compute entry events; with a slippage context, resolve per-trade slippage and
+// fill ratio up-front and drop unfillable one-word limit-up entries (fixing a grid-only optimism gap).
+func (o *Options) sweepTriggersOf(ad adapter, ai int, code string, kls []data.KLine,
+	indByDate map[string]float64, sc *slipCtx) []sweepTrigger {
+	var out []sweepTrigger
+	if na, ok := ad.(*nShapeAdapter); ok {
+		na.macdSeries = data.CalcMACDSeries(kls)
+	}
+	for i := 29; i < len(kls)-1; i++ {
+		if na, ok := ad.(*nShapeAdapter); ok {
+			na.curIdx = i
+		}
+		prevClose := 0.0
+		if i > 0 {
+			prevClose = kls[i-1].Close
+		}
+		indChg := 0.0
+		if indByDate != nil {
+			indChg = indByDate[kls[i].Date.Format("20060102")]
+		}
+		meta, ok := ad.Trigger(kls[:i+1], prevClose, indChg)
+		if !ok {
+			continue
+		}
+		entry := kls[i+1].Open
+		if entry <= 0 {
+			continue
+		}
+		// 滑点定档（旧路径=固定 5/5、成交比例 1）
+		buySlip, sellSlip, fill := costSlippageBps, costSlippageBps, 1.0
+		if sc != nil {
+			var can bool
+			buySlip, sellSlip, fill, can = sc.entrySlip(code, kls, i)
+			if !can {
+				continue // 一字封死：现实中买单排队无望
+			}
+		}
+		high := meta["highest_price"]
+		if high <= 0 {
+			high = entry
+		}
+		out = append(out, sweepTrigger{ad: ai, code: code, sigIdx: i,
+			entry: entry, score: meta["score"], highest: high,
+			buySlip: buySlip, sellSlip: sellSlip, fillR: fill})
+	}
+	return out
+}
+
+// simulateCombo 单组合模拟：用战法自身真实出场逻辑回测，不依赖统一出场公式。
+// 对每个组合，把参数应用到战法适配器，然后跑全量 backtestStock（真实的入场+出场），
+// 聚合胜率/盈亏比/期望收益等指标。
+// §用户反馈：分战法回测，每个战法用自己的出场逻辑，不搞统一公式。
+func simulateCombo(ad adapter, kind string, o *Options, klines map[string][]data.KLine,
+	industryChg map[string]map[string]float64, takeProfitPct float64, stopLossPct float64, maxHold int, minScore float64) sweepResult {
+	// 记录原始参数，组合完成后恢复
+	restore := applyComboParams(ad, takeProfitPct, stopLossPct, maxHold, minScore)
+	res := sweepResult{Name: ad.Name(), Kind: kind, Trail: takeProfitPct, StopLossPct: stopLossPct, Hold: maxHold, MinScore: minScore}
+	var winSum, lossSum float64
+	var pnls []float64
+	var dates []string
+	for code, kls := range klines {
+		indByDate := industryChg[code]
+		trades := o.backtestStock(code, kls, ad, indByDate)
+		for _, t := range trades {
+			res.Count++
+			res.AvgHold += float64(t.HoldDays)
+			pnls = append(pnls, t.PnlPct)
+			dates = append(dates, t.Date)
+			if t.PnlPct > 0 {
+				res.Win++
+				winSum += t.PnlPct
+			} else {
+				res.Loss++
+				lossSum += t.PnlPct
+			}
+		}
+	}
+	restore() // 恢复原始参数
+	finalizeResult(&res, winSum, lossSum, pnls, dates, o.RiskFreeRate)
+	return res
+}
+
+// applyComboParams 把组合参数应用到战法适配器，返回恢复函数。
+// 对于内置战法，修改 config 的出场旋钮；对于因子/形态规则，修改 ruleEvalAdapter 的字段。
+func applyComboParams(ad adapter, takeProfitPct, stopLossPct float64, maxHold int, minScore float64) func() {
+	switch a := ad.(type) {
+	case *doubleBumpAdapter:
+		old1, old2, old3 := a.cfg.TrailingDrawbackPct, a.cfg.DoubleBumpTakeProfitPct, a.cfg.MaxHoldDays
+		if takeProfitPct > 0 {
+			a.cfg.TrailingDrawbackPct = takeProfitPct
+		}
+		if stopLossPct > 0 {
+			a.cfg.DoubleBumpTakeProfitPct = stopLossPct
+		}
+		if maxHold > 0 {
+			a.cfg.MaxHoldDays = maxHold
+		}
+		return func() { a.cfg.TrailingDrawbackPct, a.cfg.DoubleBumpTakeProfitPct, a.cfg.MaxHoldDays = old1, old2, old3 }
+	case *dragonAdapter:
+		old1, old2 := a.cfg.TrailingDrawbackPct, a.cfg.MaxHoldDays
+		if takeProfitPct > 0 {
+			a.cfg.TrailingDrawbackPct = takeProfitPct
+		}
+		if maxHold > 0 {
+			a.cfg.MaxHoldDays = maxHold
+		}
+		return func() { a.cfg.TrailingDrawbackPct, a.cfg.MaxHoldDays = old1, old2 }
+	case *dragonReturnAdapter:
+		old1, old2, old3, old4 := a.cfg.TakeProfitPct, a.cfg.StopLossPct, a.cfg.MaxHoldDays, a.cfg.TrailingDrawback
+		if takeProfitPct > 0 {
+			a.cfg.TakeProfitPct = takeProfitPct / 100
+			a.cfg.TrailingDrawback = takeProfitPct
+		}
+		if stopLossPct > 0 {
+			a.cfg.StopLossPct = stopLossPct / 100
+		}
+		if maxHold > 0 {
+			a.cfg.MaxHoldDays = maxHold
+		}
+		return func() {
+			a.cfg.TakeProfitPct, a.cfg.StopLossPct, a.cfg.MaxHoldDays, a.cfg.TrailingDrawback = old1, old2, old3, old4
+		}
+	case *nShapeAdapter:
+		old1, old2, old3 := a.cfg.TrailingDrawbackPct, a.cfg.HardStopLoss, a.cfg.MaxHoldDays
+		if takeProfitPct > 0 {
+			a.cfg.TrailingDrawbackPct = takeProfitPct
+		}
+		if stopLossPct > 0 {
+			a.cfg.HardStopLoss = stopLossPct / 100
+		}
+		if maxHold > 0 {
+			a.cfg.MaxHoldDays = maxHold
+		}
+		return func() { a.cfg.TrailingDrawbackPct, a.cfg.HardStopLoss, a.cfg.MaxHoldDays = old1, old2, old3 }
+	case *ruleEvalAdapter:
+		old1, old2 := a.trailOverride, a.holdOverride
+		if takeProfitPct > 0 {
+			v := takeProfitPct
+			a.trailOverride = &v
+		}
+		if maxHold > 0 {
+			v := maxHold
+			a.holdOverride = &v
+		}
+		return func() { a.trailOverride, a.holdOverride = old1, old2 }
+	}
+	return func() {}
+}
+
+// uniformExit 统一出场引擎 v2（§用户反馈：到线就卖，不等天数）。
+//
+// 三个条件按优先级逐日检查：
+//  1. 止损线：亏损达 stopLossPct%（相对入场价）→ 立即卖出控制损失
+//  2. 止盈线：盈利达 takeProfitPct%（相对入场价）→ 锁定利润
+//  3. 移动止盈：从阶段高点回撤 trailPct%（且曾盈利）→ 保护已有利润
+//  4. 兜底：超过 maxHoldDays 天 → 强制离场
+//
+// 与旧版的区别：新增了独立的止损线和止盈线，不再只依赖移动止盈+超期。
+// maxHoldDays 是安全兜底而非主要出场方式。
+func uniformExitV2(kls []data.KLine, sigIdx int, entry, sigHigh float64,
+	takeProfitPct, stopLossPct, trailPct float64, maxHoldDays int) (int, float64) {
+	// §Phase3 ATR 动态止损：旧签名委托新变体（不传 ATR → 固定百分比止损，行为不变）
+	// English: ATR dynamic stop — the legacy signature delegates to the new variant (no ATR series →
+	// fixed-percentage stop, unchanged behavior).
+	return uniformExitV2ATR(kls, sigIdx, entry, sigHigh, takeProfitPct, stopLossPct, trailPct, maxHoldDays, nil, 0)
+}
+
+// uniformExitV2ATR 统一出场引擎 v2 的 ATR 动态止损变体（§Phase3）：
+// 当 atrStopMult>0 且 ATR 序列在 j 日有效时，止损线用 当日ATR×mult/入场价 换算的动态百分比
+// （跟随波动率自适应，高波动放宽止损、低波动收紧）；否则回退固定 stopLossPct。
+// 其余止盈/移动止盈/超期条件与 uniformExitV2 完全一致。
+// English: uniformExitV2ATR is the ATR dynamic-stop variant of the v2 uniform exit engine (Phase 3).
+// When atrStopMult>0 and the ATR series is valid on day j, the stop line becomes the dynamic percent
+// computed as ATR[j]×mult/entry (volatility-adaptive: wider stops in high volatility, tighter in low);
+// otherwise it falls back to the fixed stopLossPct. Take-profit/trailing/timeout logic is unchanged.
+func uniformExitV2ATR(kls []data.KLine, sigIdx int, entry, sigHigh float64,
+	takeProfitPct, stopLossPct, trailPct float64, maxHoldDays int,
+	atr []float64, atrStopMult float64) (int, float64) {
+	// 旧签名委托全参数版：固定 5/5 滑点、全额成交、无跌停封死门控（行为不变）
+	return uniformExitV2Full(kls, "", sigIdx, entry, sigHigh, takeProfitPct, stopLossPct, trailPct,
+		maxHoldDays, atr, atrStopMult, costSlippageBps, costSlippageBps, 1, 0)
+}
+
+// uniformExitV2Full 统一出场引擎 v2 的完整参数版（§回测自动增强 A/B）：
+// 在 ATR 动态止损之上叠加——逐笔定档的买卖滑点（非对称）、跌停封死不可卖门控
+// （sealedExtra>0 时启用：封死日跳过出场判定、打开日卖出加罚该滑点）、
+// 部分成交（盈亏 × fillRate，未成交部分留现金属零收益的近似口径 B.5-5）。
+// buySlip=sellSlip=5、fill=1、sealedExtra=0 时与旧 uniformExitV2ATR 数值完全一致。
+// English: full-parameter v2 — per-trade asymmetric slippage, limit-down sealed gate (no sell
+// while sealed, extra slippage on the opening day) and partial fills; identical to the legacy
+// variant when slippage is fixed 5/5, fill=1 and the sealed gate is off.
+func uniformExitV2Full(kls []data.KLine, code string, sigIdx int, entry, sigHigh float64,
+	takeProfitPct, stopLossPct, trailPct float64, maxHoldDays int,
+	atr []float64, atrStopMult, buySlip, sellSlip, fill, sealedExtra float64) (int, float64) {
+	entryDay := sigIdx + 1
+	stageHigh := math.Max(entry, sigHigh)
+	lastJ := len(kls) - 1
+
+	// pnlAt 按当日有效卖出滑点结算净额收益率（含部分成交折算）
+	pnlAt := func(j int, slipSell float64) float64 {
+		if entry <= 0 {
+			return 0
+		}
+		// §GAP4.1 净额口径（滑点+佣金+印花税），与 replay 回放同模型；增强路径逐笔定档
+		return costRoundTripPnlEx(entry, kls[j].Close, buySlip, slipSell) * fill
+	}
+
+	// 当日有效止损百分比：ATR 止损启用时随当日 ATR 自适应，否则固定
+	// English: effective stop percent for day j — volatility-adaptive when ATR stop is on, else fixed.
+	effStop := func(j int) float64 {
+		if atrStopMult > 0 && atr != nil && j < len(atr) && atr[j] > 0 && entry > 0 {
+			if pct := atr[j] * atrStopMult / entry * 100; pct > 0 {
+				return pct
+			}
+		}
+		return stopLossPct
+	}
+
+	wasSealed := false // 上一日是否跌停封死（打开日卖出加罚滑点）
+	for j := entryDay + 1; j <= lastJ; j++ {
+		cur := kls[j].Close
+		if cur <= 0 {
+			continue
+		}
+		// 跌停封死判定（模块 B）：封死日不可卖出、出场判定整体顺延
+		if sealedExtra > 0 && j > 0 && costLimitDownSealedDay(code, kls[j-1].Close, kls[j].Low, cur) {
+			wasSealed = true
+			continue
+		}
+		slipSell := sellSlip
+		if wasSealed {
+			slipSell += sealedExtra // 打开日以收盘价卖出，追加封死期流动性罚分
+			wasSealed = false
+		}
+		if cur > stageHigh {
+			stageHigh = cur
+		}
+		pnlPct := pnlAt(j, slipSell)
+		days := j - entryDay
+
+		if s := effStop(j); s > 0 && pnlPct <= -s {
+			return j, pnlPct // 止损线：立即卖出控制损失
+		}
+		if takeProfitPct > 0 && pnlPct >= takeProfitPct {
+			return j, pnlPct // 止盈线：锁定利润
+		}
+		// 移动止盈：较持仓期最高价回撤超过阈值即出场。
+		if trailPct > 0 && stageHigh > entry {
+			dd := (cur - stageHigh) / stageHigh * 100
+			if dd <= -trailPct {
+				return j, pnlAt(j, slipSell)
+			}
+		}
+		if days >= maxHoldDays {
+			return j, pnlPct
+		}
+	}
+	// 未触发任何退出：持有到区间末，记录末日盈亏（末日仍封死也按末日收盘结算）。
+	if lastJ > entryDay {
+		extra := sealedExtra * boolF(wasSealed)
+		return lastJ, pnlAt(lastJ, sellSlip+extra)
+	}
+	return entryDay, 0
+}
+
+// objectiveValue 按目标函数取排名值。盈亏比封顶 99 防无亏损组合发散；
+// 零亏损且有盈利的组合按满分处理（否则 PF 字段保持 0 的"完美组合"会被排到末位）。
+func objectiveValue(obj string, r *sweepResult) float64 {
+	switch obj {
+	case "expectancy":
+		return r.Expectancy
+	case "winrate":
+		return r.WinRate
+	case "avgwin":
+		return r.AvgWinPct
+	case "calmar":
+		return r.Calmar
+	default: // profitfactor
+		// 零亏损组合的 PF 字段留 0，直接排名会被踩到底，故显式给封顶值 99；
+		// 其余同样以 99 截断，避免样本极少时 PF 发散支配排序。
+		if r.Loss == 0 && r.Win > 0 {
+			return 99
+		}
+		if r.ProfitFactor > 99 {
+			return 99
+		}
+		return r.ProfitFactor
+	}
+}
+
+// rankedJSON 排名结果的结构化输出（worker 持仓 optimization_results 用）。
+func rankedJSON(all *[]sweepResult, order []int) []map[string]any {
+	out := make([]map[string]any, 0, len(order))
+	for pos, idx := range order {
+		r := (*all)[idx]
+		out = append(out, map[string]any{
+			"rank": pos + 1, "strategy": r.Name, "strategy_kind": r.Kind,
+			// §§Phase3：trail_pct 向后兼容旧前端；take_profit_pct/atr_stop_mult 为新解析键
+			// English: trail_pct kept for legacy frontends; take_profit_pct/atr_stop_mult are the new keys.
+			"params":   map[string]any{"trail_pct": r.Trail, "take_profit_pct": r.Trail, "hold_days": r.Hold, "min_score": r.MinScore, "atr_stop_mult": r.AtrStopMult},
+			"win_rate": r.WinRate, "profit_factor": r.ProfitFactor,
+			"win": r.Win, "loss": r.Loss,
+			"avg_win_pct": r.AvgWinPct, "avg_loss_pct": r.AvgLossPct,
+			"trigger_count": r.Count, "avg_hold_days": r.AvgHold,
+		})
+	}
+	return out
+}
+
+// sweepMaxStocksLimit 生效股票池上限：显式 MaxStocks 与全局护栏取小（至少 50 保底可用）。
+func sweepMaxStocksLimit(maxStocks int) int {
+	limit := maxStocks
+	if limit <= 0 || limit > sweepMaxCacheStocks {
+		limit = sweepMaxCacheStocks
+	}
+	if limit < 50 {
+		limit = 50
+	}
+	return limit
+}
+
+// ── §D2 四维锦标赛寻优的辅助件 ──
+
+// betterOf 两结果按目标函数 PK（淘汰赛比较子）；平局以触发数多者胜（小样本让位）。
+func betterOf(obj string, a, b *sweepResult) *sweepResult {
+	va, vb := objectiveValue(obj, a), objectiveValue(obj, b)
+	if va != vb {
+		if va > vb {
+			return a
+		}
+		return b
+	}
+	if a.Count >= b.Count {
+		return a
+	}
+	return b
+}
+
+// simulateUniform 网格扫参专用轻量模拟：预计算触发 + uniformExitV2 统一出场。
+// 触发与出场参数无关 → 只在此处按门槛过滤/贪心不重叠/逐日出场扫描，
+// 单组合成本 O(触发数×平均持仓天数)，万级组合秒~分钟级完成。
+// atrStopMult>0 时启用 ATR 动态止损（§Phase3，需传入与 klines 同序的 ATR14 序列）。
+// §回测自动增强 A/B：滑点与成交比例取触发预计算时的逐笔定档值（旧路径恒 5/5/1）；
+// sc 非空且启用跌停封死时，出场 walk 内封死顺延、打开日加罚卖出滑点。
+// English: grid-mode lightweight simulation — precomputed triggers filtered by threshold,
+// greedy non-overlapping entries, daily uniform exit walk; thousands of combos in seconds.
+// Per-trade slippage/fill comes from the pre-computed trigger; the sealed limit-down gate
+// defers the exit to the opening day when enabled.
+func simulateUniform(name, kind string, trigs []sweepTrigger, klines map[string][]data.KLine,
+	takeProfitPct, stopLossPct float64, maxHold int, minScore float64,
+	atrStopMult float64, atrs map[string][]float64, rf float64, sc *slipCtx) sweepResult {
+	res := sweepResult{Name: name, Kind: kind, Trail: takeProfitPct, StopLossPct: stopLossPct,
+		Hold: maxHold, MinScore: minScore, AtrStopMult: atrStopMult}
+	nextFree := map[string]int{} // code -> 可再入场最早下标（同股持仓期内不重复入场）
+	sealedExtra := sc.sellSealedExtra()
+	var winSum, lossSum float64
+	var pnls []float64
+	var dates []string
+	// 逐触发模拟：门槛过滤后按 ATR 止损统一出场，记录胜败、持有天数与日期。
+	for _, t := range trigs {
+		if minScore > 0 && t.score >= 0 && t.score < minScore {
+			continue // 门槛过滤（score=-1 标记=无分维度，不过滤）
+		}
+		if t.sigIdx < nextFree[t.code] {
+			continue
+		}
+		exitJ, pnl := uniformExitV2Full(klines[t.code], t.code, t.sigIdx, t.entry, t.highest,
+			takeProfitPct, stopLossPct, 0, maxHold, atrs[t.code], atrStopMult,
+			t.buySlip, t.sellSlip, t.fillR, sealedExtra)
+		nextFree[t.code] = exitJ + 1
+		res.Count++
+		res.AvgHold += float64(exitJ - (t.sigIdx + 1))
+		pnls = append(pnls, pnl)
+		dates = append(dates, klines[t.code][t.sigIdx+1].Date.Format("20060102"))
+		if pnl > 0 {
+			res.Win++
+			winSum += pnl
+		} else {
+			res.Loss++
+			lossSum += pnl
+		}
+	}
+	finalizeResult(&res, winSum, lossSum, pnls, dates, rf)
+	return res
+}
+
+// finalizeResult 由胜负计数与盈亏和聚合出 胜率/均盈/均亏/盈亏比/期望/风险调整指标
+// （两种模拟共用口径；pnls/dates 为按发生序的逐笔净额收益与入场日）。
+func finalizeResult(res *sweepResult, winSum, lossSum float64, pnls []float64, dates []string, rf float64) {
+	if res.Count == 0 {
+		return
+	}
+	res.AvgHold /= float64(res.Count)
+	if res.Win > 0 {
+		res.AvgWinPct = winSum / float64(res.Win)
+	}
+	if res.Loss > 0 {
+		res.AvgLossPct = lossSum / float64(res.Loss)
+	}
+	if res.Win+res.Loss > 0 {
+		res.WinRate = float64(res.Win) / float64(res.Win+res.Loss) * 100
+	}
+	if lossSum != 0 {
+		res.ProfitFactor = winSum / -lossSum
+	}
+	wr := res.WinRate / 100
+	res.Expectancy = wr*res.AvgWinPct + (1-wr)*res.AvgLossPct
+	res.Sharpe, res.MaxDrawdownPct, res.AnnualReturnPct, res.Calmar = perfMetricsRF(pnls, dates, rf)
+	// §WS-H C2 单组合统计显著性：逐笔净收益均值>0 的双尾 t 检验 p 值。
+	res.PValue = oneSampleTP(pnls)
+}
+
+// stepRangeF 浮点步进序列（止盈/止损/门槛维），含起终点；非法输入回退单档。
+func stepRangeF(from, to, step float64) []float64 {
+	if step <= 0 || to < from {
+		return []float64{from}
+	}
+	out := make([]float64, 0, int((to-from)/step)+1)
+	for v := from; v <= to+0.001; v += step {
+		out = append(out, math.Round(v*100)/100)
+	}
+	return out
+}
+
+// verifyChampion 冠军实盘口径复核：把冠军参数注入该战法真实 adapter.Exit 后整库回放一遍。
+// 直接复用 simulateCombo（applyComboParams 注入+恢复、backtestStock 走战法原生出场逻辑）。
+func verifyChampion(ad adapter, kind string, o *Options, klines map[string][]data.KLine,
+	industryChg map[string]map[string]float64, tp, sl float64, holdDays int) sweepResult {
+	return simulateCombo(ad, kind, o, klines, industryChg, tp, sl, holdDays, 0)
+}
+
+// stepRangeI 整数步进序列（持仓天数维），含起终点；非法输入回退单档。
+func stepRangeI(from, to, step int) []int {
+	if step <= 0 || to < from {
+		return []int{from}
+	}
+	out := make([]int, 0, (to-from)/step+1)
+	for v := from; v <= to; v += step {
+		out = append(out, v)
+	}
+	return out
+}
+
+// defaultPoolConfig 内置默认池 → DB 配置结构（引擎侧统一消费 SweepPoolConfig；
+// 步长由相邻两档差值推导，单档维度按 1 计）。门槛默认 40~95 步进 5。
+func defaultPoolConfig(name string) *store.SweepPoolConfig {
+	p := poolFor(name)
+	derive := func(r []float64) (from, to, step float64) {
+		if len(r) == 0 {
+			return 0, 0, 1
+		}
+		if len(r) == 1 {
+			return r[0], r[0], 1
+		}
+		return r[0], r[len(r)-1], r[1] - r[0]
+	}
+	tpFrom, tpTo, tpStep := derive(p.tpRange)
+	slFrom, slTo, slStep := derive(p.slRange)
+	return &store.SweepPoolConfig{
+		Strategy: name,
+		TpFrom:   tpFrom, TpTo: tpTo, TpStep: tpStep,
+		SlFrom: slFrom, SlTo: slTo, SlStep: slStep,
+		HoldFrom: 2, HoldTo: p.maxHold, HoldStep: 2,
+		ScoreFrom: 40, ScoreTo: 95, ScoreStep: 5,
+		// §Phase3 ATR 动态止损维：默认单档 0=禁用（回退固定百分比止损），
+		// 用户可在 API 配置多档（如 1.5~3.0 步进 0.5）启用动态止损搜索。
+		// English: Phase-3 ATR stop dimension — default single level 0 (disabled, fixed-pct fallback);
+		// multi-level ranges (e.g. 1.5~3.0 step 0.5) enable dynamic ATR-stop search via the API.
+		AtrFrom: 0, AtrTo: 0, AtrStep: 1,
+	}
+}

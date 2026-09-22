@@ -1,0 +1,244 @@
+# nightly-e2e — §UAT-D7（2026-09-16）全栈端到端每日回归
+# 此前 Playwright e2e（web/e2e）从未进 CI：50 条用例只靠本机手工起栈跑，
+# 前端路由/接口契约/交易闭环的回归只能等人工想起来验证。本 job 复刻 UAT 实录栈：
+# qmt-mock(18789) + quant(18080, 独立数据目录) + vite dev(5173, VITE_BACKEND_PORT=18080)，
+# 初始化 admin/tester 账号、装配 QMT 配置、seed 情绪日线，再全量跑 spec。
+# English: nightly full-stack e2e — builds mock+engine+frontend, seeds accounts/config/sentiment,
+# then runs the Playwright suite that previously only existed as a manual drill.
+name: nightly-e2e
+
+on:
+  schedule:
+    # 21:00 北京时间（UTC 13:00），周二~周六 = A股交易日夜检
+    - cron: "0 13 * * 2-6"
+  workflow_dispatch:
+
+jobs:
+  # 唯一 job：拉起"qmt-mock 柜台 + quant 引擎 + vite 前端"三件套后跑 Playwright 全量 spec。
+  # 40 分钟超时兜底：Playwright 卡死/等待期重试风暴时不至于烧满 runner 计费时长。
+  e2e:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    # 全栈环境变量：数据目录隔离（独立于默认路径，避免污染 runner 缓存）、
+    # e2e 专用 admin/tester 双账号、QMT token 与 mock 网关对齐。
+    env:
+      QUANT_DATA_DIR: ${{ github.workspace }}/.uat-data
+      BACKEND: http://127.0.0.1:18080
+      E2E_USER: admin
+      E2E_PASS: Nightly!2026
+      E2E_USER2: tester
+      E2E_PASS2: Tester!2026
+      QMT_TOKEN: uat-secret
+    steps:
+      # 检出代码（Playwright spec 与后端二进制同仓构建）
+      - uses: actions/checkout@v4
+
+      # Go 工具链按 go.mod 声明的版本安装，避免与本地开发环境漂移
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      # Node 20 + npm 缓存（按 web/package-lock.json 命中缓存提速）
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      # Python 3.11 仅用于后续 seed 情绪日线（sqlite3 标准库直插 DB）
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      # 编译 quant 引擎与 qmt-mock 假柜台二进制；数据目录随容器预建
+      - name: Build binaries
+        run: |
+          mkdir -p "$RUNNER_TEMP/bin" "$QUANT_DATA_DIR"
+          go build -o "$RUNNER_TEMP/bin/quant" ./cmd/quant
+          go build -o "$RUNNER_TEMP/bin/qmt-mock" ./cmd/qmt-mock
+
+      # 先起 mock 柜台（:18789）：预置茅台持仓行情 + 1.5s 回报延迟模拟真实柜台节奏；
+      # 轮询 /health 最多 30s，起不来后续步骤会自然失败。
+      - name: Start qmt-mock
+        run: |
+          "$RUNNER_TEMP/bin/qmt-mock" -listen :18789 -token "$QMT_TOKEN" \
+            -server http://127.0.0.1:18080 -delay 1.5s \
+            -seed "600519.SH,贵州茅台,200,1500.00" \
+            > mock.log 2>&1 &
+          for i in $(seq 1 30); do
+            curl -fsS http://127.0.0.1:18789/health >/dev/null 2>&1 && break
+            sleep 1
+          done
+
+      # 起 quant 引擎（:18080）并等 /setup 就绪（200 已初始化 / 405 未初始化均算服务可达）；
+      # 失败时 cat 日志留证，便于在 CI 界面直接看启动期报错。
+      - name: Start engine
+        run: |
+          QUANT_ADDR=:18080 "$RUNNER_TEMP/bin/quant" > engine.log 2>&1 &
+          echo $! > engine.pid
+          for i in $(seq 1 60); do
+            curl -s -o /dev/null -w '%{http_code}' "$BACKEND/setup" | grep -qE '200|405' && break
+            sleep 1
+          done
+          cat engine.log
+
+      - name: Seed accounts + QMT config
+        run: |
+          TOKEN=$(curl -fsS -X POST "$BACKEND/setup" -H 'Content-Type: application/json' \
+            -d "{\"username\":\"$E2E_USER\",\"password\":\"$E2E_PASS\"}" | jq -r .token)
+          echo "ADMIN_TOKEN=$TOKEN" >> "$GITHUB_ENV"
+          curl -fsS -X POST "$BACKEND/api/admin/users" -H "Authorization: Bearer $TOKEN" \
+            -H 'Content-Type: application/json' \
+            -d "{\"username\":\"$E2E_USER2\",\"password\":\"$E2E_PASS2\",\"role\":\"user\"}"
+          # §T-3（20260917 缺陷修复批）：§MT 租户级频控默认 600 次/分钟与全套 Playwright 突发
+          # 互踩（实测第 600 请求准时 429，失败集合随顺序漂移，CI 靠 retries 掩盖迟早漂绿）。
+          # 仅 nightly 的 UAT 栈上调配额；生产默认 600 不动。
+          curl -fsS -X PUT "$BACKEND/api/tenants/t_default" -H "Authorization: Bearer $TOKEN" \
+            -H 'Content-Type: application/json' \
+            -d '{"quota":{"api_rate_per_min":100000}}'
+          # QMT 网关装配：手动模式 + mock 地址（休市时段部分参数重启后才装配生效，下一步统一重启）
+          curl -fsS -X POST "$BACKEND/api/config/qmt" -H "Authorization: Bearer $TOKEN" \
+            -H 'Content-Type: application/json' -d '{
+              "enabled": true, "mode": "manual",
+              "gateway_url": "http://127.0.0.1:18789", "token": "uat-secret",
+              "price_type": "limit", "max_positions": 5, "fixed_amount": 20000,
+              "initial_capital": 500000, "daily_max_buys": 3,
+              "daily_budget_amount": 100000, "max_order_amount": 50000,
+              "miss_heartbeat_sec": 120,
+              "sell_unified_mode": "shadow"
+            }'
+
+      - name: Seed market_risk_daily（情绪回看用例依赖）
+        # 休市时段引擎不会自行落情绪行情 → 用 sqlite 直插今昨两天记录：
+        # 昨日"偏冷/yellow"、今日"中性/green"，供 e2e 的情绪回看/风险档用例断言。
+        run: |
+          python - <<'PY'
+          import os, sqlite3
+          db = sqlite3.connect(os.path.join(os.environ["QUANT_DATA_DIR"], "trading.db"))
+          from datetime import date, timedelta
+          d0 = date.today().strftime("%Y%m%d")
+          d1 = (date.today() - timedelta(days=1)).strftime("%Y%m%d")
+          for d, emo, tier in ((d1, "偏冷", "yellow"), (d0, "中性", "green")):
+              db.execute(
+                  "INSERT OR REPLACE INTO market_risk_daily(trade_date,emotion,market_state,risk_tier,reasons,up_ratio,break_rate,max_pos_pct,limit_up_count,ladder_height) "
+                  "VALUES (?,?,?,?,?,?,?,?,?,?)",
+                  (d, emo, "震荡", tier, "nightly seed", 0.55, 0.12, 0.6, 30, 4))
+          db.commit()
+          print("seeded rows:", db.execute("SELECT COUNT(*) FROM market_risk_daily").fetchone()[0])
+          # §D-1（GAP_VERIFY_20260917_PM）夜研报告 seed：paper_research_reports 一条最小报告
+          # （D-1 e2e 用例断言"弹窗打开+日期条渲染"，正文形状与 researchd 产出一致）。
+          # §FIX-20260918（UAT_FULLCHAIN_VERIFY P1-CI1）：auth 已迁 auth.json（internal/auth/auth.go:232），
+          # trading.db 不再有 users 表——旧 SQL "SELECT id FROM users" 在本机复刻时实测
+          # sqlite3.OperationalError: no such table: users，夜检 CI 必红。改从 auth.json 取 admin id。
+          # English: users now live in auth.json, not trading.db — read the admin id from there.
+          import json as _json
+          auth = _json.load(open(os.path.join(os.environ["QUANT_DATA_DIR"], "auth.json")))
+          admin_id = next(u["id"] for u in auth["users"] if u.get("role") == "admin")
+          rep = {"generated_at": d0, "trades": [{"strategy_type": "dragon", "side": "buy", "count": 2,
+                 "total_amount": 40000.0, "avg_price": 10.5, "avg_slippage": 0.12, "avg_latency": 2.0}],
+                 "daily": [], "attribution": [], "emotion": {"days": 2, "last_phase": "中性", "phase_days": {}}}
+          # 读端 GET /api/research/paper-reports 走 researchDB=trading.db（server.go:147/455 实证）
+          db.execute("INSERT OR REPLACE INTO paper_research_reports(date,user_id,summary_json,created_at) VALUES (?,?,?,datetime('now'))",
+                     ("2026-09-17", admin_id, _json.dumps(rep)))
+          db.commit()
+          print("seeded reports:", db.execute("SELECT COUNT(*) FROM paper_research_reports").fetchone()[0])
+          PY
+
+      # §FIX-8(20260919) 模拟盘持仓 seed：nightly 此前从不建仓 → uat_full 的手动卖出分支永远 skip，
+      # P0 手/股错位正是在这条"永远绿"的缝里隐形的。开总开关 + 两笔手动买入（qty=股数契约，§FIX-1），
+      # 当日 filled_at 的 T+1 问题由下一步"隔日改写"解决。runner 一次性，跑完无需 reset。
+      - name: Seed paper positions
+        run: |
+          curl -fsS -X POST "$BACKEND/api/paper/config" -H "Authorization: Bearer $ADMIN_TOKEN" \
+            -H 'Content-Type: application/json' -d '{"enabled": true, "auto_sell": false}'
+          for p in '600000.SH|浦发银行|10|500' '000001.SZ|平安银行|12|200'; do
+            IFS='|' read -r code name price qty <<< "$p"
+            curl -fsS -X POST "$BACKEND/api/paper/buy" -H "Authorization: Bearer $ADMIN_TOKEN" \
+              -H 'Content-Type: application/json' \
+              -d "{\"code\":\"$code\",\"name\":\"$name\",\"strategy\":\"手动\",\"price\":$price,\"qty\":$qty}"
+          done
+          curl -fsS "$BACKEND/api/paper/positions" -H "Authorization: Bearer $ADMIN_TOKEN" \
+            | jq -e 'length == 2'
+
+      - name: Restart engine（QMT 配置装配生效）
+        # kill 旧进程后带新数据目录重启：休市时段写入的 QMT 配置/lower 配额随重启装配；
+        # 用带 admin token 的 /api/health 探活，比首启的 /setup 更严格。
+        # §FIX-8：停机窗口内把 paper.json 持仓 filled_at 隔日改写（北京时区 -2 天），
+        # 引擎重启 load() 后即"昨日建仓"——卖出分支不再被 T+1 拦截（只动 CI 临时账本）。
+        run: |
+          kill "$(cat engine.pid)" 2>/dev/null || true
+          sleep 2
+          python - <<'PY'
+          import glob, json, os
+          from datetime import datetime, timedelta, timezone
+          # 账本按账号落盘（$QUANT_DATA_DIR/accounts/<uid>/paper.json），逐文件改写持仓 filled_at
+          files = glob.glob(os.path.join(os.environ["QUANT_DATA_DIR"], "accounts", "*", "paper.json"))
+          old = (datetime.now(timezone(timedelta(hours=8))) - timedelta(days=2)).isoformat()
+          n = 0
+          for path in files:
+              st = json.load(open(path))
+              positions = st.get("positions") or {}
+              for p in positions.values():
+                  p["filled_at"] = old
+                  n += 1
+              if positions:
+                  json.dump(st, open(path, "w"))
+          print("backdated positions:", n, "files:", len(files))
+          PY
+          QUANT_ADDR=:18080 "$RUNNER_TEMP/bin/quant" > engine2.log 2>&1 &
+          echo $! > engine.pid
+          for i in $(seq 1 60); do
+            curl -s -o /dev/null -w '%{http_code}' "$BACKEND/api/health" -H "Authorization: Bearer $ADMIN_TOKEN" | grep -q 200 && break
+            sleep 1
+          done
+
+      - name: Install web deps + Playwright browser
+        working-directory: web
+        # npm ci 严格按 lockfile 安装；--with-deps 顺带装 chromium 系统依赖（Ubuntu 缺库会白屏）
+        run: |
+          npm ci
+          npx playwright install --with-deps chromium
+
+      - name: Start frontend (vite dev)
+        # 用 vite dev 而非 build+preview：与 UAT 实录口径一致且省构建时间；
+        # VITE_BACKEND_PORT 指向 :18080 引擎；--strictPort 保证探活端口即真实服务端口。
+        run: |
+          cd web
+          VITE_BACKEND_PORT=18080 npx vite --port 5173 --strictPort > ../vite.log 2>&1 &
+          echo $! > ../vite.pid
+          for i in $(seq 1 60); do
+            curl -fsS http://127.0.0.1:5173 >/dev/null 2>&1 && break
+            sleep 1
+          done
+
+      # 全量跑 web/e2e Playwright spec（配置内自带 retries/trace，失败可上传回放）
+      # §FIX-8：skip 视为黄牌——本 job 已有 paper 持仓 seed，卖出分支再 skip 即 seed 覆盖退化信号，
+      # 在 CI 界面显式告警而不是无声放过（历史教训：手/股 P0 就藏在"永远 skip"的分支里）。
+      - name: Playwright 全量 e2e
+        working-directory: web
+        run: |
+          set +e
+          npx playwright test 2>&1 | tee pw.log
+          status=${PIPESTATUS[0]}
+          if grep -qE '[0-9]+ skipped' pw.log; then
+            echo "::warning title=FIX-8-skip-yellow-card::存在 skipped 用例——seed 覆盖可能退化，请核对（历史假绿源：卖出分支常年 skip）"
+          fi
+          exit $status
+
+      # 仅失败时上传：Playwright 报告/trace + 三件套全量日志，供夜间失败次日取证回放
+      - name: Upload report artifacts（失败时取证）
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: nightly-e2e-report
+          path: |
+            web/playwright-report/
+            web/test-results/
+            mock.log
+            engine.log
+            engine2.log
+            vite.log
+          if-no-files-found: ignore

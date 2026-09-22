@@ -1,0 +1,183 @@
+// Package data 提供行情数据获取、多数据源协调、情绪面分析、筹码分析、板块扫描等核心数据能力。
+// 所有行情 API 调用均通过 net/http 直连，不引入第三方行情库。
+// Package data provides core data capabilities: quoting, multi-source coordination,
+// sentiment, chips and sector scanning. All market calls go direct via net/http
+// without third-party market libraries.
+package data
+
+import "time"
+
+// StockInfo 个股实时行情快照。
+// 由多数据源（东方财富 push2、新浪、同花顺）统一填充，缺失字段留零值。
+// StockInfo is a realtime quote snapshot filled uniformly across sources
+// (EastMoney push2, Sina, THS); missing fields remain zero-valued.
+type StockInfo struct {
+	Code      string  `json:"code"`       // 股票代码（如 "600519"）
+	Name      string  `json:"name"`       // 股票名称
+	Price     float64 `json:"price"`      // 当前价（元）
+	Open      float64 `json:"open"`       // 今日开盘价（元）
+	High      float64 `json:"high"`       // 当日最高价（元）
+	Low       float64 `json:"low"`        // 当日最低价（元）
+	Close     float64 `json:"close"`      // 最新价 / 昨收价（依数据源而定）——历史歧义字段，见 PrevClose
+	PrevClose float64 `json:"prev_close"` // §P1-5（2026-09-15）昨收价（元），>0 才可信。历史各数据源把昨收
+	// 混塞进 Close（Close 语义"依数据源而定"），风控闸 checkLimitPrice 的涨跌停判定以 PrevClose
+	// 为基准，基准歧义会让闸门"现价再涨 9.9% 才拦"或反向误拦。装配点逐源填充真实昨收；
+	// 消费方一律 PrevClose>0 优先、回退旧 Close 字段（向后兼容未改造的装配点）。
+	Volume    float64 `json:"volume"`     // 成交量（股）
+	Amount    float64 `json:"amount"`     // 成交额（元）
+	ChangePct float64 `json:"change_pct"` // 涨跌幅（%，如 1.23 表示 +1.23%）
+	Turnover  float64 `json:"turnover"`   // 换手率（%，如 5.67 表示 5.67%）
+	NetInflow float64 `json:"net_inflow"` // 主力净流入（元），东方财富口径
+	// HasFlow §FIX-9e(20260919)：NetInflow 是否真由数据源返回。东财口径下"净流入=0"是
+	// 合法实测值（超大+大单买卖完全对冲），旧消费方以 NetInflow==0 判"源未返回"会把
+	// 真 0 误报成"数据源未返回"，诱导模型说"没有数据"。缺数=false、有数=true（含 0）。
+	HasFlow bool   `json:"has_flow"`
+	Sector  string `json:"sector"` // 所属板块名称
+}
+
+// KLine K 线数据。
+// Date 为交易日，其余字段含义与 StockInfo 同名字段一致。
+// KLine represents OHLCV data; Date is the trading day and the other fields
+// share the same meaning as their same-named StockInfo fields.
+type KLine struct {
+	Date   time.Time `json:"date"`   // 交易日
+	Open   float64   `json:"open"`   // 开盘价（元）
+	High   float64   `json:"high"`   // 最高价（元）
+	Low    float64   `json:"low"`    // 最低价（元）
+	Close  float64   `json:"close"`  // 收盘价（元）
+	Volume float64   `json:"volume"` // 成交量（股）
+	Amount float64   `json:"amount"` // 成交额（元）
+}
+
+// KLineClose 提取 K 线收盘价，用于策略指标计算（如 MA、EMA）。
+// KLineClose extracts the closing price, used by strategy indicators (MA/EMA).
+func KLineClose(k KLine) float64 { return k.Close }
+
+// KLineHigh 提取 K 线最高价。
+// KLineHigh extracts the high price.
+func KLineHigh(k KLine) float64 { return k.High }
+
+// KLineLow 提取 K 线最低价。
+// KLineLow extracts the low price.
+func KLineLow(k KLine) float64 { return k.Low }
+
+// KLineOpen 提取 K 线开盘价。
+// KLineOpen extracts the open price.
+func KLineOpen(k KLine) float64 { return k.Open }
+
+// KLineVolume 提取 K 线成交量。
+// KLineVolume extracts the volume.
+func KLineVolume(k KLine) float64 { return k.Volume }
+
+// SectorInfo 板块行情快照。
+// 来源于东方财富行业板块行情列表，包含涨跌幅、涨停家数、资金流向等。
+// SectorInfo is a sector quote snapshot sourced from the EastMoney industry list,
+// including change pct, limit-up count and money flow.
+type SectorInfo struct {
+	Code       string  `json:"code"`                 // 板块代码（BKXXXX）
+	Name       string  `json:"name"`                 // 板块名称（如 "半导体"）
+	ChangePct  float64 `json:"change_pct"`           // 板块涨跌幅（%）
+	LimitupCnt int     `json:"limitup_cnt"`          // 板块内涨停家数
+	VolumeRank int     `json:"volume_rank"`          // 成交量排名
+	Amount     float64 `json:"amount"`               // 板块总成交额（元）
+	Gain2d     float64 `json:"gain_2d"`              // 两日涨幅（%）
+	EventDesc  string  `json:"event_desc,omitempty"` // 事件描述（D1 匹配结果，空时省略）
+	NetInflow  float64 `json:"net_inflow,omitempty"` // 主力净流入（东财口径，元）
+}
+
+// EmotionData 市场情绪综合数据。
+// 用于六阶段情绪判断（冰点/启动/发酵/高潮/背离/退潮）。
+// EmotionData aggregates market-sentiment data used to judge the six-stage
+// sentiment cycle (freeze/start/ferment/climax/divergence/ebb).
+type EmotionData struct {
+	Stage       string  `json:"stage"`        // 情绪阶段名称："冰点"/"启动"/"发酵"/"高潮"/"背离"/"退潮"
+	LimitupCnt  int     `json:"limitup_cnt"`  // 涨停家数（含新股）
+	BoardHeight int     `json:"board_height"` // 连板高度（最高连板数）
+	BlastRate   float64 `json:"blast_rate"`   // 炸板率（%），炸板数/(涨停+炸板)
+	UpCount     int     `json:"up_count"`     // 上涨家数
+	DownCount   int     `json:"down_count"`   // 下跌家数
+	IndexPrice  float64 `json:"index_price"`  // 上证指数当前价
+	IndexMA20   float64 `json:"index_ma20"`   // 上证指数 20 日均线
+}
+
+// CapitalFlow 资金流向数据。
+// 按超大单/大单/中单/小单分维度统计，来源于东方财富。
+// CapitalFlow is capital-flow data broken down by order size (super-large/large/
+// medium/small), sourced from EastMoney.
+type CapitalFlow struct {
+	Code          string  `json:"code"`            // 股票代码
+	NetInflow     float64 `json:"net_inflow"`      // 主力净流入（元），超大单+大单净流入
+	SuperLargeIn  float64 `json:"super_large_in"`  // 超大单流入（元），>=500 万元
+	SuperLargeOut float64 `json:"super_large_out"` // 超大单流出（元）
+	LargeIn       float64 `json:"large_in"`        // 大单流入（元），>=100 万元且 <500 万元
+	LargeOut      float64 `json:"large_out"`       // 大单流出（元）
+	MediumIn      float64 `json:"medium_in"`       // 中单流入（元），>=20 万元且 <100 万元
+	MediumOut     float64 `json:"medium_out"`      // 中单流出（元）
+	SmallIn       float64 `json:"small_in"`        // 小单流入（元），<20 万元
+	SmallOut      float64 `json:"small_out"`       // 小单流出（元）
+
+	// 四档**净额**（元，= 流入 − 流出）。§修复 EM-FFLOW(20260920)：
+	// 东财 fflow 实际只返回净额（6 列：日期 + 主力/小/中/大/超大 净额），**不返回** 流入/流出对，
+	// 故 In/Out 两列在该源上恒为空，只有 Net 列有值。消费方必须读 Net，不能用 In−Out 反推
+	// （那会恒得 0）。hithink 第二源同时有 in/out，落库时一并把 Net 算好，两源口径统一。
+	// Per-bucket NET (CNY). EastMoney's fflow only returns nets (6 columns), so In/Out stay zero
+	// there and consumers must read Net instead of deriving In-Out (which would always be 0).
+	SuperLargeNet float64 `json:"super_large_net"` // 超大单净流入（元）
+	LargeNet      float64 `json:"large_net"`       // 大单净流入（元）
+	MediumNet     float64 `json:"medium_net"`      // 中单净流入（元）
+	SmallNet      float64 `json:"small_net"`       // 小单净流入（元）
+
+	Time time.Time `json:"time"` // 数据获取时间
+}
+
+// NewsItem 财经快讯 / 新闻条目。
+// 可来自东方财富快讯、新浪财经、Tushare 新闻等源。
+// NewsItem is a financial flash-news entry, possibly sourced from EastMoney,
+// Sina Finance, Tushare, etc.
+type NewsItem struct {
+	Title          string   `json:"title"`                  // 新闻标题
+	Content        string   `json:"content,omitempty"`      // 正文摘要（可能为空）
+	URL            string   `json:"url,omitempty"`          // 原文链接（用于正文抓取）
+	Datetime       string   `json:"datetime"`               // 发布时间字符串
+	Source         string   `json:"source"`                 // 来源标识（如 "东方财富""新浪财经""上市公司公告"）
+	SentimentScore float64  `json:"sentiment_score"`        // LLM 情感得分(0~1, 0.5=中性), 0表示未分析
+	Sentiment      string   `json:"sentiment,omitempty"`    // LLM 情感倾向 正面/负面/中性
+	ImpactLevel    string   `json:"impact_level,omitempty"` // 影响程度 高/中/低
+	EventType      string   `json:"event_type,omitempty"`   // 事件类型 政策/财报/行业/公司/宏观/事件驱动
+	Urgency        string   `json:"urgency,omitempty"`      // 紧急程度 立即/关注/观察
+	Direction      string   `json:"direction,omitempty"`    // 方向 利好/利空/中性
+	Sectors        []string `json:"sectors,omitempty"`      // 关联板块
+	Stocks         []string `json:"stocks,omitempty"`       // 关联个股
+	Strategy       string   `json:"strategy,omitempty"`     // 匹配策略
+	Reason         string   `json:"reason,omitempty"`       // 分析理由
+}
+
+// IPOEvent 新股日历事件。
+// IPOEvent is an IPO-calendar event (subscription/listing).
+type IPOEvent struct {
+	Code        string  `json:"code"`         // 股票代码（6位）
+	Name        string  `json:"name"`         // 股票名称
+	IPODate     string  `json:"ipo_date"`     // 申购日期 YYYYMMDD
+	ListingDate string  `json:"listing_date"` // 上市日期 YYYYMMDD
+	IssuePrice  float64 `json:"issue_price"`  // 发行价（元）
+	ListStatus  string  `json:"list_status"`  // L=已上市 U=未上市
+	Sector      string  `json:"sector"`       // 所属板块名称（IPO时可能空缺）
+}
+
+// FinancialInfo 个股基本面指标。
+// 用于风控筛选和估值判断，仅包含可量化的关键财务字段。
+// FinancialInfo holds quantifiable fundamentals used for risk screening
+// and valuation judgment.
+type FinancialInfo struct {
+	Code            string  `json:"code"`                   // 股票代码
+	IsST            bool    `json:"is_st"`                  // 是否 ST/*ST 股票
+	HasPenalty12m   bool    `json:"has_penalty_12m"`        // 近 12 个月是否有违规处罚
+	GoodwillRatio   float64 `json:"goodwill_ratio"`         // 商誉占净资产比例
+	PledgeRatio     float64 `json:"pledge_ratio"`           // 股权质押比例
+	ConsecutiveLoss int     `json:"consecutive_loss_years"` // 连续亏损年数
+	UnlockRatio30d  float64 `json:"unlock_ratio_30d"`       // 未来 30 天解禁比例
+	PE              float64 `json:"pe"`                     // 市盈率
+	PB              float64 `json:"pb"`                     // 市净率
+	ROE             float64 `json:"roe"`                    // 净资产收益率（%）
+	MarketCap       float64 `json:"market_cap"`             // 总市值（元）
+}

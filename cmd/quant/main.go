@@ -1,0 +1,1034 @@
+// 文件概述（cmd/quant/main.go）
+// ─────────────────────────────────────────────────────────────────────────────
+// 本文件是 quant-trading-v2 量化交易系统的【进程入口】，负责整个引擎进程的
+// 组装、启动与生命周期管理：
+//
+//  1. 进程级环境准备：强制 Asia/Shanghai 时区（交易时段判断依赖 time.Local）、
+//     初始化数据目录与每日运维日志（opslog）。
+//  2. 组件装配（按依赖顺序）：认证管理 → 行情 API（东财/同花顺/hithink 降级链）→
+//     事件匹配器 → 配置管理器（含热重载）→ LLM 客户端（未配 Key 自动降级）→
+//     新闻代理 → 策略引擎 → 板块扫描 → 报告/自选/持仓追踪 → HTTP 服务 →
+//     模拟盘 → 研究库/实盘账本（trading.db / live.db）→ 推送器（桌面/网关/ntfy）→
+//     5s 实时行情采集 → 多账号引擎注册表 → 实时触发引擎。
+//  3. 双层调度循环：
+//     - 近实时打分循环（默认 5s 节拍）：驱动所有账号引擎打分，休市时降频并执行
+//     交易日滚动清空、盘后复盘、监控池同步；
+//     - 主循环（main for-loop）：按市场时段（盘前/午前/盘中）异步驱动顶层编排
+//     引擎，盘前"跑完即排下一轮"，盘中用自适应等待（新新闻到达或超时兜底）。
+//  4. 信号处理与优雅停机：捕获 SIGTERM/SIGINT，先关 HTTP、停触发引擎与采集器、
+//     停新闻代理，再退出，保证状态文件完整落盘（不再走 defer 链）。
+//  5. 辅助函数：部署自检（verifyDeployment）、时段追回起点计算（sinceForSession）、
+//     数据目录解析（getDataDir）、端口绑定（pickListener）、密钥脱敏（redact）等。
+//
+// 所有后台常驻 goroutine（行情采集/触发引擎/打分循环）均通过 defer 或 ctx cancel
+// 与进程退出路径对齐；HTTP 监听采用 fail-fast 策略（端口被占即退出，防双实例写库）。
+//
+// Package main 量化交易系统入口：初始化所有模块（认证、行情、策略、板块、新闻、风控），
+// 按市场时段循环驱动顶层编排引擎。
+package main
+
+import (
+	"context"
+	"log"
+	"net"
+	"net/http"
+	"os"
+	"os/signal"
+	"path/filepath"
+	"strconv"
+	"strings"
+	"sync"
+	"syscall"
+	"time"
+	_ "time/tzdata" // §TZ1 内嵌 IANA 时区库：Windows/精简容器保证 Asia/Shanghai 可加载
+
+	"quant-trading-v2/internal/auth"
+	"quant-trading-v2/internal/config"
+	"quant-trading-v2/internal/data"
+	"quant-trading-v2/internal/display"
+	"quant-trading-v2/internal/engine"
+	"quant-trading-v2/internal/llm"
+	"quant-trading-v2/internal/llmcfg"
+	"quant-trading-v2/internal/newsagent"
+	"quant-trading-v2/internal/notify"
+	"quant-trading-v2/internal/opslog"
+	"quant-trading-v2/internal/paper"
+	"quant-trading-v2/internal/report"
+	"quant-trading-v2/internal/sector_agent"
+	"quant-trading-v2/internal/server"
+	"quant-trading-v2/internal/store"
+	"quant-trading-v2/internal/strategy_engine"
+	"quant-trading-v2/internal/trading"
+	"quant-trading-v2/internal/trigger"
+)
+
+// buildCommit 构建期注入的 git 提交指纹（-ldflags "-X main.buildCommit=$(git rev-parse --short HEAD)"）。
+// 未注入时显示 "unknown"——用于 §R6 P1-1 部署漂移自检：日志/告警可据此判断线上二进制与代码头是否一致
+// （2026-09-01 实录：广州旧二进制缺 d09c07a 执行器重建修复，开关打开引擎仍用 Noop executor）。
+// 相较仅靠文件时间戳/大小，短 SHA 可与本地 git 直接比对，瞬间定位漂移。
+// English: git short-SHA stamped at build time via -ldflags; "unknown" when not injected. Used by the
+// §R6 P1-1 deployment-drift self-check to detect a binary running behind its source commit.
+var buildCommit = "unknown"
+
+// main 系统入口：初始化数据目录、认证、行情 API、LLM、新闻代理、策略引擎等所有组件，
+// 然后进入主循环，每 5 分钟驱动一次顶层编排引擎（engine.Engine）。
+func main() {
+	// §启动顺序 0：日志带文件:行号，便于多 goroutine 场景下定位输出来源；打印构建指纹。
+	log.SetFlags(log.LstdFlags | log.Lshortfile)
+	log.Printf("[deploy] 二进制构建指纹: buildCommit=%s（未注入显示 unknown，用于比对代码头是否一致）", buildCommit)
+
+	// 时区加固：全部交易时段判断基于 time.Local（如 CurrentSession / 主循环 sinceForSession），
+	// 服务器若在海外（如首尔 KST=UTC+9）或系统默认 UTC，会导致开盘/收盘/盘前窗口整体偏移。
+	// 统一强制 Asia/Shanghai（北京时间，A 股交易时区）；仅当外部显式设置 TZ 环境变量时遵循外部值。
+	// systemd 侧同时设置 TZ=Asia/Shanghai 双保险。
+	// English: force Asia/Shanghai as process timezone so trading-session windows (which read time.Local)
+	// align with A-share trading hours even on overseas hosts (e.g. Seoul KST) or UTC-default Ubuntu.
+	// An explicit external TZ env var overrides this default.
+	if os.Getenv("TZ") == "" {
+		os.Setenv("TZ", "Asia/Shanghai")
+		if loc, err := time.LoadLocation("Asia/Shanghai"); err == nil {
+			time.Local = loc
+		}
+		log.Printf("[main] 进程时区已固定为 Asia/Shanghai (北京时间), 当前 %s", time.Now().Format("2006-01-02 15:04:05 -07:00"))
+	}
+
+	// 数据目录：存放认证、配置、报告、自选等持久化文件
+	dataDir := getDataDir()
+	os.MkdirAll(dataDir, 0755)
+
+	// §DAILY_OPSLOG 每日系统运行日志：quant/research 双进程共写的按日核心记录
+	// （订单/成交/对账/熔断/任务生命周期……策划性低频事件），详见 internal/opslog 包注释。
+	// 独立 opslog 子目录：数据目录根已很拥挤，日志按天集中收纳便于巡检与整体备份。
+	opslog.Init(filepath.Join(dataDir, "opslog"), 0)
+	opslog.Logf("quant", "引擎进程启动 dataDir=%s tz=%s", dataDir, time.Local.String())
+
+	// 认证管理：初始化用户库。§GAP2-W1 移除"首次启动自动创建 admin/admin123"——
+	// 全世界都知道的弱口令在公网等于无门；现在全新部署必须走 POST /setup 原子初始化
+	// （SetupInitialAdmin 单临界区完成检查+建号+标记，防并发双 admin），由部署者自设强口令。
+	// 存量部署不受影响：已有用户的库 IsInitialized()==true，行为与此前一致。
+	authMgr := auth.NewManager(dataDir)
+	if err := authMgr.Init(); err != nil {
+		log.Fatalf("auth init: %v", err)
+	}
+	if !authMgr.IsInitialized() {
+		log.Printf("全新部署：请打开 http://<host>:8080/setup 创建管理员账号（不再提供默认口令 admin/admin123）")
+	}
+
+	// 行情客户端：东财行情 API + 同花顺板块出口（板块列表/涨跌幅/主力净流入）
+	marketAPI := data.NewMarketAPI()
+	thsClient := data.NewTHSClient() // 同花顺出口（板块列表/涨跌幅/主力净流入、个股换手率）
+	// §QUOTE-CHAIN(20260920)：把同花顺注入行情客户端，使其成为**咨询页行情链首选源**。
+	// 换手率只有同花顺（免费）能提供，东财 push2 不可达时旧链会退到新浪从而丢掉该字段。
+	marketAPI.SetTHSClient(thsClient)
+
+	// 事件匹配器：加载左侧事件规则（config/events_leftside.yaml），失败时禁用事件匹配
+	var matcher *data.EventMatcher
+	eventsCfg, err := data.LoadEvents("config/events_leftside.yaml")
+	if err == nil {
+		matcher = data.NewEventMatcher(eventsCfg)
+	}
+
+	// 配置管理器：读取数据目录下的 config.json（策略/风控/情绪/LLM 等）
+	cfgMgr := config.NewManager(filepath.Join(dataDir, "config.json"))
+	// §启动顺序 1：配置存储挂载。§UI-AUTHORITATIVE 修复：配置存储（trading.db KV）必须在下方 LLM 启动装配【之前】挂好，
+	// 否则 StoredLLMConfig 恒为 false，设置页保存的运营配置在重启后无法恢复（被 env 顶掉）。
+	// server.New 内部会再次 SetStore（幂等赋值，无副作用）。
+	cfgMgr.SetStore(authMgr)
+	// 运营数据统一归属管理员：把管理员账号 ID 注入配置管理器，使量化/模拟盘/策略/D1/LLM/
+	// 做多空等配置与持仓/告警等数据系统级共享，后端按角色鉴权（子账号只读公开部分）。
+	cfgMgr.SetOperatorID(authMgr.AdminID())
+	// §P1-6 配置热重载：每分钟轮询 config.json，内容变更自动重载（无需重启）。
+	cfgMgr.Watch(context.Background(), 60*time.Second)
+
+	// §数据源路由装配（§HITHINK_DATA_SOURCE_PLAN）：primary_source=hithink 时回测取数优先 ths_ 表。
+	// 两个包级开关是回测/存储层读取数据源的路由信号，由 config.json 的 rules.data 段驱动。
+	store.PrimarySourceThsDaily = strings.EqualFold(cfgMgr.Rules.Data.PrimarySource, "hithink")
+	store.ThsFactorsReady = cfgMgr.Rules.Data.ThsFactorsReady
+
+	// §GAP3.1 运行时交易日历：后台拉取法定节假日/临时休市日（失败按周末口径兜底，不阻断启动）。
+	data.LoadTradingCalendarAsync()
+
+	// LLM 配置解析统一走 §UI-AUTHORITATIVE 权威链（UI 保存 > env > 全局auth > config.json），
+	// 与 cmd/backtest、cmd/news_signal_latency 共用 internal/llmcfg，杜绝各入口口径分叉。
+	llmCfg := llmcfg.Resolve(cfgMgr, authMgr)
+
+	// LLM 客户端：未配置 API Key 时降级为纯关键词分析（新闻归因不可用）
+	// §启动顺序 2：llmCfg 已按权威链解析完毕，此处仅在有可用 Key 时才创建客户端。
+	var llmClient *llm.Client
+	if len(llmCfg.APIKeys) > 0 {
+		llmClient = llm.New(llmCfg)
+	} else {
+		log.Println("[LLM] 未配置 API Key，LLM 功能不可用")
+	}
+
+	// 启动前 LLM 通道预检：尽早暴露 key 失效/断网问题，避免盘前才被发现
+	if llmClient != nil {
+		if err := llmClient.Ping(); err != nil {
+			log.Printf("[LLM] 启动预检失败(将降级运行): %v", err)
+		} else {
+			log.Printf("[LLM] 启动预检通过")
+		}
+	}
+
+	// 股票清洗器：负责股票代码/名称归一化，供新闻归因与板块扫描使用
+	cleaner := data.NewStockCleaner(marketAPI)
+
+	// 新闻代理：聚合新闻 + LLM 归因分析，后台常驻运行
+	nAgent := newsagent.New(marketAPI, llmClient, cleaner, dataDir)
+	nAgent.Start()
+	defer nAgent.Stop()
+
+	// 策略引擎：注册四大战法策略（龙头/双响炮/N形/龙回头）
+	strategyEngine := strategy_engine.New(marketAPI)
+	strategyEngine.SetTHS(thsClient)
+
+	// 板块扫描器 + RPS 强度管理器：板块→个股传播与验证
+	scanner := data.NewSectorScanner(marketAPI, matcher)
+	scanner.SetSectorSource(thsClient) // 板块成分股：同花顺优先，东财兜底
+	strategyEngine.SetScanner(scanner)
+	rpsMgr := data.NewRPSManager()
+	sAgent := sector_agent.New(scanner, rpsMgr)
+
+	// 报告 / 前端聚合 / 自选股 / 持仓追踪等数据服务
+	rpt := report.New(filepath.Join(dataDir, "report.json"))
+	agg := display.New()
+	wlMgr := data.NewWatchlistManager(dataDir)
+	stockTracker := data.NewStockTracker(filepath.Join(dataDir, "tracked_stocks.json"))
+
+	// HTTP 服务：认证/前端/报告/自选股 + SSE 实时推送
+	// §启动顺序 3：先把服务端骨架建起来，随后逐步注入依赖（缓存目录/LLM 运行态/采集器/引擎注册表等）。
+	srv := server.New(authMgr, agg, cfgMgr, rpt, marketAPI, wlMgr, thsClient)
+	srv.SetCacheDir(dataDir) // 看板快照落盘，休市/重启后前端仍有最近一次有效数据
+	// §A7（20260918 审计批）：把构建期 git 指纹注入 HTTP 层，随 /api/status 的 build_commit
+	// 下发，供前端（尤其 APK 内嵌 assets）比对本地构建版本、过期即横幅告警。
+	// English: §A7 — pass the build-time git fingerprint to the server so /api/status reports it.
+	srv.SetBuildCommit(buildCommit)
+	// 计算"生效模型名"用于展示与运行态注入：LLM 配置未显式指定模型时回退包级默认模型。
+	effModel := llmCfg.Model
+	if effModel == "" {
+		effModel = llm.DefaultModel
+	}
+	srv.SetRuntimeLLM(llmCfg.APIURL, effModel)
+	// 密钥池规模统计：仅在 LLM 客户端存在时才有意义（未配置 Key 时为 0），仅用于启动日志展示。
+	poolN := 0
+	if llmClient != nil {
+		poolN = llmClient.KeyCount()
+	}
+	log.Printf("[LLM] 运行模型: %s @ %s (生效密钥池 %d 把)", effModel, llmCfg.APIURL, poolN)
+
+	// 模拟盘（纸面交易）：独立于真实持仓的虚拟撮合/净值/信号质量统计。
+	// 开启后引擎按实时快照价自动撮合 buy 信号；config.json 的 rules.paper 控制开关与参数。
+	// English: paper trading — virtual fills/net-value/signal-quality stats isolated from the real book.
+	// When enabled, the engine auto-fills buy signals at the live snapshot price; rules.paper in
+	// config.json controls the switch and parameters.
+	paperCfg := cfgMgr.Rules.Paper
+	// §F-4（20260917 缺陷修复批）装配逻辑收敛到 paper.ConfigFromRules（零值归一口径不变），
+	// 与 POST /api/paper/config 热更新共用同一构建器，消灭"只有重启才生效"的独一份内联。
+	paperEngine := paper.New(paper.ConfigFromRules(paperCfg), filepath.Join(dataDir, "paper.json"))
+	srv.SetPaper(paperEngine)
+	if paperEngine.Enabled() {
+		log.Printf("[paper] 模拟盘已启用: 每票%.0f元 上限%d仓 初始%.0f元",
+			paperEngine.Cfg().FixedAmount, paperEngine.Cfg().MaxPositions, paperEngine.Cfg().InitialCapital)
+	} else {
+		log.Printf("[paper] 模拟盘未启用（rules.paper.enabled=false）")
+	}
+
+	// B5 研究闭环：研究库与实时库同目录，web 审批端点读写候选、应用权重。
+	// 同时把研究库作为实盘财务因子数据源（SetFinaLookup：把最新财务指标注入 StockMarketData，
+	// 供实盘因子战法对 ROE/净利同比等财务类因子打分）。
+	// 也是实盘账本（AUTO_TRADING_PLAN M1）存储：real_positions/orders/fills 供 QMT 控制器存取。
+	// English: the research DB (same dir as live) backs the B5 approval endpoints, serves as the live
+	// financial source (SetFinaLookup injects latest financials into StockMarketData so the live factor
+	// strategy can score financial factors like ROE/YoyNetProfit), and hosts the real book
+	// (AUTO_TRADING_PLAN M1) — real_positions/orders/fills for the QMT controller.
+	researchDB, dbErr := store.Open(filepath.Join(dataDir, "trading.db"))
+	if researchDB != nil && dbErr == nil {
+		srv.SetResearch(researchDB, dataDir)
+		// §RFIX-4 启动恢复：backtest_jobs 残留 running 僵尸行标 interrupted（上次进程崩溃/
+		// 重启遗留）。MarkRunningInterrupted 此前是死代码——research_tasks 的启动接管只覆盖
+		// 任务队列表，backtest_jobs 表恢复职责丢失（生产 id=3 自 08-21 挂 running）。
+		// 与 researchd 侧双写幂等（同一 trading.db，UPDATE WHERE status='running'）。
+		if n, merr := researchDB.MarkRunningInterrupted(); merr != nil {
+			log.Printf("[research] backtest_jobs 启动恢复失败(忽略): %v", merr)
+		} else if n > 0 {
+			log.Printf("[research] backtest_jobs 启动恢复：%d 个遗留 running 回放作业标记为 interrupted", n)
+			opslog.Logf("engine", "backtest_jobs 启动恢复 %d 个遗留 running 为 interrupted", n)
+		}
+		// 实盘财务因子查询：取研究库 fina_indicator 最新报告期（点对时）作为该股财务指标。
+		// 带进程内 TTL 缓存，避免 5s 打分循环反复查库；缓存缺失/过期时读库。
+		finaCache := newFinaCache(researchDB)
+		strategyEngine.SetFinaLookup(finaCache.Lookup)
+		log.Printf("[research] 研究库已接入（含实盘财务因子）: %s", filepath.Join(dataDir, "trading.db"))
+	} else if dbErr != nil {
+		log.Printf("[research] 研究库接入失败: %v", dbErr)
+	}
+
+	// §OPT-3 实盘账本隔离：独立 live.db，与夜间研究库（trading.db）拆分，降低同文件写竞争并便于独立备份。
+	// 首次启动从 trading.db 一次性迁移存量实盘数据（real_positions/orders/fills/real_account），幂等。
+	realStore := researchDB
+	liveDB, liveErr := store.Open(filepath.Join(dataDir, "live.db"))
+	if liveDB != nil && liveErr == nil {
+		if migrated, merr := store.MigrateRealTablesIfEmpty(liveDB, researchDB); merr != nil {
+			log.Printf("[research] live.db 存量迁移失败(忽略, 继续): %v", merr)
+		} else if migrated {
+			log.Printf("[research] 已从 trading.db 迁移实盘账本到 live.db（存量数据已保留）")
+		}
+		srv.SetLiveDB(liveDB)
+		realStore = liveDB
+		log.Printf("[research] 实盘账本已隔离至: %s", filepath.Join(dataDir, "live.db"))
+	} else if liveErr != nil {
+		log.Printf("[research] live.db 打开失败, 实盘账本回退 trading.db: %v", liveErr)
+	}
+
+	// 推送器：P1 清仓/止损强提醒走桌面 + Webhook（地址从 config.json notify.webhook_urls 读取，可热改）
+	notifier := notify.New()
+	// §R3-8 P1-D 补投队列持久化：进程重启后继续补投失败的止损/清仓提醒（此前纯内存即丢）。
+	notifier.SetOutboxPersistPath(filepath.Join(dataDir, "notify_outbox.json"))
+	notifier.SetWebhooks(cfgMgr.GetNotifyConfig().WebhookURLs)
+	// §GAP5.2 静默时段：窗口内仅高级别（交易信号/清仓/止损）放行，低中级别留痕跳过
+	if nc := cfgMgr.GetNotifyConfig(); nc.QuietStart != "" && nc.QuietEnd != "" {
+		notifier.SetQuietHours(nc.QuietStart, nc.QuietEnd)
+		log.Printf("[main] 通知静默时段已启用: %s ~ %s（仅高级别放行）", nc.QuietStart, nc.QuietEnd)
+	}
+	// 外部推送网关：config.json notify.push 启用时，把关键提醒转发到推送服务，
+	// 实现 APK 后台/离线的系统通知触达。provider=jpush 走极光 REST API（AppKey+Secret+Alias），
+	// 否则走通用 webhook 网关（URL 指向接收 JSON 的推送地址）。
+	if pushCfg := cfgMgr.GetNotifyConfig().Push; pushCfg.Enabled {
+		if pushCfg.Provider == "jpush" {
+			gw := notify.NewJPushGateway(pushCfg.AppKey, pushCfg.Secret, pushCfg.Alias)
+			notifier.SetGateway(gw)
+			log.Printf("[main] 外部推送网关已启用: 极光(alias=%s)", gw.Alias)
+		} else if pushCfg.URL != "" {
+			gw := notify.NewWebhookGateway(pushCfg.URL)
+			notifier.SetGateway(gw)
+			log.Printf("[main] 外部推送网关已启用: webhook(%s)", pushCfg.URL)
+		}
+	}
+	// §HARDENING ntfy 运维告警通道：与上面的 APK 网关并行、相互独立（服务商/进程/路径不同），
+	// 关键提醒双投；Topic 为空=关闭。备份/监控脚本也订阅同一 topic 报丧。
+	if nc := cfgMgr.GetNotifyConfig(); nc != nil && nc.NtfyTopic != "" {
+		if gw := notify.NewNtfyGateway(nc.NtfyURL, nc.NtfyTopic); gw != nil {
+			notifier.SetNtfy(gw)
+			log.Printf("[main] ntfy 运维告警通道已启用: %s/<topic>", gw.URL)
+		}
+	}
+
+	// 5秒实时行情采集器（激活 data.Fetcher：自选+持仓为监控池，供实时触发/快照使用）
+	baseStocks := append(wlMgr.All(), rpt.HeldPositionCodes()...)
+	dc := data.NewDataCoordinator(marketAPI, thsClient) // 统一行情源：hithink→新浪→同花顺→东财 四级降级链
+
+	// 注入同花顺（新）hithink 最高优先级源（可选）：Key 缺失时 NewHithinkClient 返回错误，
+	// 此处静默跳过——降级链自动退化为 新浪→同花顺→东财，不破坏既有功能、不报错。
+	// 注入成功后 hithink 成为 GetQuote 第一顺位，东财永远最末兜底。
+	if hk, hkErr := data.NewHithinkClient(); hkErr == nil {
+		dc.SetHithink(hk)
+		log.Printf("[main] 同花顺(新)hithink 数据源已注入为行情第一顺位")
+	} else {
+		log.Printf("[main] 同花顺(新)hithink 未启用(降级链不受影响): %v", hkErr)
+	}
+	fetcher := data.NewFetcher(baseStocks, marketAPI, dc)
+	// §GAP3.2/3.3 快照落盘（同日重启恢复）+ 盘中陈旧度告警
+	fetcher.SetDataDir(dataDir)
+	fetcher.LoadPersistedSnapshot(dataDir)
+	// §A+B 行情刷新间隔可配置（默认 5s）：降低以缩短"行情变化→信号检测"感知延迟。
+	if sec := cfgMgr.Rules.Runtime.FeedIntervalSec; sec > 0 {
+		fetcher.SetRefreshInterval(time.Duration(sec) * time.Second)
+	}
+	// §WS-G 快照流录制：QUANT_RECORD_STREAM=1 时把每轮 5s 快照追加为 quote_stream.jsonl
+	//（staging 录制，供回放 harness 以"与线上同输入"驱动打分循环；失败仅记日志不阻断采集）。
+	// English: §WS-G quote-stream recording — QUANT_RECORD_STREAM=1 appends each 5s snapshot as JSONL
+	// for the replay harness; failures only log, never block collection.
+	if os.Getenv("QUANT_RECORD_STREAM") == "1" {
+		sl, err := data.NewStreamLog(filepath.Join(dataDir, "quote_stream.jsonl"))
+		if err != nil {
+			log.Printf("[main] 快照流录制开启失败（继续采集）: %v", err)
+		} else {
+			fetcher.SetSnapshotSink(func(snap *data.MarketSnapshot) { _ = sl.Write(snap) })
+			defer sl.Close()
+			log.Printf("[main] 行情快照流录制已开启: %s", filepath.Join(dataDir, "quote_stream.jsonl"))
+		}
+	}
+	go fetcher.Start()
+	defer fetcher.Stop()
+	// §ENH-5 批E：QMT Level-1 全推行情 feed（默认关，生产决策机开启）。
+	// 命中代码合并覆盖快照 Source=QMT-L1；任何失败静默——5s 新浪链照常兜底，
+	// Staleness 自然增长，交易熔断判定（/health ok&&broker_connected）不含行情态。
+	// English: §ENH-5 Level-1 quote feed (off by default; production decision machine only).
+	// Failures are silent — the 5s Sina chain keeps running and health trading-gates stay untouched.
+	if cfgMgr.Rules.Runtime.QMTFeedEnabled && cfgMgr.Rules.QMT.GatewayURL != "" {
+		intervalSec := cfgMgr.Rules.Runtime.QMTFeedIntervalSec
+		if intervalSec <= 0 {
+			intervalSec = 3
+		}
+		feedClient := trading.NewQMTClient(cfgMgr.Rules.QMT.GatewayURL, cfgMgr.Rules.QMT.Token, 3*time.Second, 0)
+		qmtFeed := data.NewQMTFeed(fetcher, feedClient, time.Duration(intervalSec)*time.Second, 30*time.Second, 1)
+		go qmtFeed.Start()
+		defer qmtFeed.Stop()
+		log.Printf("[main] §ENH-5 QMT Level-1 行情 feed 已启用: %s, 轮询 %ds", cfgMgr.Rules.QMT.GatewayURL, intervalSec)
+	} else if cfgMgr.Rules.Runtime.QMTFeedEnabled {
+		log.Printf("[main] §ENH-5 qmt_feed_enabled=true 但 gateway_url 未配置，feed 保持停用（新浪链兜底）")
+	}
+	srv.SetFetcher(fetcher)   // 报价接口优先读 5s 快照，缺失再降级拉取
+	srv.SetCoordinator(dc)    // HTTP 展示层统一走该降级链，保证跨页价格一致
+	srv.SetNotifier(notifier) // §C9-清扫：/api/notify-test 升级为逐通道真实探测，需注入全局通知器
+	log.Printf("[main] 实时行情采集已启动: 监控 %d 只(自选+持仓), 5s 轮询", len(baseStocks))
+
+	// 板块→个股成分股覆盖数（默认20）：扩大同板块强势股进打分池，避免只覆盖龙头前10漏选
+	// English: per-sector constituent coverage (default 20) — widen same-sector leaders into the pool
+	sectorTopN := cfgMgr.Rules.MainSector.SectorConstituentTopN
+	if sectorTopN <= 0 {
+		sectorTopN = 20
+	}
+	sAgent.SetConstituentTopN(sectorTopN)
+
+	// 多账号独立引擎注册表：数据源全局共享一份，每个账号登录时懒加载自己的引擎实例。
+	// 同一账号任何设备读取同一份后端计算结果（信号/评分/做多做空开关/战法参数均按账号隔离）。
+	// English: multi-account engine registry — data sources are shared; each account lazily gets its
+	// own engine on login. The same account reads the same backend-computed results on any device
+	// (signals/scores/long-short toggles/strategy params are all isolated per account).
+	registry := engine.NewRegistry(engine.EngineOptions{
+		MarketAPI:          marketAPI,
+		NewsAgent:          nAgent,
+		StrategyEng:        strategyEngine,
+		SectorAgent:        sAgent,
+		Scanner:            scanner,
+		Matcher:            matcher,
+		Rpt:                rpt,
+		StockTracker:       stockTracker,
+		WlMgr:              wlMgr,
+		SSE:                srv.GetSSE(),
+		LLMClient:          llmClient,
+		THS:                thsClient,
+		Fetcher:            fetcher,
+		CfgMgr:             cfgMgr,
+		Coordinator:        dc,                                     // §MARKET_RISK_GATE P0：风险盘口主源协调器（hithink 优先+东财兜底）
+		RiskHithinkPrimary: cfgMgr.Rules.Data.RiskHithinkPrimary(), // 应急回退阀：false 时引擎回落东财直连
+		DataDir:            dataDir,
+		Notifier:           notifier,
+		SectorTopN:         sectorTopN,
+		Paper:              paperEngine,
+		D1MaxRetries:       cfgMgr.Rules.LLM.MaxRetryTimes,
+		D1MaxTokens:        cfgMgr.Rules.LLM.D1MaxTokens,
+		RealStore:          realStore,   // 实盘账本（AUTO_TRADING_PLAN M1）：QMT 控制器存取 real_positions（已隔离至 live.db）
+		D1Store:            researchDB,  // D1 评分历史（d1_scores）：研究侧数据，留 trading.db
+		ShadowExec:         isStaging(), // §WS-G staging 影子执行器：决策落 shadow_orders、永不真下
+	})
+	srv.SetEngineRegistry(registry)
+
+	// §R6 P1-1 部署漂移自检：启动阶段汇总高影响配置的"声明态 vs 实际生效态"，与二进制指纹一并
+	// 落到 opslog + 启动日志，早期暴露 2026-09-01 三类线上事故（旧二进制缺修复 / LLM key 拼写/
+	// 为空 / QMT enabled 但 gateway_url/token 缺失致 executor 固化 Noop）。
+	// 仅告警不阻断——配置缺失时既有降级逻辑继续兜底，但运维可从日志一眼看出"开关白开"。
+	// English: §R6 P1-1 startup self-check — dumps binary fingerprint + high-impact config summaries
+	// (LLM key sanity, QMT effective executor) to opslog once at boot so the three real incidents from
+	// 2026-09-01 surface immediately. Warning-only: existing fallbacks still apply.
+	verifyDeployment(cfgMgr, authMgr)
+
+	// 模拟盘账号策略：仅 admin 账号自动按战法建仓/估值；普通用户模拟盘纯手动 + 静态存储。
+	// 同时注入当前启用战法资金池模板（分仓，防单战法垄断）。
+	// English: paper account policy — only admin accounts auto-fill/mark from strategies; normal users'
+	// paper is manual-only and static. Also injects the enabled-strategy pool template (allocation).
+	registry.SetAutoPaperCheck(authMgr.IsAdmin)
+	// §P1-4 透传管理员判定，使共享引擎的实盘账本/QMT 控制器默认归属管理员账号。
+	registry.SetAdminCheck(authMgr.IsAdmin)
+	// §SIGNAL_CONTROLLER P3：池模板按运营账号的模拟盘战法白名单装配（momentum 显式列名才开池）。
+	registry.SetPaperPools(server.ActivePaperPoolTypes(dataDir, cfgMgr.GetRulesFor("").Paper.Strategies))
+	// §C 规则细分池显示名解析器：fac_1/pat_2 → "因子战法#1" 等（分仓条可读）
+	registry.SetPaperLabelResolver(server.LibraryLabelResolver(dataDir))
+	// 盘后落库：每个交易日收盘后把模拟盘当日成交 + 每日快照导出研究库，供自动研究消费。
+	// English: post-close export — after each trading-day close, the paper day's fills + daily snapshot
+	// are exported to the research DB for auto-research.
+	registry.SetDayCloseExport(func(userID string, pe *paper.Engine) {
+		srv.ExportPaperToResearch(userID, pe)
+	})
+
+	// 前端修改 LLM 配置时热重建客户端，避免重启进程。§UI-AUTHORITATIVE 修复：改走
+	// Registry.SetLLMClient 统一分发——同时更新注册表模板（覆盖之后懒加载新建的引擎）、
+	// 共享新闻归因代理与全部存活引擎；此前只刷当时存活的引擎，空注册表/新建账号会静默
+	// 沿用旧客户端（表现为设置页保存后归因仍是旧模型）。
+	srv.SetLLMRecreate(func(apiKeys []string, apiURL, model string, timeoutSec int, streaming bool, batchConcurrency int, classifierModel string) {
+		// §FIX-7(20260919) 热重建必须带回成本治理与空闲阈值：热更新请求体不含这些字段，
+		// 若不回读运营账号已落库配置，重建出的客户端永远 0=不限/默认空闲——这正是此前
+		// "预算形同虚设"缺陷在热更新路径上的复现点。
+		opCfg := *cfgMgr.GetLLMConfigFor(authMgr.AdminID()) // 取值拷贝（GetLLMConfigFor 别名警告）
+		lc := llm.New(llm.Config{
+			APIKeys:           apiKeys,
+			APIURL:            apiURL,
+			Model:             model,
+			Timeout:           time.Duration(timeoutSec) * time.Second,
+			Streaming:         streaming,
+			BatchConcurrency:  batchConcurrency,
+			ClassifierModel:   classifierModel,
+			StreamIdleTimeout: time.Duration(opCfg.StreamIdleTimeoutSec) * time.Second,
+			DailyCallBudget:   opCfg.DailyCallBudget,
+			DailyTokenBudget:  opCfg.DailyTokenBudget,
+			ConsultDailyCalls: opCfg.ConsultDailyCalls, // §FIX-7 咨询专属预算同样回读，热重建不丢成本治理
+		})
+		registry.SetLLMClient(lc)
+		eff := model
+		if eff == "" {
+			eff = llm.DefaultModel
+		}
+		log.Printf("[LLM] 热重建生效: %s @ %s (keys=%d, timeout=%ds, stream=%v)",
+			eff, apiURL, len(apiKeys), timeoutSec, streaming)
+	})
+	// 把进程**实际加载**的这份配置注入为初始快照，作为"上一个可用配置"的回滚起点。
+	// 不注入的话，进程刚起来时回滚点为空——而"刚重启、启动预检失败、想退回上一次能用的那份"
+	// 恰恰是最需要回滚的时刻。注意它是"当前加载的"，不等于"已验证可用"（verified=false）。
+	srv.SeedLLMSnapshot(llmCfg.APIKeys, llmCfg.APIURL, effModel,
+		int(llmCfg.Timeout/time.Second), llmCfg.Streaming, llmCfg.BatchConcurrency, llmCfg.ClassifierModel)
+
+	// 实时触发引擎（daban式放量急拉检测，SSE 推送）
+	trigCtx, trigCancel := context.WithCancel(context.Background())
+	defer trigCancel()
+	triggerEngine := trigger.New(fetcher, srv.GetSSE(), trigger.DefaultConfig())
+	go triggerEngine.Run(trigCtx)
+
+	// 启动 HTTP 服务：地址可用 QUANT_ADDR 覆盖。
+	// 端口占用自动顺延：绑定失败时依次尝试下一个端口（最多 20 个），
+	// 避免"bind: address already in use"直接把整个进程打崩（stale 进程占端口时的常见故障）。
+	// English: start the HTTP server (address overridable via QUANT_ADDR). When the port is already
+	// taken, roll over to the next port (up to 20) so a stale process holding the port cannot crash
+	// the whole app with "bind: address already in use".
+	addr := ":8080"
+	if v := os.Getenv("QUANT_ADDR"); v != "" {
+		addr = v
+	}
+	ln := pickListener(addr, 20)
+	if ln == nil {
+		log.Fatalf("HTTP 监听失败 %s: 端口被占用（§W4-b fail-fast：拒绝顺延端口避免双实例写同一数据目录；请排查残留进程）", addr)
+	}
+	bound := ln.Addr().String()
+	log.Printf("[main] HTTP 服务已绑定 %s (来源 %s)", bound, addr)
+
+	// HTTP 服务加固：设置读写超时/头部超时/空闲超时，防慢速攻击与连接悬挂；
+	// 不设 WriteTimeout 上限过大（SSE 长连接需长期保持），仅约束头部与空闲期。
+	// English: hardened HTTP server with header/read/idle timeouts (slow-loris protection);
+	// WriteTimeout is left generous because SSE keeps long-lived connections open.
+	hs := &http.Server{
+		Handler:           srv,
+		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       30 * time.Second,
+		IdleTimeout:       120 * time.Second,
+	}
+	go func() {
+		if err := hs.Serve(ln); err != nil && err != http.ErrServerClosed {
+			log.Printf("[main] HTTP 服务异常退出: %v", err)
+		}
+	}()
+
+	// 优雅停机：收到 SIGTERM/SIGINT（systemd stop / Ctrl-C）时先关闭 HTTP、
+	// 停掉所有后台循环，再做最终落盘，避免写一半的 JSON 损坏。
+	// English: graceful shutdown on SIGTERM/SIGINT — close HTTP first, stop background
+	// loops, then let deferred writers flush, avoiding half-written JSON files.
+	stop := make(chan os.Signal, 2)
+	signal.Notify(stop, syscall.SIGTERM, syscall.SIGINT)
+	go func() {
+		<-stop
+		log.Println("[main] 收到退出信号，正在优雅停机…")
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
+		_ = hs.Shutdown(shutdownCtx)
+		trigCancel()
+		// §W3-c 根修：旧实现此处 os.Exit(0) 直接跳过 main 的全部 defer——
+		// nAgent.Stop/fetcher.Stop 永不执行（注释宣称"最终落盘"与实现相反），
+		// 非原子写状态文件可能被拦腰截断。改为显式执行关键 Stop 后再退出，
+		// 与 defer 链语义对齐（scoreLoopCancel 等由 ctx 派生自动生效）。
+		fetcher.Stop()
+		nAgent.Stop()
+		log.Println("[main] 优雅停机完成")
+		os.Exit(0)
+	}()
+
+	// 主循环根 ctx：驱动引擎异步 run 上下文（随进程生命周期存活，不做取消）。
+	ctx := context.Background()
+	log.Println("quant-trading-v2 已启动")
+
+	// 近实时 8a/8b 打分循环：5s 节奏，驱动所有已创建的账号引擎（共享引擎去重）。
+	// 各账号引擎内部按各自配置打分，持仓+自选持续打分 + 状态翻转信号。
+	// English: near-realtime 8a/8b scoring loop at a 5s cadence, driving every created account
+	// engine (shared engines deduplicated). Each engine scores by its own config over its pool.
+	// scoreLoopCtx 供打分循环退出用；cancel 经 defer 保证进程退出路径可终止该循环。
+	scoreLoopCtx, scoreLoopCancel := context.WithCancel(ctx)
+	defer scoreLoopCancel()
+	// 哨兵 goroutine：等待 scoreLoopCtx 取消信号（消费 Done 后即退出）。
+	// 当前除维持 ctx 被取消后有一处退出点外无其他逻辑；cancel 触发时与其配对唤醒。
+	go func() {
+		<-scoreLoopCtx.Done()
+	}()
+	go func() {
+		// §A+B 近实时节拍可配置（默认 5s）：降低以加快信号翻转检出与下单；非交易时段仍休眠。
+		// English: A+B — configurable near-realtime cadence (default 5s); off-hours still hibernated.
+		scoringTick := 5 * time.Second
+		if sec := cfgMgr.Rules.Runtime.ScoringIntervalSec; sec > 0 {
+			scoringTick = time.Duration(sec) * time.Second
+		}
+		// sleepChunk 分块休眠窗口：将长等待切分为 ≤15 分钟的片段，便于响应信号/退出。
+		const sleepChunk = 15 * time.Minute
+		activeTick := scoringTick
+		timer := time.NewTimer(activeTick)
+		defer timer.Stop()
+		for {
+			select {
+			case <-scoreLoopCtx.Done():
+				for _, e := range registry.All() {
+					e.StopBuyDispatcher()
+				}
+				return
+			case <-timer.C:
+			}
+			if !data.IsActiveSession(time.Now()) {
+				for _, e := range registry.All() {
+					// §修复 P2#23：休市/跨日也做交易日滚动清空，00:00 后即移除昨日固化信号，
+					// 无需等到次日第一个盘中 cycle（近实时循环在盘前休眠，主循环由这里补位）。
+					// English: P2#23 — run the trading-day rollover during off-hours too, so yesterday's
+					// pinned signals are cleared right after midnight (the scoring loop sleeps pre-open;
+					// this loop covers that window).
+					e.RolloverDayStores()
+					e.TrimAfterHoursIfDue(time.Now())
+					// §DAILY_REVIEW 盘后持仓 LLM 综合复盘：收盘后每日一次写入消息中心（引擎内 reviewGuardDay 去重）。
+					e.ReviewPositionsIfDue(time.Now())
+					// §QUOTE_POOL_SPLIT: 盘后也保持持仓池 base 最新（自选∪实盘∪纸面持仓钉仓），
+					// 次日开盘首个 cycle 直接用最新 base 拉行情，无需等到盘中才钉入。
+					// English: keep the held-pool base fresh after hours too, so the next open fetches
+					// against the latest base right away.
+					e.SyncMonitorBase()
+				}
+				// §D-4（GAP_VERIFY_20260917_PM）行情库覆盖断言（每日盘后一次）：
+				// 免费源断供时回测/情绪链会静默吃旧数据——滞后 >1 交易日即 ntfy/webhook 告警 + opslog 留痕。
+				checkDataCoverageOnce(researchDB, notifier)
+				d := data.DurationToNextActiveSession(time.Now())
+				if d > sleepChunk {
+					d = sleepChunk
+				}
+				if d < time.Second {
+					d = time.Second
+				}
+				log.Printf("[main] 打分循环休眠 %s（至下个交易窗口）", d.Round(time.Second))
+				timer.Reset(d)
+				continue
+			}
+			for _, e := range registry.All() {
+				e.RunScoringLoopOnce(scoreLoopCtx)
+			}
+			timer.Reset(activeTick)
+		}
+	}()
+
+	// 主循环：按市场时段驱动所有账号引擎。
+	// 盘前（8:30-9:15）"跑完即排下一轮"：等待异步引擎完成后立即触发下一轮，最大化新闻归因轮次，
+	// 让昨夜晚间新闻在开盘前尽可能完成 LLM 归因（配合未归因队列失败重试）；
+	// 其他时段按 5 分钟节奏推进，asyncBusy 忙锁防并发重入。
+	for {
+		now := time.Now()
+		session := data.CurrentSession(now)
+		since, ok := sinceForSession(session, now)
+		if ok {
+			log.Printf("[main] Session=%s 追回起始=%s", session, since.Format("01-02 15:04"))
+			engines := registry.All()
+			if len(engines) == 0 {
+				// 尚无账号登录/懒加载引擎，跳过本轮（等服务有账号时再驱动）
+				time.Sleep(5 * time.Minute)
+				continue
+			}
+			if session == data.SessionPreMarket {
+				// 盘前：新闻流水线含 LLM，异步触发避免阻塞近实时打分；等待完成后立即排下一轮，
+				// 用 AsyncIdle 轮询替代固定 5min 间隔，保证 9:15 前尽可能多轮归因。
+				for _, e := range engines {
+					if e.TryAsyncRun(ctx, since) {
+						log.Printf("[main] 盘前异步引擎已触发 (账号 %s)", e.UserID())
+					} else {
+						log.Printf("[main] 盘前异步引擎仍在运行 (账号 %s)", e.UserID())
+					}
+				}
+				// 等待所有账号引擎异步完成（asyncBusy 清零）再立即排下一轮
+				for {
+					allIdle := true
+					for _, e := range engines {
+						if !e.AsyncIdle() {
+							allIdle = false
+							break
+						}
+					}
+					if allIdle {
+						break
+					}
+					time.Sleep(500 * time.Millisecond)
+				}
+				continue // 立即下一轮，不 sleep 5min
+			} else {
+				// 午前/盘中：异步触发，避免 LLM 重试阻塞主循环/近实时打分；
+				// asyncBusy 忙锁防止并发重入（上一轮未完成时本轮跳过）。
+				// 触发后用"新新闻到达或超时兜底"的自适应等待替代原固定 5min 心跳：
+				// 一旦探测到新新闻（或距上次触发满 maxIdleWait 兜底）且引擎空闲，立即排下一轮，
+				// 把"新闻出现→开始扫描"的延迟从分钟级压到探测周期内（默认 30s）。
+				// English: trade sessions run asynchronously so LLM retries never block the main loop or
+				// near-realtime scoring; the asyncBusy guard skips overlap. After triggering, an adaptive wait
+				// replaces the old fixed 5-min heartbeat: as soon as new news is probed (or the maxIdleWait
+				// backstop elapses) with engines idle, the next round starts at once, cutting news→scan
+				// latency down to the probe period (default 30s).
+				for _, e := range engines {
+					if e.TryAsyncRun(ctx, since) {
+						log.Printf("[main] 盘中异步引擎已触发 (账号 %s)", e.UserID())
+					} else {
+						log.Printf("[main] 异步引擎仍在运行, 跳过本轮 (账号 %s)", e.UserID())
+					}
+				}
+				adaptiveIntradayWait(ctx, engines)
+				continue // 由自适应等待决定何时排下一轮（不再固定 sleep 5min）
+			}
+		} else {
+			log.Printf("[main] Session=%s 非处理时段, 跳过本轮", session)
+		}
+		time.Sleep(5 * time.Minute)
+	}
+}
+
+// adaptiveIntradayWait 盘中自适应等待：以短周期探测各引擎是否空闲 + 是否有新新闻到达，
+// 满足"全部空闲 且（有新新闻 或 距上次触发已超最大空闲间隔）"即返回让主循环立即排下一轮。
+// 相比原固定 5min 心跳，"新闻到达→触发扫描"的延迟压缩到探测周期内（默认 30s）；
+// 无新闻时靠 maxIdleWait 兜底周期刷新（行情/自选持仓打分仍需周期性更新），避免盘中长时间静默。
+// （adaptiveIntradayWait waits adaptively during trade sessions: on a short cadence it checks whether all
+// engines are idle and whether new news has arrived, and returns once all idle AND either new news arrived
+// or the max idle interval elapsed, so the main loop starts the next round at once. vs the old fixed 5-min
+// heartbeat, news→scan latency drops to ~the probe period (default 30s); quiet periods are covered by the
+// maxIdleWait backstop so quote/watchlist-only refreshes still happen periodically.）
+func adaptiveIntradayWait(ctx context.Context, engines []*engine.Engine) {
+	// 自适应盘中等待参数：探测周期与兜底间隔。
+	const (
+		probeInterval = 30 * time.Second // 新新闻探测周期：决定"新闻到达→触发"的最大感知延迟
+		maxIdleWait   = 3 * time.Minute  // 无新新闻时的兜底触发间隔
+	)
+	lastTrigger := time.Now()
+	probe := time.NewTicker(probeInterval)
+	defer probe.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-probe.C:
+			// 上一轮异步尚未结束时不排下一轮（asyncBusy 忙锁防并发重入）
+			if !allEnginesIdle(engines) {
+				continue
+			}
+			// 有新新闻到达 → 立即触发下一轮扫描
+			if anyNewNews(engines) {
+				log.Printf("[main] 盘中探测到新新闻, 立即排下一轮")
+				return
+			}
+			// 兜底：距上次触发已超最大空闲间隔，即使无新新闻也刷新一轮
+			// （行情/自选持仓打分需要周期性更新，防止盘中长时间静默）
+			if time.Since(lastTrigger) >= maxIdleWait {
+				log.Printf("[main] 盘中无新新闻已达 %v, 超时兜底排下一轮", maxIdleWait)
+				return
+			}
+		}
+	}
+}
+
+// allEnginesIdle 报告全部引擎异步是否空闲（上轮异步 run 均已完成）。
+func allEnginesIdle(engines []*engine.Engine) bool {
+	for _, e := range engines {
+		if !e.AsyncIdle() {
+			return false
+		}
+	}
+	return true
+}
+
+// anyNewNews 探测任一引擎的新闻源是否有新新闻到达（命中即触发下一轮扫描）。
+func anyNewNews(engines []*engine.Engine) bool {
+	for _, e := range engines {
+		if e.HasNewNews() {
+			return true
+		}
+	}
+	return false
+}
+
+// sinceForSession 根据市场时段计算新闻追回起始时间：
+// - 盘前：追回昨日收盘后的新闻（周一追回周五收盘后）
+// - 午前：追回上午收盘后的新闻
+// - 盘中：追回最近 30 分钟新闻
+// ok=false 表示当前时段不处理（收盘后/夜间）。
+func sinceForSession(session data.MarketSession, now time.Time) (time.Time, bool) {
+	switch session {
+	case data.SessionPreMarket:
+		since := time.Date(now.Year(), now.Month(), now.Day(), 15, 0, 0, 0, now.Location())
+		if now.Weekday() == time.Monday {
+			since = since.Add(-72 * time.Hour)
+		} else {
+			since = since.Add(-24 * time.Hour)
+		}
+		return since, true
+	case data.SessionPreAfternoon:
+		return time.Date(now.Year(), now.Month(), now.Day(), 11, 30, 0, 0, now.Location()), true
+	case data.SessionMorningTrade, data.SessionAfternoonTrade:
+		return now.Add(-30 * time.Minute), true
+	default:
+		return time.Time{}, false
+	}
+}
+
+// getDataDir 返回数据存储目录：
+//   - QUANT_ENV=staging（staging 影子环境）→ 强制 ~/.quant-staging（忽略 QUANT_DATA_DIR，
+//     与生产数据/账本/配置完全隔离，防 staging 误读实盘数据或误连实盘网关）。
+//   - 否则优先 QUANT_DATA_DIR，默认 ~/.quant-trading-v2。
+//
+// English: data-dir resolution — the staging env forces ~/.quant-staging (fully isolated from
+// production data/books/config); otherwise QUANT_DATA_DIR wins with ~/.quant-trading-v2 as default.
+func getDataDir() string {
+	if os.Getenv("QUANT_ENV") == "staging" {
+		home, _ := os.UserHomeDir()
+		return filepath.Join(home, ".quant-staging")
+	}
+	if v := os.Getenv("QUANT_DATA_DIR"); v != "" {
+		return v
+	}
+	home, _ := os.UserHomeDir()
+	return filepath.Join(home, ".quant-trading-v2")
+}
+
+// isStaging 是否处于 staging 影子环境（QUANT_ENV=staging）。
+// English: reports whether the process runs in the staging shadow environment.
+func isStaging() bool {
+	return os.Getenv("QUANT_ENV") == "staging"
+}
+
+// verifyDeployment §R6 P1-1 部署漂移自检（启动时调用一次，仅告警不阻断）。
+// 目标：把 2026-09-01 三类线上事故（①旧二进制缺执行器重建修复、②LLM key 拼写漂移致全链 401、
+// ③qmt.enabled=true 但 gateway_url/token 缺失 executor 固化 Noop）在启动阶段一眼暴露，而非盘中才发现。
+//
+// 检查项：
+//  1. 二进制 git 指纹（buildCommit，构建期 -ldflags 注入；unknown=未注入需在部署侧排查）。
+//  2. LLM 密钥池健全性：唯一 key 数、可疑长度（<8 截断/拼写漂移常见特征）、含空白字符。
+//  3. QMT 实盘配置一致性：enabled=true 时 gateway_url/token 是否齐备（缺任一 → executor 必为 Noop，
+//     即"开关白开"的根因信号）；mode/price_type 枚举合理性。
+//
+// English: §R6 P1-1 deployment-drift self-check at boot (warning-only). Surfaces three real 2026-09-01
+// incidents at startup: stale binary missing the executor-rebuild fix; LLM key typo → full-chain 401;
+// qmt.enabled=true with missing gateway_url/token pinning the executor to Noop.
+func verifyDeployment(cfgMgr *config.Manager, authMgr *auth.Manager) {
+	// —— 0. staging 影子环境 fail-fast ——
+	// §WS-G：QUANT_ENV=staging 下 qmt.enabled=true 一律拒绝启动（staging 严禁连接实盘网关；
+	// enabled=true 说明部署侧残留生产配置，一旦放行即资损级误连）。staging 的决策流由
+	// ShadowExecutor 接管（registry ShadowExec=isStaging()），qmt.enabled 在影子环境无意义。
+	// English: §WS-G staging fail-fast — QUANT_ENV=staging with qmt.enabled=true refuses to start:
+	// staging must never touch the real gateway (an enabled flag means a production config leaked in).
+	if isStaging() {
+		if cfgMgr.Get().QMT.Enabled {
+			log.Fatalf("[deploy] staging 环境检测到 qmt.enabled=true：staging 严禁连接实盘网关，拒绝启动。" +
+				"请将 qmt.enabled 置 false（staging 决策流由 ShadowExecutor 接管，不真下）")
+		}
+		log.Printf("[deploy] staging 影子环境启动: 数据目录=%s（QMT 一律走 ShadowExecutor，不真下）", getDataDir())
+	}
+	// —— 0.5 配置 schema 校验（§WS-K 维4：非法段启动即告警，不阻断，符合 only-warning 语义）——
+	if verr := config.Validate(cfgMgr.Get()); verr != nil {
+		log.Printf("[deploy] ⚠ 配置 schema 校验告警（不阻断启动）: %v", verr)
+		opslog.Logf("quant", "部署自检: 配置 schema 校验告警: %v", verr)
+	}
+	// —— 1. 二进制指纹 ——
+	if buildCommit == "" || buildCommit == "unknown" {
+		log.Printf("[deploy] ⚠ 二进制未注入 git 指纹（buildCommit=unknown）：部署脚本已带 -ldflags -X main.buildCommit，请勿手动裸 go build 覆盖线上产物")
+		opslog.Logf("quant", "部署自检: 二进制未注入 git 指纹(建议构建期 -ldflags 注入 buildCommit)")
+	} else {
+		log.Printf("[deploy] 二进制 git 指纹正常: %s", buildCommit)
+	}
+
+	// —— 2. LLM 密钥池 ——
+	// 密钥来源只认环境变量：优先复数型 LLM_API_KEYS（逗号分隔、逐个去空白），
+	// 未配置时再退回单数型 LLM_API_KEY。注意此处仅采集展示，不参与实际客户端装配。
+	var keys []string
+	if raw := os.Getenv("LLM_API_KEYS"); raw != "" {
+		// 按【逗号】切分为多把 Key，逐项去掉两侧空白后过滤空项
+		for _, k := range strings.Split(raw, ",") {
+			if k = strings.TrimSpace(k); k != "" {
+				keys = append(keys, k)
+			}
+		}
+	}
+	if len(keys) == 0 {
+		// 复数形态未配置时的单数兜底：整个 LLM_API_KEY 视为唯一一把 Key
+		if k := os.Getenv("LLM_API_KEY"); k != "" {
+			keys = []string{k}
+		}
+	}
+	// 顺序去重：seen 集合保证同一 Key 只进 uniq 一次（重复会影响池轮换语义）
+	seen := map[string]bool{}
+	var uniq []string
+	for _, k := range keys {
+		if !seen[k] {
+			seen[k] = true
+			uniq = append(uniq, k)
+		}
+	}
+	log.Printf("[deploy] LLM 密钥池: 配置 %d 把, 去重后 %d 把", len(keys), len(uniq))
+	// 可疑 Key 巡检：长度 <8 或含空白字符是"截断/拼写漂移"的常见特征（仅告警，不阻断）
+	for i, k := range uniq {
+		suspicious := len(k) < 8 || strings.ContainsAny(k, " \t\n")
+		if suspicious {
+			log.Printf("[deploy] ⚠ LLM 密钥[%d] 长度=%d 或含空白（疑似截断/拼写漂移, 请核对环境变量）: %s",
+				i+1, len(k), redact(k))
+			opslog.Logf("quant", "部署自检⚠ LLM 密钥[%d]可疑(长度%d), 请核对 LLM_API_KEYS", i+1, len(k))
+		}
+	}
+	if len(keys) != len(uniq) {
+		log.Printf("[deploy] ⚠ LLM 密钥存在重复（配置 %d → 去重 %d），不影响运行但不建议", len(keys), len(uniq))
+	}
+
+	// —— 3. QMT 实盘配置一致性 ——
+	if q := cfgMgr.GetQMTConfigFor(""); q != nil {
+		log.Printf("[deploy] QMT 实盘配置: enabled=%t mode=%s price_type=%s gateway_url=%q token=%q",
+			q.Enabled, q.Mode, q.PriceType, q.GatewayURL, redact(q.Token))
+		if !q.Enabled {
+			log.Printf("[deploy] QMT 实盘当前关闭（enabled=false），实盘链路停用，模拟盘不受影响")
+		} else {
+			missing := []string{}
+			if q.GatewayURL == "" {
+				missing = append(missing, "gateway_url")
+			}
+			if q.Token == "" {
+				missing = append(missing, "token")
+			}
+			if len(missing) > 0 {
+				log.Printf("[deploy] ⚠ QMT enabled=true 但缺少 %v → executor 将固化为 Noop（不真下）, 这是"+
+					"“开关白开”的根因信号，请到量化交易页补全后重启或热更（5s 生效）", missing)
+				opslog.Logf("quant", "部署自检⚠ QMT enabled=true 但缺少 %s, executor=Noop 不真下", strings.Join(missing, ","))
+			} else {
+				log.Printf("[deploy] QMT enabled=true 且 gateway_url/token 齐备 → executor=QMTClient 真实通道（假定已前端热更生效）")
+			}
+			switch q.Mode {
+			case "auto", "manual":
+			default:
+				log.Printf("[deploy] ⚠ QMT mode=%q 非 auto/manual 枚举（可致开关判定异常）", q.Mode)
+			}
+			switch q.PriceType {
+			case "market", "limit":
+			default:
+				log.Printf("[deploy] ⚠ QMT price_type=%q 非 market/limit 枚举（可致废单，参考沪市 price_type 实录）", q.PriceType)
+			}
+		}
+	} else {
+		log.Printf("[deploy] QMT 配置段缺失（GetQMTConfigFor 返回 nil），实盘链路按关闭处理")
+	}
+
+	// §D5 修复：per-user QMT 覆盖清单——多账号实盘下每个用户可独立配 gateway/token，
+	// 但启动日志此前只打 `GetQMTConfigFor("")`（读全局 config.json rules.qmt），
+	// 用户按启动日志判断连的是哪个 gateway，实际按 per-user 路由到别的地方（UAT 2026-09-13 现场踩过：
+	// 启动日志显示 mock:18789，生产 gateway 是别的地址；反之亦然）。
+	// 这里遍历所有账号打一行摘要，让"当前谁连哪儿"启动即显式，与 auth.json 内 per-user 快照同源。
+	// English: D5 — enumerate per-user QMT overrides at boot; previously the log only showed the
+	// global config.json fallback which can drift from the actual per-user gateway in use.
+	if authMgr != nil {
+		if global := cfgMgr.GetQMTConfigFor(""); global != nil {
+			for _, u := range authMgr.ListUsers() {
+				perUser := cfgMgr.GetQMTConfigFor(u.ID)
+				if perUser == nil {
+					continue
+				}
+				// 只在与全局回退不一致时打（一致时不刷屏）；enabled/token 都参与比对
+				if perUser.GatewayURL != global.GatewayURL || perUser.Enabled != global.Enabled || perUser.Token != global.Token || perUser.Mode != global.Mode {
+					state := "覆盖"
+					if !perUser.Enabled {
+						state = "覆盖·关闭"
+					}
+					log.Printf("[deploy] QMT %s %s(%s): enabled=%t gateway=%q token=%q mode=%s",
+						state, u.Username, u.ID, perUser.Enabled, perUser.GatewayURL, redact(perUser.Token), perUser.Mode)
+				}
+			}
+		}
+	}
+}
+
+// redact 密钥等敏感串脱敏显示：仅留前 3 位与后 2 位，中间掩码。空串原样返回。
+// English: redacts a secret for logging — keeps first 3 + last 2 chars, masks the rest.
+func redact(s string) string {
+	if len(s) <= 6 {
+		return "****"
+	}
+	return s[:3] + "…" + s[len(s)-2:]
+}
+
+// pickListener §W4-b fail-fast 化：仅尝试绑定 baseAddr 本身；端口被占用即返回 nil 由调用方
+// 致命退出（systemd 5s 后重启）。旧实现自动顺延端口的副作用是：stale 旧实例占住 8080 时，
+// 新实例静默绑到 8081"正常启动"，两套引擎同时写同一 trading.db 且 Caddy 仍指向旧实例——
+// split-brain 极难察觉。单实例保证已由 systemd 承担，应用层应快速失败暴露问题。
+// English: §W4-b fail-fast binding — a taken port now aborts startup (systemd restarts) instead of
+// silently rolling to the next port, which previously allowed two engines writing the same DB while
+// Caddy kept hitting the stale one.
+func pickListener(baseAddr string, maxTries int) net.Listener {
+	_ = maxTries // 兼容旧调用方签名（语义已改为只试一次）
+	ln, err := net.Listen("tcp", baseAddr)
+	if err != nil {
+		log.Printf("[main] 端口绑定失败 %s: %v（可能存在残留进程；拒绝顺延端口以避免双实例写同一数据目录）",
+			baseAddr, err)
+		return nil
+	}
+	return ln
+}
+
+// bumpPort 将 host:port 地址中的端口号 +1（如 :8080 -> :8081）；解析失败时原样返回。
+// 当前生产路径已不再顺延端口（pickListener 改为 fail-fast），本函数仅保留供单元测试
+// （main_test.go）验证端口递增逻辑使用。
+// English: increments the port number of a host:port address (e.g. :8080 -> :8081);
+// returns the address unchanged when it cannot be parsed. Retained for unit tests only.
+func bumpPort(addr string) string {
+	host, portStr, err := net.SplitHostPort(addr)
+	if err != nil {
+		return addr
+	}
+	p, err := strconv.Atoi(portStr)
+	if err != nil {
+		return addr
+	}
+	return net.JoinHostPort(host, strconv.Itoa(p+1))
+}
+
+// coverageGuard §D-4 每日一次守卫：同日内重复调用直接返回（盘后循环节拍不等）。
+var coverageGuard = struct {
+	mu  sync.Mutex
+	day string
+}{}
+
+// checkDataCoverageOnce 行情库覆盖断言（§D-4）：trade_cal 可用且行情滞后 >1 交易日时
+// 投递 high 告警（ws/webhook + 网关 ntfy/JPush 双通道）并写 opslog；无从判定（无日历/未启动
+// 采集）与新鲜态只留 debug 日志。错误静默（旁路观测面，绝不影响主循环）。
+// English: §D-4 — once-per-day quote-DB coverage assertion; lagging >1 trading day fires a
+// high-severity ops alert (desktop/webhook + gateway/ntfy) plus an opslog line.
+func checkDataCoverageOnce(db *store.DB, n *notify.Notifier) {
+	if db == nil {
+		return
+	}
+	now := time.Now()
+	if now.Hour() < 16 { // 盘前/盘中不判（当日行情本就没有）
+		return
+	}
+	today := now.Format("20060102")
+	coverageGuard.mu.Lock()
+	if coverageGuard.day == today {
+		coverageGuard.mu.Unlock()
+		return
+	}
+	coverageGuard.day = today
+	coverageGuard.mu.Unlock()
+	f, err := db.CheckDataFreshness(today, 1)
+	if err != nil {
+		log.Printf("[coverage] 覆盖断言查询失败（忽略）: %v", err)
+		return
+	}
+	if f.OK {
+		if f.TradeCalOK && f.Latest != "" {
+			log.Printf("[coverage] 行情库覆盖正常: %s", f.String())
+		}
+		return
+	}
+	content := f.String() + "——请检查 dataload/hithink 同步链（断供期间回测与情绪链在用旧数据）"
+	opslog.Logf("quant", "行情库覆盖断言失败: %s", content)
+	log.Printf("[coverage] ⚠ %s", content)
+	if n != nil {
+		msg := notify.Message{Level: notify.LevelHigh, Title: "行情数据断供", Content: content}
+		// §M8（2026-09-22 修复批）：Push 已内聚 WS/Webhook/手机网关三路（高级别必过网关门槛），
+		// 不再额外直调 PushGateway（双发去重设计见 internal/notify/notify.go Push 注释）。
+		n.Push(msg)
+	}
+}

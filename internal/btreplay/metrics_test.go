@@ -1,0 +1,150 @@
+// metrics_test.go — §GAP4.5 绩效指标回归：夏普/最大回撤/年化/卡玛 的已知序列精确断言。
+package btreplay
+
+import (
+	"encoding/json"
+	"math"
+	"testing"
+	"time"
+)
+
+// TestPerfMetricsKnownSeries 验证已知序列的绩效指标计算。
+func TestPerfMetricsKnownSeries(t *testing.T) {
+	// 稳定 +1%/笔 ×100 笔、首末相隔 99 个自然日：均值 1%、std=0 → Sharpe=0；
+	// 净值单调上升 → MDD≈0、Calmar≈0；年化按实际跨度复利折算。
+	sharpe, mdd, annual, calmar := perfMetrics(
+		repeat(1.0, 100), dateSpanN("20250101", 100))
+	if sharpe != 0 {
+		t.Fatalf("std=0 时 Sharpe 应为 0, got %.4f", sharpe)
+	}
+	if mdd > 1e-9 || calmar > 1e-9 {
+		t.Fatalf("单边上涨无回撤: mdd=%.2e calmar=%.2e", mdd, calmar)
+	}
+	years := 99.0 / 365.25
+	wantAnnual := (math.Pow(math.Pow(1.01, 100), 1/years) - 1) * 100
+	if math.Abs(annual-wantAnnual) > 0.5 {
+		t.Fatalf("annual=%.2f want=%.2f", annual, wantAnnual)
+	}
+}
+
+// TestPerfMetricsDrawdownAndSharpe 验证回撤与夏普比率计算。
+func TestPerfMetricsDrawdownAndSharpe(t *testing.T) {
+	// 序列：+20% 后 -10%（净值 1.2→1.08，MDD=(1.2-1.08)/1.2=10%）
+	pnls := []float64{20, -10}
+	dates := []string{"20250101", "20250301"}
+	sharpe, mdd, _, calmar := perfMetrics(pnls, dates)
+	if math.Abs(mdd-10) > 1e-6 {
+		t.Fatalf("MDD=%.4f want 10", mdd)
+	}
+	// 两笔不同收益 std>0 → Sharpe>0
+	if sharpe <= 0 {
+		t.Fatalf("波动序列 Sharpe 应 >0, got %.4f", sharpe)
+	}
+	// Calmar = |annual/MDD|：annual=(1.08)^(365/59)-1≈61.9%，calmar≈6.19
+	if calmar < 5 || calmar > 8 {
+		t.Fatalf("calmar=%.2f 超出合理区间", calmar)
+	}
+	// 全亏：净值归零 → annual=-100
+	_, _, ann2, _ := perfMetrics([]float64{-100, -100}, dates)
+	if ann2 != -100 {
+		t.Fatalf("净值归零年化应 -100, got %.2f", ann2)
+	}
+}
+
+// TestPerfMetricsEdge 验证绩效指标边界（空序列/单点等）。
+func TestPerfMetricsEdge(t *testing.T) {
+	if s, mdd, a, c := perfMetrics(nil, nil); s != 0 || mdd != 0 || a != 0 || c != 0 {
+		t.Fatal("空输入应全零")
+	}
+	if s, _, _, _ := perfMetrics([]float64{5}, []string{"20250101"}); s != 0 {
+		t.Fatal("单样本 Sharpe 应为 0")
+	}
+}
+
+// TestSweepChampionRiskMetrics §F5 回归：冠军 sweepResult 的风险调整指标必须被计算并由
+// JSON 序列化携带（此前漏带出 SWEEP_JSON → optimization_results 落库恒 0）。
+// English: §F5 regression — the champion sweepResult's risk-adjusted metrics must be computed and
+// survive JSON serialization (they were previously dropped before SWEEP_JSON, zeroing the DB rows).
+func TestSweepChampionRiskMetrics(t *testing.T) {
+	var res sweepResult
+	res.Count = 2
+	res.Win, res.Loss = 1, 1
+	res.AvgHold = 10
+	finalizeResult(&res, 8.0, -4.0, []float64{8, -4}, []string{"20250101", "20250301"}, 0)
+	if res.WinRate != 50 || res.ProfitFactor != 2 {
+		t.Fatalf("基础指标异常: wr=%.1f pf=%.2f", res.WinRate, res.ProfitFactor)
+	}
+	if res.Sharpe == 0 || res.Calmar == 0 {
+		t.Fatalf("风险指标未计算: sharpe=%.4f calmar=%.4f", res.Sharpe, res.Calmar)
+	}
+	bj, err := json.Marshal(res)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	var back struct {
+		Sharpe          float64 `json:"sharpe"`
+		MaxDrawdownPct  float64 `json:"max_drawdown_pct"`
+		AnnualReturnPct float64 `json:"annual_return_pct"`
+		Calmar          float64 `json:"calmar"`
+	}
+	if err := json.Unmarshal(bj, &back); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if back.Sharpe != res.Sharpe || back.Calmar != res.Calmar ||
+		back.MaxDrawdownPct != res.MaxDrawdownPct || back.AnnualReturnPct != res.AnnualReturnPct {
+		t.Fatalf("风险指标序列化丢失: got %+v want %+v", back, res)
+	}
+}
+
+// TestPerfMetricsRFDailyFrequency §WS-D D3：Sharpe 日频口径公式精确断言
+// （(mean(R_daily)−rf/252)/std(R_daily)×√252；同日多笔复利合成当日收益；rf 可配）。
+func TestPerfMetricsRFDailyFrequency(t *testing.T) {
+	// 两日各一笔：+20% / -10% → R_daily（小数）= [0.2, -0.1]
+	// mean=0.05, std=0.15 → sharpe(rf=0) = 0.05/0.15*√252
+	pnls := []float64{20, -10}
+	dates := []string{"20250101", "20250301"}
+	sharpe0, _, _, _ := perfMetricsRF(pnls, dates, 0)
+	want0 := 0.05 / 0.15 * math.Sqrt(252)
+	if math.Abs(sharpe0-want0) > 1e-9 {
+		t.Fatalf("rf=0 sharpe=%.6f want %.6f", sharpe0, want0)
+	}
+	// rf=2% 年化 → 日 rf=0.02/252（小数口径）：分子 0.05−0.02/252
+	sharpeRf, _, _, _ := perfMetricsRF(pnls, dates, 0.02)
+	wantRf := (0.05 - 0.02/252) / 0.15 * math.Sqrt(252)
+	if math.Abs(sharpeRf-wantRf) > 1e-9 {
+		t.Fatalf("rf=0.02 sharpe=%.6f want %.6f", sharpeRf, wantRf)
+	}
+	// 同日多笔复利合成：+10% 与 +10% 同日 = 当日收益 21%（非 20%），单日样本 → sharpe=0
+	same, _, _, _ := perfMetricsRF([]float64{10, 10}, []string{"20250101", "20250101"}, 0)
+	if same != 0 {
+		t.Fatalf("单日样本 sharpe 应为 0, got %.4f", same)
+	}
+	// 日样本 <2 → 0
+	if s, _, _, _ := perfMetricsRF([]float64{5}, []string{"20250101"}, 0.02); s != 0 {
+		t.Fatalf("单样本应为 0, got %.4f", s)
+	}
+	// rf=0 便捷封装 perfMetrics 与 perfMetricsRF 一致
+	a, _, _, _ := perfMetrics(pnls, dates)
+	if math.Abs(a-want0) > 1e-9 {
+		t.Fatalf("perfMetrics 应等同 rf=0, got %.6f", a)
+	}
+}
+
+// repeat 生成 n 个重复值 v 的序列（指标输入用的夹具）。
+func repeat(v float64, n int) []float64 {
+	out := make([]float64, n)
+	for i := range out {
+		out[i] = v
+	}
+	return out
+}
+
+// dateSpanN 自 first 起 n 个自然日的日期序列（YYYYMMDD）。
+func dateSpanN(first string, n int) []string {
+	t0, _ := time.Parse("20060102", first)
+	out := make([]string, n)
+	for i := 0; i < n; i++ {
+		out[i] = t0.AddDate(0, 0, i).Format("20060102")
+	}
+	return out
+}

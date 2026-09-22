@@ -1,0 +1,566 @@
+// 用户/账号管理与管理员代配他人账号配置端点（仅 admin 角色可调用）。
+// English: user/account management plus admin-side per-account configuration endpoints (admin role only).
+// Package server: admin-only user management and per-account config endpoints.
+package server
+
+import (
+	"encoding/json"
+	"fmt"
+	"log"
+	"net/http"
+	"strings"
+	"time"
+
+	"quant-trading-v2/internal/auth"
+	"quant-trading-v2/internal/config"
+	"quant-trading-v2/internal/opslog"
+)
+
+// handleAuthMe 处理 GET /api/auth/me：返回当前登录用户的公开信息（角色/权限位），
+// 前端据此渲染管理员菜单与功能按钮。
+// English: handles GET /api/auth/me — returns the current user's public info (role/perms), which the
+// frontend uses to render the admin menu and action buttons.
+func (s *Server) handleAuthMe(w http.ResponseWriter, r *http.Request) {
+	user := userFromContext(r)
+	if user == nil {
+		writeError(w, 401, "unauthorized")
+		return
+	}
+	writeJSON(w, 200, map[string]interface{}{
+		"id":          user.ID,
+		"username":    user.Username,
+		"role":        user.Role,
+		"perms":       user.Perms,
+		"enabled":     user.Enabled,
+		"expires_at":  user.ExpiresAt,
+		"tenant_id":   s.auth.TenantOf(user.ID), // §MT 所属租户
+		"tenant_name": s.auth.TenantName(s.auth.TenantOf(user.ID)),
+	})
+}
+
+// handleListUsers 处理 GET /api/admin/users：列出可见用户（公开视图，不含密码/令牌）。
+// §MT 作用域：平台运营者=全部；租户 admin=仅本租户成员。附 tenant_name 便于前端展示。
+// English: §MT — platform admins list everyone; tenant admins list only their own members.
+func (s *Server) handleListUsers(w http.ResponseWriter, r *http.Request) {
+	users := s.scopedUsers(r)
+	names := map[string]string{}
+	for _, t := range s.auth.ListTenants() {
+		names[t.ID] = t.Name
+	}
+	platform := s.isPlatformAdmin(r)
+	writeJSON(w, 200, map[string]interface{}{
+		"users":        users,
+		"perms":        auth.AllPerms(),
+		"tenant_names": names,
+		"platform":     platform, // §MT 前端据此决定是否渲染租户管理区块
+	})
+}
+
+// handleCleanupUsers 处理 POST /api/admin/users/cleanup（§U-5 2026-09-14 像素级 UAT）：
+// 批量清理"脏账号"——临时账号体系（CreateTemp，用户名 temp_ 前缀）到期后从不回收，
+// 长期部署 auth.json 积累数十条废行（UAT 副本实录 60 条 temp_* + 15 条测试号），
+// 拖慢列表分页、放大备份、混淆审计。temp 账号无密码、其可用性完全由会话到期决定，
+// 故过期判定用 HasActiveSession（全部会话过期=再也无法被使用），绝不按创建时间误伤在用号。
+// 删除口径（保守，可 dry_run 预览）：
+//   - 非 admin 且 已过账号级有效期（expires_at>0 且已过期，CreateUser 带 expires_days 的正式号）；
+//   - 非 admin 且 temp_ 前缀 且（会话全部过期 或 已禁用）。
+//
+// 请求体 {"dry_run":true} 仅返回将被清理的清单不落删除；响应 {"deleted":[...],"count":n,"dry_run":bool}。
+// 全过程 opslog 审计留痕。admin 自身与其他在用账号绝无删除路径。
+// English: §U-5 — bulk cleanup of stale accounts. Temp accounts (temp_ prefix from CreateTemp)
+// were never reaped, leaving dozens of dead rows (UAT copy: 60 temp_* + 15 test accounts) that
+// bloat the list page and backups. Password-less temps live only while a session is valid, so
+// expiry is judged by HasActiveSession (all sessions lapsed ⇒ unusable), never by creation time.
+// Targets: expired non-admin accounts, plus temp_ accounts with no live session or disabled.
+// dry_run previews without deleting. Admin and in-use accounts are never touched.
+func (s *Server) handleCleanupUsers(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		DryRun bool `json:"dry_run"`
+	}
+	_ = json.NewDecoder(r.Body).Decode(&req)
+	now := time.Now().Unix()
+	type cleaned struct {
+		ID       string `json:"id"`
+		Username string `json:"username"`
+		Reason   string `json:"reason"`
+	}
+	var out []cleaned
+	// §MT 清理同样受租户作用域约束：租户 admin 只清本租户僵尸号。
+	for _, u := range s.scopedUsers(r) {
+		if u.Role == auth.RoleAdmin {
+			continue // 管理员账号绝无清理路径
+		}
+		// 清理口径三分支：账号级过期 / temp 会话全过期（僵尸） / temp 已禁用
+		reason := ""
+		switch {
+		case u.ExpiresAt > 0 && now > u.ExpiresAt:
+			reason = "expired"
+		case strings.HasPrefix(u.Username, "temp_") && !s.auth.HasActiveSession(u.ID):
+			reason = "temp_session_expired"
+		case strings.HasPrefix(u.Username, "temp_") && !u.Enabled:
+			reason = "temp_disabled"
+		}
+		if reason == "" {
+			continue
+		}
+		if !req.DryRun {
+			if err := s.auth.DeleteUser(u.ID); err != nil {
+				log.Printf("[admin] cleanup 删除 %s(%s) 失败: %v", u.Username, u.ID, err)
+				continue // 单个失败不阻断整批
+			}
+		}
+		out = append(out, cleaned{ID: u.ID, Username: u.Username, Reason: reason})
+	}
+	opslog.Audit("user_cleanup", userFromContext(r).ID, "users", fmt.Sprintf("dry_run=%v count=%d", req.DryRun, len(out)))
+	writeJSON(w, 200, map[string]interface{}{"deleted": out, "count": len(out), "dry_run": req.DryRun})
+}
+
+// createUserReq 管理员开户请求体。
+// English: createUserReq is the admin account-creation request body.
+type createUserReq struct {
+	Username string `json:"username"` // 用户名
+	Password string `json:"password"` // 密码
+	Role     string `json:"role"`     // 可选，缺省 user
+	// English: optional, defaults to user.
+	Perms []string `json:"perms"` // 可选，权限位列表
+	// English: optional, list of permission bits.
+	ExpiresDays int `json:"expires_days"` // 可选，账号有效期天数（0=永久）
+	// English: optional, account validity in days (0 = permanent).
+	// §MT 目标租户：仅平台运营者可指定；租户 admin 建号恒落本租户。
+	TenantID string `json:"tenant_id"`
+}
+
+// handleCreateUser 处理 POST /api/admin/users：管理员创建正式用户并返回其公开视图。
+// English: handles POST /api/admin/users — the admin creates a real user and returns its public view.
+func (s *Server) handleCreateUser(w http.ResponseWriter, r *http.Request) {
+	var req createUserReq
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, 400, "invalid request body")
+		return
+	}
+	if req.Username == "" || req.Password == "" {
+		writeError(w, 400, "username and password required")
+		return
+	}
+	if req.ExpiresDays < 0 {
+		writeError(w, 400, "expires_days must be >= 0")
+		return
+	}
+	// §MT 租户归属判定：租户 admin 强制本租户；平台运营者可指定 tenant_id（须存在）。
+	tenantID := s.actorTenant(r)
+	if req.TenantID != "" && req.TenantID != tenantID {
+		if !s.isPlatformAdmin(r) {
+			writeError(w, 403, "无权限：仅平台运营者可指定其他租户")
+			return
+		}
+		if s.auth.TenantByID(req.TenantID) == nil {
+			writeError(w, 400, "tenant not found")
+			return
+		}
+		tenantID = req.TenantID
+	}
+	// §MT 跨租户开户护栏：非平台运营者不得直接在他租户建 admin。
+	if req.Role == auth.RoleAdmin && !s.isPlatformAdmin(r) && tenantID != s.actorTenant(r) {
+		writeError(w, 403, "无权限：仅平台运营者可在其他租户创建管理员")
+		return
+	}
+	user, err := s.auth.CreateUserInTenant(tenantID, req.Username, req.Password, req.Role, req.Perms, req.ExpiresDays)
+	if err != nil {
+		// §MT 开户失败统一 409：用户名撞车/租户满额(ErrTenantQuota)/租户停用(ErrTenantDisabled)等
+		writeError(w, 409, err.Error())
+		return
+	}
+	opslog.Audit("user_create", userIDFor(r), user.ID, "tenant="+tenantID)
+	log.Printf("[admin] 创建用户 %s (role=%s perms=%v expires_days=%d tenant=%s)", req.Username, user.Role, req.Perms, req.ExpiresDays, tenantID)
+	writeJSON(w, 201, map[string]interface{}{"user": user.PublicUser()})
+}
+
+// setUserRoleReq 设置角色请求体。
+// English: setUserRoleReq is the set-role request body.
+type setUserRoleReq struct {
+	Role string `json:"role"` // 目标角色
+}
+
+// handleSetUserRole 处理 POST /api/admin/users/{id}/role：设置用户角色。
+// English: handles POST /api/admin/users/{id}/role — sets a user's role.
+func (s *Server) handleSetUserRole(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	// §MT 租户作用域护栏：租户 admin 仅可操作本租户成员，平台运营者不限。
+	if !s.denyOutOfScope(w, r, id) {
+		return
+	}
+	var req setUserRoleReq
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, 400, "invalid request body")
+		return
+	}
+	if err := s.auth.SetRole(id, req.Role); err != nil {
+		writeError(w, 400, err.Error())
+		return
+	}
+	log.Printf("[admin] 用户 %s 角色 → %s", id, req.Role)
+	writeJSON(w, 200, map[string]string{"status": "ok"})
+}
+
+// setUserPermsReq 设置权限位请求体。
+// English: setUserPermsReq is the set-perms request body.
+type setUserPermsReq struct {
+	Perms []string `json:"perms"` // 权限位列表（整体覆盖）
+}
+
+// handleSetUserPerms 处理 POST /api/admin/users/{id}/perms：整体覆盖用户权限位列表。
+// English: handles POST /api/admin/users/{id}/perms — overwrites a user's whole permission-bit list.
+func (s *Server) handleSetUserPerms(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	// §MT 租户作用域护栏：租户 admin 仅可操作本租户成员，平台运营者不限。
+	if !s.denyOutOfScope(w, r, id) {
+		return
+	}
+	var req setUserPermsReq
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, 400, "invalid request body")
+		return
+	}
+	if err := s.auth.SetPerms(id, req.Perms); err != nil {
+		writeError(w, 400, err.Error())
+		return
+	}
+	log.Printf("[admin] 用户 %s 权限 → %v", id, req.Perms)
+	writeJSON(w, 200, map[string]string{"status": "ok"})
+}
+
+// setUserPasswordReq 重置密码请求体。
+// English: setUserPasswordReq is the password-reset request body.
+type setUserPasswordReq struct {
+	Password string `json:"password"` // 新密码
+}
+
+// handleSetUserPassword 处理 POST /api/admin/users/{id}/password：重置用户密码并重签令牌。
+// English: handles POST /api/admin/users/{id}/password — resets a user's password and re-issues the token.
+func (s *Server) handleSetUserPassword(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	// §MT 租户作用域护栏：租户 admin 仅可操作本租户成员，平台运营者不限。
+	if !s.denyOutOfScope(w, r, id) {
+		return
+	}
+	var req setUserPasswordReq
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, 400, "invalid request body")
+		return
+	}
+	if err := s.auth.ChangePassword(id, req.Password); err != nil {
+		writeError(w, 400, err.Error())
+		return
+	}
+	opslog.Audit("password_reset", userIDFor(r), id, "ok")
+	log.Printf("[admin] 用户 %s 已重置密码", id)
+	writeJSON(w, 200, map[string]string{"status": "ok"})
+}
+
+// setUserEnabledReq 启/禁用请求体。
+// English: setUserEnabledReq is the enable/disable request body.
+type setUserEnabledReq struct {
+	Enabled bool `json:"enabled"` // 是否启用
+}
+
+// setUserExpiryReq 设置有效期请求体。
+// English: setUserExpiryReq is the set-expiry request body.
+type setUserExpiryReq struct {
+	ExpiresDays int `json:"expires_days"` // 有效期天数（0=永久）
+	// English: validity days (0 = permanent).
+}
+
+// handleSetUserExpiry 处理 POST /api/admin/users/{id}/expiry：设置账号有效期天数（0=永久）。
+// English: handles POST /api/admin/users/{id}/expiry — sets an account's validity in days (0 = permanent).
+func (s *Server) handleSetUserExpiry(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	// §MT 租户作用域护栏：租户 admin 仅可操作本租户成员，平台运营者不限。
+	if !s.denyOutOfScope(w, r, id) {
+		return
+	}
+	var req setUserExpiryReq
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, 400, "invalid request body")
+		return
+	}
+	if err := s.auth.SetExpiry(id, req.ExpiresDays); err != nil {
+		writeError(w, 400, err.Error())
+		return
+	}
+	log.Printf("[admin] 用户 %s 有效期天数 → %d", id, req.ExpiresDays)
+	writeJSON(w, 200, map[string]string{"status": "ok"})
+}
+
+// handleSetUserEnabled 处理 POST /api/admin/users/{id}/enabled：启用/禁用账号。
+// English: handles POST /api/admin/users/{id}/enabled — enables/disables an account.
+func (s *Server) handleSetUserEnabled(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	// §MT 租户作用域护栏：租户 admin 仅可操作本租户成员，平台运营者不限。
+	if !s.denyOutOfScope(w, r, id) {
+		return
+	}
+	var req setUserEnabledReq
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, 400, "invalid request body")
+		return
+	}
+	if err := s.auth.SetEnabled(id, req.Enabled); err != nil {
+		writeError(w, 400, err.Error())
+		return
+	}
+	log.Printf("[admin] 用户 %s enabled=%v", id, req.Enabled)
+	writeJSON(w, 200, map[string]string{"status": "ok"})
+}
+
+// handleDeleteUser 处理 DELETE /api/admin/users/{id}：删除用户（管理员不可删）。
+// English: handles DELETE /api/admin/users/{id} — deletes a user (admins cannot be deleted).
+func (s *Server) handleDeleteUser(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	// §MT 租户作用域护栏：租户 admin 仅可操作本租户成员，平台运营者不限。
+	if !s.denyOutOfScope(w, r, id) {
+		return
+	}
+	if err := s.auth.DeleteUser(id); err != nil {
+		writeError(w, 400, err.Error())
+		return
+	}
+	log.Printf("[admin] 已删除用户 %s", id)
+	writeJSON(w, 200, map[string]string{"status": "ok"})
+}
+
+// ── 管理员代配他人账号配置 ──
+// English: --- admin-side provisioning of other accounts' configuration ---
+
+// handleAdminGetStrategyConfig 处理 GET /api/admin/users/{id}/config/strategy：
+// 读取指定账号的战法参数（账号级覆盖优先，否则全局）。
+// English: handles GET /api/admin/users/{id}/config/strategy — reads the account's strategy params
+// (account-level override wins, otherwise the global config).
+func (s *Server) handleAdminGetStrategyConfig(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	// §MT 租户作用域护栏：租户 admin 仅可操作本租户成员，平台运营者不限。
+	if !s.denyOutOfScope(w, r, id) {
+		return
+	}
+	if s.cfg == nil {
+		writeError(w, 503, "配置未接入")
+		return
+	}
+	writeJSON(w, 200, s.cfg.GetStrategyConfigFor(id))
+}
+
+// handleAdminSetStrategyConfig 处理 POST /api/admin/users/{id}/config/strategy：
+// 保存指定账号的战法参数覆盖。
+// English: handles POST /api/admin/users/{id}/config/strategy — saves the account's strategy param overrides.
+func (s *Server) handleAdminSetStrategyConfig(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	// §MT 租户作用域护栏：租户 admin 仅可操作本租户成员，平台运营者不限。
+	if !s.denyOutOfScope(w, r, id) {
+		return
+	}
+	if s.cfg == nil {
+		writeError(w, 503, "配置未接入")
+		return
+	}
+	var cfg config.StrategyConfig
+	if err := json.NewDecoder(r.Body).Decode(&cfg); err != nil {
+		writeError(w, 400, "invalid request body")
+		return
+	}
+	s.cfg.SetStrategyConfigFor(id, &cfg)
+	log.Printf("[admin] 用户 %s 战法参数已保存", id)
+	writeJSON(w, 200, map[string]string{"status": "ok"})
+}
+
+// handleAdminGetD1Config 处理 GET /api/admin/users/{id}/config/d1。
+// English: handles GET /api/admin/users/{id}/config/d1.
+func (s *Server) handleAdminGetD1Config(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	// §MT 租户作用域护栏：租户 admin 仅可操作本租户成员，平台运营者不限。
+	if !s.denyOutOfScope(w, r, id) {
+		return
+	}
+	if s.cfg == nil {
+		writeError(w, 503, "配置未接入")
+		return
+	}
+	writeJSON(w, 200, s.cfg.GetD1ConfigFor(id))
+}
+
+// handleAdminSetD1Config 处理 POST /api/admin/users/{id}/config/d1。
+// English: handles POST /api/admin/users/{id}/config/d1.
+func (s *Server) handleAdminSetD1Config(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	// §MT 租户作用域护栏：租户 admin 仅可操作本租户成员，平台运营者不限。
+	if !s.denyOutOfScope(w, r, id) {
+		return
+	}
+	if s.cfg == nil {
+		writeError(w, 503, "配置未接入")
+		return
+	}
+	var cfg config.D1Config
+	if err := json.NewDecoder(r.Body).Decode(&cfg); err != nil {
+		writeError(w, 400, "invalid request body")
+		return
+	}
+	s.cfg.SetD1ConfigFor(id, &cfg)
+	log.Printf("[admin] 用户 %s D1 规则已保存", id)
+	writeJSON(w, 200, map[string]string{"status": "ok"})
+}
+
+// handleAdminGetLongShortConfig 处理 GET /api/admin/users/{id}/config/longshort。
+// English: handles GET /api/admin/users/{id}/config/longshort.
+func (s *Server) handleAdminGetLongShortConfig(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	// §MT 租户作用域护栏：租户 admin 仅可操作本租户成员，平台运营者不限。
+	if !s.denyOutOfScope(w, r, id) {
+		return
+	}
+	if s.cfg == nil {
+		writeError(w, 503, "配置未接入")
+		return
+	}
+	writeJSON(w, 200, s.cfg.GetLongShortConfigFor(id))
+}
+
+// handleAdminSetLongShortConfig 处理 POST /api/admin/users/{id}/config/longshort。
+// English: handles POST /api/admin/users/{id}/config/longshort.
+func (s *Server) handleAdminSetLongShortConfig(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	// §MT 租户作用域护栏：租户 admin 仅可操作本租户成员，平台运营者不限。
+	if !s.denyOutOfScope(w, r, id) {
+		return
+	}
+	if s.cfg == nil {
+		writeError(w, 503, "配置未接入")
+		return
+	}
+	var cfg config.LongShortConfig
+	if err := json.NewDecoder(r.Body).Decode(&cfg); err != nil {
+		writeError(w, 400, "invalid request body")
+		return
+	}
+	s.cfg.SetLongShortConfigFor(id, cfg)
+	log.Printf("[admin] 用户 %s 做多/做空开关已保存", id)
+	writeJSON(w, 200, map[string]string{"status": "ok"})
+}
+
+// handleAdminGetLLMConfig 处理 GET /api/admin/users/{id}/config/llm：
+// 读取指定账号的 LLM 配置（含多 key）。
+// English: handles GET /api/admin/users/{id}/config/llm — reads the account's LLM config (incl. multiple keys).
+func (s *Server) handleAdminGetLLMConfig(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	// §MT 租户作用域护栏：租户 admin 仅可操作本租户成员，平台运营者不限。
+	if !s.denyOutOfScope(w, r, id) {
+		return
+	}
+	if s.cfg == nil {
+		writeError(w, 503, "配置未接入")
+		return
+	}
+	// 读取账号级 LLM 配置，多 key 优先（兼容旧单 key 配置）。
+	cfg := s.cfg.GetLLMConfigFor(id)
+	var apiKeys []string
+	if v, ok := s.auth.GetConfig(id, "llm_api_keys"); ok && v != "" {
+		apiKeys = splitLLMKeys(v)
+	}
+	if len(apiKeys) == 0 {
+		if v, ok := s.auth.GetConfig(id, "llm_api_key"); ok && v != "" {
+			apiKeys = []string{v}
+		}
+	}
+	writeJSON(w, 200, map[string]interface{}{
+		"api_url":           cfg.APIURL,
+		"api_keys":          apiKeys,
+		"model":             cfg.Model,
+		"stream":            cfg.StreamingEnabled(),
+		"timeout_sec":       cfg.TimeoutSec,
+		"batch_concurrency": cfg.BatchConcurrency,
+		"classifier_model":  cfg.ClassifierModel,
+	})
+}
+
+// handleAdminSetLLMConfig 处理 POST /api/admin/users/{id}/config/llm：
+// 管理员保存指定账号的 LLM 配置。
+//
+// §P0 2026-09-18 收口：本端点此前是**独立实现**（只落盘、不热生效，且不做脱敏哨兵解析、
+// 不保留空值原义）——与设置页那条路径口径分叉，于是它同时继承了那两个老缺陷：
+// 把回显的掩码当成真钥落库、把只改 Key 的提交里的空 api_url/model 写成空串。
+// 现在统一走 applyLLM 这一份实现（探测 → 热切换 → 落库），口径与设置页完全一致。
+//
+// 是否热生效仍按归属判定：LLM 配置归属运营账号（ownerOf），因此**只有当被改账号的配置
+// 归属到运营账号时**才动全局运行时客户端——这正是"改的到底是不是那一份全局配置"的判据。
+// 多租户下改的是别家运营者的配置时，只落库、不动本进程的全局客户端（避免互相扰动）。
+// English: unified with the settings-page path. It hot-applies only when the edited account's
+// config resolves to this process's operator account (i.e. it IS the global runtime config).
+func (s *Server) handleAdminSetLLMConfig(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	// §MT 租户作用域护栏：租户 admin 仅可操作本租户成员，平台运营者不限。
+	if !s.denyOutOfScope(w, r, id) {
+		return
+	}
+	if s.cfg == nil {
+		writeError(w, 503, "配置未接入")
+		return
+	}
+	// 解析请求体为 LLM 配置结构（非法 JSON 直接拒绝）。
+	var req setLLMConfigReq
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, 400, "invalid request body")
+		return
+	}
+	// 归属判定：改为运营账号的配置 = 改全局运行时配置 → 与设置页同走「探测 → 切换 → 落库」。
+	owner := s.cfg.ConfigOwnerID(id)
+	hot := owner != "" && owner == s.operatorID() && s.llmRecreate != nil
+	res, status, msg := s.runLLMApplyFor(id, req, hot)
+	if msg != "" {
+		writeError(w, status, msg)
+		return
+	}
+	if !hot {
+		log.Printf("[admin] 用户 %s 的 LLM 配置已保存（归属 %s，非本机运营账号 → 仅落库不热切换）", id, owner)
+	}
+	writeLLMApplyResult(w, status, res, res.Reason)
+}
+
+// handleAdminGetQMTConfig 处理 GET /api/admin/users/{id}/config/qmt（§2026-09-07 多账号实盘）：
+// 管理员读取指定账号的 QMT 实盘配置（token 脱敏）。
+// English: handles GET /api/admin/users/{id}/config/qmt — admin reads an account's QMT live config.
+func (s *Server) handleAdminGetQMTConfig(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	// §MT 租户作用域护栏：租户 admin 仅可操作本租户成员，平台运营者不限。
+	if !s.denyOutOfScope(w, r, id) {
+		return
+	}
+	if s.cfg == nil {
+		writeError(w, 503, "配置未接入")
+		return
+	}
+	log.Printf("[diag-qmt] admin GET /api/admin/users/%s/config/qmt operator=%s", id, s.operatorID())
+	writeJSON(w, 200, qmtConfigView(s.cfg.GetQMTConfigFor(id), s.knownStrategyList()))
+}
+
+// handleAdminSetQMTConfig 处理 POST /api/admin/users/{id}/config/qmt（§2026-09-07 多账号实盘）：
+// 管理员为指定账号局部合并保存 QMT 实盘配置（逐账号独立 gateway/token/资金，落该账号规则快照，
+// 引擎 syncAccountConfig 5s 热同步生效）。复用 applySetQMTConfig 与 /api/config/qmt 完全同口径
+// （指针字段=本次要改的，nil=保持原值；token 脱敏哨兵/空串保持原值）。
+// English: handles POST /api/admin/users/{id}/config/qmt — admin merges an account's QMT live config
+// (per-account gateway/token/capital; hot-synced within 5s). Reuses applySetQMTConfig, identical
+// validation/semantics to the operator endpoint.
+func (s *Server) handleAdminSetQMTConfig(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	// §MT 租户作用域护栏：租户 admin 仅可操作本租户成员，平台运营者不限。
+	if !s.denyOutOfScope(w, r, id) {
+		return
+	}
+	if s.cfg == nil {
+		writeError(w, 503, "配置未接入")
+		return
+	}
+	var req setQMTConfigReq
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, 400, "invalid request body")
+		return
+	}
+	s.applySetQMTConfig(w, userIDFor(r), id, req)
+}

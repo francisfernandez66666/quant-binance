@@ -1,0 +1,360 @@
+// optimizations.go 参数优化 API（§P2-f STRATEGY_OPTIMIZE_PLAN）。
+//
+// POST /api/backtest/optimize                          入队全库扫参任务（high 优先级）
+// GET  /api/research/optimizations                     扫参任务列表（按任务倒序分组）
+// POST /api/research/optimizations/{id}/approve        审批：参数覆盖写库规则 + 热重载
+// POST /api/research/optimizations/{id}/reject         淘汰该排名行
+//
+// English: sweep-optimizer endpoints — enqueue, list, approve (persist rule-level overrides and
+// hot-reload the engine), reject.
+package server
+
+import (
+	"encoding/json"
+	"fmt"
+	"hash/fnv"
+	"log"
+	"net/http"
+	"reflect"
+	"strconv"
+	"strings"
+	"time"
+
+	"quant-trading-v2/internal/paper"
+	"quant-trading-v2/internal/research"
+	"quant-trading-v2/internal/store"
+)
+
+// handleOptimizeEnqueue 处理 POST /api/backtest/optimize：
+// payload {kind:"optimize", objective, start?, end?, top_n?}，ref_id 固定 0（全库一次一个）。
+func (s *Server) handleOptimizeEnqueue(w http.ResponseWriter, r *http.Request) {
+	// §UAT-D6 寻优任务吃满 CPU/数据源配额，按用户 20 次/5 分钟封顶。
+	// 初版取 5/5min 过紧：W6 e2e 合法连发 4 objective + 1 幂等重发即 5 次，重跑或真实研究
+	// 多标的扫参秒撞墙。20 仍能拦失控脚本，却不误伤合法批处理（队列为串行为主，此处仅防刷）。
+	if !s.userRateLimit(r, "bt-optimize", 20, 5*time.Minute) {
+		rejectRateLimit(w, 5*time.Minute)
+		return
+	}
+	var body struct {
+		Objective string `json:"objective"`
+		Start     string `json:"start"`
+		End       string `json:"end"`
+		TopN      int    `json:"top_n"`
+	}
+	if r.Body != nil {
+		_ = json.NewDecoder(r.Body).Decode(&body)
+	}
+	payload := map[string]any{"kind": "optimize"}
+	if body.Objective != "" {
+		payload["objective"] = body.Objective
+	}
+	if body.Start != "" {
+		payload["start"] = body.Start
+	}
+	if body.End != "" {
+		payload["end"] = body.End
+	}
+	if body.TopN > 0 {
+		payload["top_n"] = body.TopN
+	}
+	// §W6 修复：objective 分槽——不同优化目标使用不同 ref_id 槽位，
+	// 避免旧行为"任意时刻只允许 1 个扫参任务、后续 objective 请求被 HasActiveTaskByRef 静默吞掉"
+	// （前端 4 次切目标提交 → 实际只跑首次那条 → 结果永远一致）。
+	// 相同 objective 内部仍幂等（同一目标不会同时排队两条相同扫参）。
+	// English: W6 — slot ref_id by objective; prevents HasActiveTaskByRef from silently dropping
+	// follow-up optimize requests with a different objective while a prior one is still queued.
+	id, _, err := s.enqueueBacktestTask(store.TaskBacktestStrategy, optRefIDFor(body.Objective), payload)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusAccepted, map[string]any{"task_id": id, "status": "queued", "objective": body.Objective, "ref_id": optRefIDFor(body.Objective)})
+}
+
+// optTaskRefID 扫参任务默认槽位（盈亏比 objective 或未指定时的历史值，兼容旧数据）。
+// English: default (profitFactor / unknown) slot for optimize tasks.
+const optTaskRefID int64 = 990
+
+// optRefIDFor 按优化目标返回稳定的槽位 id。
+// 已知 5 目标占 990-994（盈亏比沿用历史 990，其他 4 目标顺序排布），未知目标兜底
+// 走 FNV32 散列到 1000-1099 段（不与已知槽冲突）。同 objective 幂等，跨 objective 互不遮挡。
+// English: stable slot per objective; known objectives use 990-994, unknown fall back to a
+// hashed 1000-1099 range. Same-objective requests dedup, different-objective don't collide.
+func optRefIDFor(objective string) int64 {
+	switch strings.ToLower(strings.TrimSpace(objective)) {
+	case "", "profitfactor":
+		return 990
+	case "winrate":
+		return 991
+	case "avgwin":
+		return 992
+	case "expectancy":
+		return 993
+	case "calmar":
+		return 994
+	default:
+		h := fnv.New32a()
+		_, _ = h.Write([]byte(strings.ToLower(strings.TrimSpace(objective))))
+		return 1000 + int64(h.Sum32()%100)
+	}
+}
+
+// handleOptimizationList 处理 GET /api/research/optimizations。
+// §B 每行附加「模拟盘实测」：按 战法→池 映射取池级真实绩效（胜率/期望/成交笔数），
+// 前端与回测最优并排对比——回测冠军是否在模拟盘复现一眼可见。
+func (s *Server) handleOptimizationList(w http.ResponseWriter, r *http.Request) {
+	if s.researchDB == nil {
+		writeError(w, http.StatusServiceUnavailable, "研究库未接入")
+		return
+	}
+	list, err := s.researchDB.ListOptimizations(20)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	// §RFIX-4 expired 终态默认过滤（?all=1 可见）：夜间 lifecycle 会把超期未审批的 pending
+	// 行置 expired，历史过期行不再淹没审批列表。请求为 nil（形状契约测试）时不过滤不 panic。
+	if r != nil && r.URL.Query().Get("all") != "1" {
+		filtered := make([]map[string]any, 0, len(list))
+		for _, task := range list {
+			results, _ := task["results"].([]*store.OptimizationResult)
+			kept := make([]*store.OptimizationResult, 0, len(results))
+			for _, row := range results {
+				if row.Status != "expired" {
+					kept = append(kept, row)
+				}
+			}
+			if len(kept) == 0 {
+				continue // 整任务全过期 → 不再展示
+			}
+			task["results"] = kept
+			filtered = append(filtered, task)
+		}
+		list = filtered
+	}
+	pe := s.paperEngineFor(requestUserIDSafe(r))
+	for _, task := range list {
+		results, _ := task["results"].([]*store.OptimizationResult)
+		for _, row := range results {
+			poolKey := paper.PoolKeyForStrategy(row.Strategy, row.StrategyKind)
+			if poolKey == "" || pe == nil {
+				continue // 其他池（手动/兜底）不下发也不回显
+			}
+			st := pe.PoolStats(poolKey)
+			row.PoolStats = &store.PoolLiveStats{
+				WinRatePct: st.WinRatePct,
+				Expectancy: st.Expectancy,
+				FilledBuys: st.FilledBuys,
+				// §Phase3 A/B 对照组：回显池组标签（A=回测最优/B=灰度观察）
+				// English: Phase-3 A/B group tag echoed for the pool.
+				ABGroup: pe.PoolABGroup(poolKey),
+			}
+		}
+	}
+	writeJSON(w, 200, map[string]any{"optimizations": list})
+}
+
+// handleOptimizationApprove 处理 POST /api/research/optimizations/{id}/approve：
+// 规则级参数覆盖写入 applied_*.json（因子含 buy_threshold；形态仅出场），随后热重载引擎；
+// 内置战法（无 strategy_kind）不支持入库，返回 400 提示走设置页。
+func (s *Server) handleOptimizationApprove(w http.ResponseWriter, r *http.Request) {
+	id, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
+	if err != nil {
+		writeError(w, 400, "无效 id")
+		return
+	}
+	row, err := s.researchDB.GetOptimization(id)
+	if err != nil || row == nil {
+		writeError(w, 404, "排名记录不存在")
+		return
+	}
+	p := row.Params
+	// §回测自动增强 D：可选 body {params:{...}} 用 Pareto 推荐解参数覆盖冠军行参数——
+	// 前端「应用推荐解」直接提交 grid_json.pareto.recommended.params，落库行与审计仍走本 id。
+	overridden := false
+	if r.Body != nil {
+		var body struct {
+			Params *store.SweepParams `json:"params"`
+		}
+		if derr := json.NewDecoder(r.Body).Decode(&body); derr == nil && body.Params != nil {
+			if body.Params.TakeProfitPct > 0 || body.Params.HoldDays > 0 {
+				p = *body.Params
+				overridden = true
+			}
+		}
+	}
+	// §F4 修复：override 生效时把实际写入的规则参数同步回排名行 params 列，
+	// 否则重开页面卡片显示旧冠军、applied_*.json 却是推荐解，两处数字对不上。
+	if overridden {
+		if uerr := s.researchDB.UpdateOptimizationParams(id, p); uerr != nil {
+			log.Printf("[optimize] 排名行 #%d 参数回写失败（已应用配置不受影响）: %v", id, uerr)
+		} else {
+			row.Params = p
+		}
+	}
+	if row.StrategyKind == "" {
+		// §内置战法一键应用：四内置均写统一出场旋钮（trailing_drawback_pct/max_hold_days）
+		if err := s.applyBuiltinOptParams(row); err != nil {
+			writeError(w, 400, err.Error())
+			return
+		}
+		// §A2 寻优门槛下发池纪律（用户拍板）：内置信号 Confidence 即 D1 分，
+		// 与寻优的分位门槛同口径——写入对应战法池 MinScore，模拟盘入场按最优门槛过滤。
+		s.applyPoolMinScore(requestUserID(r), row)
+		_ = s.researchDB.UpdateOptimizationStatus(id, "approved")
+		writeJSON(w, 200, map[string]any{"status": "approved", "id": id})
+		return
+	}
+	if err := research.ApplyOptimizationParams(s.researchDir, row.StrategyKind,
+		p.TakeProfitPct, p.StopLossPct, p.HoldDays, p.MinScore); err != nil {
+		writeError(w, 500, err.Error())
+		return
+	}
+	_ = s.researchDB.UpdateOptimizationStatus(id, "approved")
+	s.reloadRulesByKind(row.StrategyKind) // 热重载对应库文件，实盘即时生效
+	// §A2 库规则行同样把门槛下发 factor/pattern 池纪律（模拟盘入场同步过滤）
+	s.applyPoolMinScore(requestUserID(r), row)
+	// §RFIX-3 应用守卫：阈值覆盖 + 候选预期触发=0 → 响应带非阻断 warning（审批人决策）。
+	writeJSON(w, 200, map[string]any{"status": "approved", "id": id,
+		"warning": thresholdOverrideWarning(s.researchDB, row.StrategyKind, p.MinScore)})
+}
+
+// thresholdOverrideWarning §RFIX-3 阈值覆盖守卫提示：扫参审批把因子战法 buy_threshold
+// 覆盖为更高值时，若来源候选的 reason 含「预期触发=0」（发现期样本内日均触发估算，
+// §RFIX-3 item1 落库），提示该战法应用后大概率仍零信号。只提示不阻断。
+// 生产教训：fac_1 应用 min_score=95 后实盘零信号数月（候选缺省阈值 70 都没触发过）。
+// English: non-blocking apply guard — warn when an approved sweep threshold exceeds the
+// candidate default AND the candidate reason says in-sample expected triggers are zero.
+func thresholdOverrideWarning(db *store.DB, kind string, minScore float64) string {
+	if db == nil || minScore <= 0 || !strings.HasPrefix(kind, "fac_") {
+		return ""
+	}
+	cid, err := strconv.ParseInt(strings.TrimPrefix(kind, "fac_"), 10, 64)
+	if err != nil || cid <= 0 {
+		return ""
+	}
+	c, err := db.CandidateByID(cid)
+	if err != nil || c == nil || !strings.Contains(c.Reason, "预期触发=0") {
+		return ""
+	}
+	var rule struct {
+		BuyThreshold float64 `json:"buy_threshold"`
+	}
+	_ = json.Unmarshal([]byte(c.Weights), &rule)
+	if minScore > rule.BuyThreshold {
+		return fmt.Sprintf("已把买入阈值覆盖为 %.0f（候选缺省 %.0f），且候选产出期样本内预期触发=0 只/日——应用后大概率仍无信号，建议降低阈值或待重新发现候选。", minScore, rule.BuyThreshold)
+	}
+	return ""
+}
+
+// applyPoolMinScore 把寻优排名行的门槛分数写入对应模拟盘战法池的买入纪律（§A2）。
+// 映射失败（未知战法→"" 其他池）静默跳过——其他池是手动/兜底池，不自动改纪律。
+// §Phase4 同时下发参考 IR（信息比率）供动态仓位缩放。
+// English: pushes an optimization row's min_score into the matching paper pool's buy discipline,
+// and (Phase 4) also pushes its reference IR for dynamic position sizing. Silently skips
+// unmappable strategies — the "other" pool is manual/fallback and never auto-tuned.
+func (s *Server) applyPoolMinScore(userID string, row *store.OptimizationResult) {
+	poolKey := paper.PoolKeyForStrategy(row.Strategy, row.StrategyKind)
+	if poolKey == "" {
+		return
+	}
+	if pe := s.paperEngineFor(userID); pe != nil {
+		pe.ApplyPoolMinScore(poolKey, row.Params.MinScore)
+		// §Phase4 IR 动态仓位基准：排名行无独立 IR 字段，用 Sharpe 作为风险调整收益代理
+		// （年均化夏普与 IR 同为风险调整口径，动态仓位语义一致）。
+		// English: Phase-4 IR-scale basis — the sweep row has no IR column, so Sharpe stands in as the
+		// risk-adjusted-return proxy (same spirit as IR for dynamic sizing).
+		pe.SetPoolIR(poolKey, row.Sharpe)
+	}
+}
+
+// handleOptimizationReject 处理 POST /api/research/optimizations/{id}/reject。
+func (s *Server) handleOptimizationReject(w http.ResponseWriter, r *http.Request) {
+	id, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
+	if err != nil {
+		writeError(w, 400, "无效 id")
+		return
+	}
+	if err := s.researchDB.UpdateOptimizationStatus(id, "rejected"); err != nil {
+		writeError(w, 500, err.Error())
+		return
+	}
+	writeJSON(w, 200, map[string]any{"status": "rejected", "id": id})
+}
+
+// reloadRulesByKind 按规则 ID 前缀热重载对应的战法库（审批后实盘即时生效）。
+func (s *Server) reloadRulesByKind(kind string) {
+	// 取第一个可用引擎（注册表模式或单引擎模式均可）。
+	// 注意：ctrlFor("") 在注册表模式下会返回带 nil 值的接口（Go 经典陷阱），
+	// 所以改用 AllControllers 取第一个非 nil 引擎。
+	var c EngineController
+	if s.registry != nil {
+		for _, cc := range s.registry.AllControllers() {
+			if cc != nil {
+				c = cc
+				break
+			}
+		}
+	} else {
+		c = s.ctrl
+	}
+	if c == nil {
+		return
+	}
+	// 二次防护：反射检查底层值是否非 nil，避免 *Engine 转 interface 的非 nil 陷阱。
+	if reflect.ValueOf(c).Kind() == reflect.Ptr && reflect.ValueOf(c).IsNil() {
+		return
+	}
+	if len(kind) >= 4 && kind[:4] == "fac_" {
+		c.ReloadFactorRules(s.researchDir)
+	} else if len(kind) >= 4 && kind[:4] == "pat_" {
+		c.ReloadPatternRules(s.researchDir)
+	}
+}
+
+// applyBuiltinOptParams 内置战法的一键应用（§P2 反馈升级版）：四个手写战法全部支持——
+// 把扫参冠军的 移动止盈回撤% + 最长持仓天 写进各自 config 段的统一出场旋钮
+// （trailing_drawback_pct/max_hold_days，CheckExit 最前执行），落盘后引擎主循环每轮
+// HotReload 自动生效；语义与扫参排名的统一出场引擎完全同口径。原有个股规则（破板/
+// 止盈止损等）保持不动、仍在其后生效。min_score 不应用于内置（其入场门槛是内部评分结构）。
+func (s *Server) applyBuiltinOptParams(row *store.OptimizationResult) error {
+	cfg := s.cfg.GetStrategyConfig()
+	if cfg == nil {
+		return fmt.Errorf("策略配置未初始化")
+	}
+	p := row.Params
+	apply := func(trail *float64, hold *int) {
+		if p.TakeProfitPct > 0 {
+			*trail = p.TakeProfitPct
+		}
+		if p.HoldDays > 0 {
+			*hold = p.HoldDays
+		}
+	}
+	switch row.Strategy {
+	case "双响炮":
+		apply(&cfg.DoubleBump.TrailingDrawbackPct, &cfg.DoubleBump.MaxHoldDays)
+		if p.StopLossPct > 0 {
+			cfg.DoubleBump.DoubleBumpTakeProfitPct = p.StopLossPct
+		}
+	case "龙头":
+		apply(&cfg.Dragon.TrailingDrawbackPct, &cfg.Dragon.MaxHoldDays)
+	case "龙回头":
+		apply(&cfg.DragonReturn.TrailingDrawback, &cfg.DragonReturn.MaxHoldDays)
+		if p.StopLossPct > 0 {
+			cfg.DragonReturn.StopLossPct = p.StopLossPct
+		}
+		if p.TakeProfitPct > 0 {
+			cfg.DragonReturn.TakeProfitPct = p.TakeProfitPct
+		}
+	case "N形":
+		apply(&cfg.NShape.TrailingDrawbackPct, &cfg.NShape.MaxHoldDays)
+		if p.StopLossPct > 0 {
+			cfg.NShape.HardStopLoss = p.StopLossPct / 100
+		}
+	default:
+		return fmt.Errorf("未知内置战法：%s", row.Strategy)
+	}
+	s.cfg.SetStrategyConfig(cfg)
+	return nil
+}

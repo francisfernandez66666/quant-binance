@@ -1,0 +1,491 @@
+// ths_special.go 同花顺（新）盘口特色数据表：涨停/跌停/炸板三池、连板天梯、个股异动
+// （§HITHINK_DATA_SOURCE_PLAN D3 数据层）。全部按 (trade_date, ts_code[, board/tag]) 幂等 upsert。
+package store
+
+import (
+	"database/sql"
+	"encoding/json"
+)
+
+// ThsLimitUpRow 涨停池行。
+type ThsLimitUpRow struct {
+	TradeDate     string  // yyyyMMdd（交易日）
+	TsCode        string  // TS代码
+	Name          string  // 名称
+	IsST          bool    // 是否ST
+	IsNew         bool    // 未开板新股
+	Price         float64 // 价格
+	PctChg        float64 // 涨跌幅（已×100）
+	FirstSealTime string  // 首次封板 HH:MM
+	ContinueCnt   int     // 连板数
+	ContinueText  string  // "5天4板"
+	LimitReason   string  // 涨停原因（可空）
+	SealMoney     float64 // 当前封单额
+	MaxSealMoney  float64 // 峰值封单额
+}
+
+// UpsertThsLimitUps 批量幂等写入涨停池。
+func (d *DB) UpsertThsLimitUps(rows []ThsLimitUpRow) (int64, error) {
+	if len(rows) == 0 {
+		return 0, nil
+	}
+	tx, err := d.db.Begin()
+	if err != nil {
+		return 0, err
+	}
+	defer func() { _ = tx.Rollback() }()
+	stmt, err := tx.Prepare(`INSERT OR REPLACE INTO ths_limit_up_daily
+		(trade_date, ts_code, name, is_st, is_new, price, pct_chg, first_seal_time,
+		 continue_cnt, continue_text, limit_reason, seal_money, max_seal_money)
+		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)`)
+	if err != nil {
+		return 0, err
+	}
+	defer stmt.Close()
+	var n int64
+	for _, r := range rows {
+		res, err := stmt.Exec(r.TradeDate, r.TsCode, r.Name, b2i(r.IsST), b2i(r.IsNew),
+			r.Price, r.PctChg, r.FirstSealTime, r.ContinueCnt, r.ContinueText,
+			r.LimitReason, r.SealMoney, r.MaxSealMoney)
+		if err != nil {
+			return n, err
+		}
+		aff, _ := res.RowsAffected()
+		n += aff
+	}
+	return n, tx.Commit()
+}
+
+// LimitUpsOnDate 某交易日涨停池（B4 事件合成 / 龙头识别 / 情绪周期消费）。
+func (d *DB) LimitUpsOnDate(date string) ([]ThsLimitUpRow, error) {
+	rows, err := d.db.Query(`SELECT trade_date, ts_code, name, is_st, is_new, price, pct_chg,
+		first_seal_time, continue_cnt, continue_text, limit_reason, seal_money, max_seal_money
+		FROM ths_limit_up_daily WHERE trade_date=? ORDER BY continue_cnt DESC`, date)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []ThsLimitUpRow
+	for rows.Next() {
+		var r ThsLimitUpRow
+		var st, nw int
+		var reason sql.NullString
+		if err := rows.Scan(&r.TradeDate, &r.TsCode, &r.Name, &st, &nw, &r.Price, &r.PctChg,
+			&r.FirstSealTime, &r.ContinueCnt, &r.ContinueText, &reason, &r.SealMoney, &r.MaxSealMoney); err != nil {
+			return nil, err
+		}
+		r.IsST, r.IsNew = st == 1, nw == 1
+		r.LimitReason = reason.String
+		out = append(out, r)
+	}
+	return out, rows.Err()
+}
+
+// LimitUpCountOnDate 某日涨停家数（情绪周期输入）。
+func (d *DB) LimitUpCountOnDate(date string) (int, error) {
+	var n int
+	err := d.db.QueryRow(`SELECT COUNT(*) FROM ths_limit_up_daily WHERE trade_date=?`, date).Scan(&n)
+	return n, err
+}
+
+// ── §ENH-A 单票涨停微结构查询（因子面板装配用）──
+
+// LuEventRow 涨停池个股事件行（面板装配消费的最小字段集）。
+type LuEventRow struct {
+	TradeDate     string  // 交易日 yyyyMMdd
+	ContinueCnt   int     // 连板数
+	FirstSealTime string  // 首封时间 HH:MM
+	MaxSealMoney  float64 // 峰值封单额（元）
+}
+
+// LimitUpsForCode 某标的区间内的涨停池事件行（升序）。索引 (ts_code, trade_date) 支持
+// 面板逐股装配 O(事件数) 读取（生产 5000 股×逐窗调用，不能全表扫）。
+// English: per-code limit-up events over a range, ascending — index-backed for panel assembly.
+func (d *DB) LimitUpsForCode(code, from, to string) ([]LuEventRow, error) {
+	rows, err := d.db.Query(`SELECT trade_date, continue_cnt, first_seal_time, max_seal_money
+		FROM ths_limit_up_daily WHERE ts_code=? AND trade_date BETWEEN ? AND ? ORDER BY trade_date`,
+		code, from, to)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []LuEventRow
+	for rows.Next() {
+		var r LuEventRow
+		var fts string
+		if err := rows.Scan(&r.TradeDate, &r.ContinueCnt, &fts, &r.MaxSealMoney); err != nil {
+			return nil, err
+		}
+		r.FirstSealTime = fts
+		out = append(out, r)
+	}
+	return out, rows.Err()
+}
+
+// BreakCntForCode 某标的区间内逐日开板（炸板）次数：date → open_times。
+// English: per-code daily blast (re-open) counts over a range.
+func (d *DB) BreakCntForCode(code, from, to string) (map[string]int, error) {
+	rows, err := d.db.Query(`SELECT trade_date, open_times FROM ths_break_pool_daily
+		WHERE ts_code=? AND trade_date BETWEEN ? AND ?`, code, from, to)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := map[string]int{}
+	for rows.Next() {
+		var dt string
+		var n int
+		if err := rows.Scan(&dt, &n); err == nil {
+			out[dt] = n
+		}
+	}
+	return out, rows.Err()
+}
+
+// ── 跌停池 / 炸板池（结构对称，字段较少）──
+
+// ThsBreakRow 炸板池单行（开板次数 = 炸板证据）。
+type ThsBreakRow struct {
+	TradeDate string  // yyyyMMdd
+	TsCode    string  // TS代码
+	Name      string  // 名称
+	Price     float64 // 价格
+	PctChg    float64 // 涨跌幅（%）
+	OpenTimes int     // 开板次数
+	Turnover  float64 // 成交额（元）
+}
+
+// BreakPoolOnDate 某交易日炸板池（情绪因子/炸板率消费）。
+func (d *DB) BreakPoolOnDate(date string) ([]ThsBreakRow, error) {
+	rows, err := d.db.Query(`SELECT trade_date, ts_code, name, price, pct_chg, open_times, turnover
+		FROM ths_break_pool_daily WHERE trade_date=?`, date)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []ThsBreakRow
+	for rows.Next() {
+		var r ThsBreakRow
+		if err := rows.Scan(&r.TradeDate, &r.TsCode, &r.Name, &r.Price, &r.PctChg,
+			&r.OpenTimes, &r.Turnover); err != nil {
+			return nil, err
+		}
+		out = append(out, r)
+	}
+	return out, rows.Err()
+}
+
+// EmotionStat 单日市场情绪统计（涨停池 + 炸板池合成）。
+type EmotionStat struct {
+	Date      string  // yyyyMMdd
+	LimitUp   int     // 涨停家数
+	BreakCnt  int     // 炸板家数
+	MaxBoard  int     // 最高连板高度
+	BlastRate float64 // 炸板率（%）：炸板/(涨停+炸板)*100；分母为 0 时 = 0
+}
+
+// EmotionStatsRange 区间内逐日市场情绪统计（按日期升序）。
+// English: per-day market-sentiment stats over [from,to], ascending by date.
+func (d *DB) EmotionStatsRange(from, to string) ([]EmotionStat, error) {
+	var out []EmotionStat
+	dates, err := d.ThsDatesBetween(from, to)
+	if err != nil {
+		return nil, err
+	}
+	// 涨停池按日计数 + 最高连板
+	q1 := `SELECT trade_date, COUNT(*), MAX(continue_cnt) FROM ths_limit_up_daily
+		WHERE trade_date BETWEEN ? AND ? GROUP BY trade_date`
+	rows, err := d.db.Query(q1, from, to)
+	if err != nil {
+		return nil, err
+	}
+	limitByDate := make(map[string][2]int, 64)
+	for rows.Next() {
+		var dt string
+		var cnt, maxBoard int
+		if err := rows.Scan(&dt, &cnt, &maxBoard); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		limitByDate[dt] = [2]int{cnt, maxBoard}
+	}
+	rows.Close()
+	// 炸板池按日计数
+	q2 := `SELECT trade_date, COUNT(*) FROM ths_break_pool_daily
+		WHERE trade_date BETWEEN ? AND ? GROUP BY trade_date`
+	rows, err = d.db.Query(q2, from, to)
+	if err != nil {
+		return nil, err
+	}
+	breakByDate := make(map[string]int, 64)
+	for rows.Next() {
+		var dt string
+		var cnt int
+		if err := rows.Scan(&dt, &cnt); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		breakByDate[dt] = cnt
+	}
+	rows.Close()
+	for _, dt := range dates {
+		lu := limitByDate[dt]
+		bc := breakByDate[dt]
+		total := lu[0] + bc
+		rate := 0.0
+		if total > 0 {
+			rate = float64(bc) / float64(total) * 100
+		}
+		out = append(out, EmotionStat{
+			Date: dt, LimitUp: lu[0], MaxBoard: lu[1], BreakCnt: bc, BlastRate: rate,
+		})
+	}
+	return out, nil
+}
+
+// ThsDatesBetween 区间内已收录行情/涨停数据的交易日（升序去重）。
+// English: trading dates in [from,to] from the THS tables (ascending, deduped).
+func (d *DB) ThsDatesBetween(from, to string) ([]string, error) {
+	rows, err := d.db.Query(`SELECT DISTINCT trade_date FROM ths_limit_up_daily
+		WHERE trade_date BETWEEN ? AND ? ORDER BY trade_date`, from, to)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []string
+	for rows.Next() {
+		var dt string
+		if err := rows.Scan(&dt); err == nil {
+			out = append(out, dt)
+		}
+	}
+	return out, rows.Err()
+}
+
+// UpsertThsSimplePool 通用三池写入（跌停/炸板共用简化列集）。
+// table 仅允许白名单值，防拼接注入。
+func (d *DB) UpsertThsSimplePool(table, tradeDate string, rows map[string]ThsPoolSimple) (int64, error) {
+	switch table {
+	case "ths_limit_down_daily", "ths_break_pool_daily":
+	default:
+		return 0, sql.ErrNoRows
+	}
+	if len(rows) == 0 {
+		return 0, nil
+	}
+	tx, err := d.db.Begin()
+	if err != nil {
+		return 0, err
+	}
+	defer func() { _ = tx.Rollback() }()
+	stmt, err := tx.Prepare(`INSERT OR REPLACE INTO ` + table + `
+		(trade_date, ts_code, name, price, pct_chg, open_times, turnover_ratio_pct, turnover)
+		VALUES (?,?,?,?,?,?,?,?)`)
+	if err != nil {
+		return 0, err
+	}
+	defer stmt.Close()
+	var n int64
+	for code, r := range rows {
+		res, err := stmt.Exec(tradeDate, code, r.Name, r.Price, r.PctChg,
+			r.OpenTimes, r.TurnoverRatioPct, r.Turnover)
+		if err != nil {
+			return n, err
+		}
+		aff, _ := res.RowsAffected()
+		n += aff
+	}
+	return n, tx.Commit()
+}
+
+// ThsPoolSimple 三池简化行（跌停：open_times=0；炸板：open_times=开板次数）。
+type ThsPoolSimple struct {
+	Name             string  // 名称
+	Price            float64 // 价格
+	PctChg           float64 // 涨跌幅
+	OpenTimes        int     // 开板次数
+	TurnoverRatioPct float64 // 换手率
+	Turnover         float64 // 成交额
+}
+
+// ThsLadderRows 连板天梯批量写入。
+func (d *DB) UpsertThsLadder(rows []ThsLadderRow) (int64, error) {
+	if len(rows) == 0 {
+		return 0, nil
+	}
+	tx, err := d.db.Begin()
+	if err != nil {
+		return 0, err
+	}
+	defer func() { _ = tx.Rollback() }()
+	stmt, err := tx.Prepare(`INSERT OR REPLACE INTO ths_ladder_daily
+		(trade_date, board_num, ts_code, name, seal_nextday, sign_level) VALUES (?,?,?,?,?,?)`)
+	if err != nil {
+		return 0, err
+	}
+	defer stmt.Close()
+	var n int64
+	for _, r := range rows {
+		var sn any
+		if r.SealNextDay != nil {
+			sn = b2i(*r.SealNextDay)
+		}
+		res, err := stmt.Exec(r.TradeDate, r.BoardNum, r.TsCode, r.Name, sn, r.SignLevel)
+		if err != nil {
+			return n, err
+		}
+		aff, _ := res.RowsAffected()
+		n += aff
+	}
+	return n, tx.Commit()
+}
+
+// ThsLadderRow 连板天梯物化行。
+type ThsLadderRow struct {
+	TradeDate   string // 交易日期
+	BoardNum    int    // 涨停家数
+	TsCode      string // TS代码
+	Name        string // 名称
+	SealNextDay *bool  // 次日是否封板
+	SignLevel   int    // 信号级别
+}
+
+// UpsertThsAnomalies 异动原因批量写入（keywords 序列化为 JSON 数组）。
+func (d *DB) UpsertThsAnomalies(tradeDate string, items []struct {
+	ThsCode         string
+	Name            string
+	TagName         string
+	AnalysisContent string
+	KeywordList     []string
+}) (int64, error) {
+	if len(items) == 0 {
+		return 0, nil
+	}
+	tx, err := d.db.Begin()
+	if err != nil {
+		return 0, err
+	}
+	defer func() { _ = tx.Rollback() }()
+	stmt, err := tx.Prepare(`INSERT OR REPLACE INTO ths_anomaly_daily
+		(trade_date, ts_code, tag_name, name, analysis_content, keywords)
+		VALUES (?,?,?,?,?,?)`)
+	if err != nil {
+		return 0, err
+	}
+	defer stmt.Close()
+	var n int64
+	for _, it := range items {
+		kw, _ := json.Marshal(it.KeywordList)
+		res, err := stmt.Exec(tradeDate, it.ThsCode, it.TagName, it.Name, it.AnalysisContent, string(kw))
+		if err != nil {
+			return n, err
+		}
+		aff, _ := res.RowsAffected()
+		n += aff
+	}
+	return n, tx.Commit()
+}
+
+// AnomalyForCode 某标的某日异动原因（D1 归因辅证查询）。
+func (d *DB) AnomalyForCode(tsCode, date string) ([]map[string]string, error) {
+	rows, err := d.db.Query(`SELECT tag_name, analysis_content, keywords FROM ths_anomaly_daily
+		WHERE trade_date=? AND ts_code=?`, date, tsCode)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []map[string]string
+	for rows.Next() {
+		var tag, content, kw string
+		if err := rows.Scan(&tag, &content, &kw); err == nil {
+			out = append(out, map[string]string{"tag": tag, "analysis": content, "keywords": kw})
+		}
+	}
+	return out, rows.Err()
+}
+
+// b2i 布尔转整数（SQLite 存储）。
+func b2i(b bool) int {
+	if b {
+		return 1
+	}
+	return 0
+}
+
+// ── 估值快照 / 财务指标（§E 因子输入扩充）──
+
+// ThsValuationRow 估值快照行。
+type ThsValuationRow struct {
+	TradeDate string   // 交易日期
+	TsCode    string   // TS代码
+	PeTtm     *float64 // 市盈率 TTM
+	PeMrq     *float64 // 市盈率 MRQ
+	PbMrq     *float64 // 市净率 MRQ
+	PsTtm     *float64 // 市销率 TTM
+	PcfTtm    *float64 // 市现率 TTM
+}
+
+// UpsertThsValuations 批量幂等写入估值快照。
+func (d *DB) UpsertThsValuations(rows []ThsValuationRow) (int64, error) {
+	if len(rows) == 0 {
+		return 0, nil
+	}
+	tx, err := d.db.Begin()
+	if err != nil {
+		return 0, err
+	}
+	defer func() { _ = tx.Rollback() }()
+	stmt, err := tx.Prepare(`INSERT OR REPLACE INTO ths_valuations_daily
+		(trade_date, ts_code, pe_ttm, pe_mrq, pb_mrq, ps_ttm, pcf_ttm) VALUES (?,?,?,?,?,?,?)`)
+	if err != nil {
+		return 0, err
+	}
+	defer stmt.Close()
+	var n int64
+	for _, r := range rows {
+		res, err := stmt.Exec(r.TradeDate, r.TsCode, r.PeTtm, r.PeMrq, r.PbMrq, r.PsTtm, r.PcfTtm)
+		if err != nil {
+			return n, err
+		}
+		aff, _ := res.RowsAffected()
+		n += aff
+	}
+	return n, tx.Commit()
+}
+
+// ThsFinIndicatorRow 财务指标单行。
+type ThsFinIndicatorRow struct {
+	TsCode  string  // TS代码
+	Report  string  // "2024-4"（报告期）
+	Ability string  // 能力维度：growth/profitability/solvency/operation/cash-flow
+	IndexID string  // 同花顺指标 ID
+	Value   *string // 上游原始精度字符串；null=未披露
+}
+
+// UpsertThsFinIndicators 批量幂等写入财务指标。
+func (d *DB) UpsertThsFinIndicators(rows []ThsFinIndicatorRow) (int64, error) {
+	if len(rows) == 0 {
+		return 0, nil
+	}
+	tx, err := d.db.Begin()
+	if err != nil {
+		return 0, err
+	}
+	defer func() { _ = tx.Rollback() }()
+	stmt, err := tx.Prepare(`INSERT OR REPLACE INTO ths_fin_indicators
+		(ts_code, report, ability, index_id, value) VALUES (?,?,?,?,?)`)
+	if err != nil {
+		return 0, err
+	}
+	defer stmt.Close()
+	var n int64
+	for _, r := range rows {
+		res, err := stmt.Exec(r.TsCode, r.Report, r.Ability, r.IndexID, r.Value)
+		if err != nil {
+			return n, err
+		}
+		aff, _ := res.RowsAffected()
+		n += aff
+	}
+	return n, tx.Commit()
+}

@@ -1,0 +1,75 @@
+# quant-trading-v2 HTTPS 反向代理 + 前端静态托管（Caddy）
+# 部署：见 scripts/deploy_seoul.sh。Caddy 自动申请/续期 Let's Encrypt 证书，无需手动管证书。
+#
+# 使用前：
+#   1. 把下面的域名替换成你的真实域名（DNS A 记录指向服务器 EIP）。
+#
+# 说明：
+#   - 页面级 basic_auth 已移除：前端有自己的登录页，后端 /api/* 由 JWT 鉴权保护。
+#   - 前端（web/dist）静态托管在 /var/www/quant-web，hash 路由无需 SPA fallback。
+#   - /api 前缀（REST + SSE）单独 handle 反代到后端 127.0.0.1:8080，SSE 长连接天然透传。
+#   - 两个 handle 分支按路径互斥：/api/* → 后端；其余（/、/assets/* 等）→ 静态前端。
+#   - CORS 已由后端 corsMiddleware 全开（*），跨域 APK 走 /api 同样可用。
+#   - 同服务器另一项目（翻译助手 translator.quant-trading.top）通过独立 conf 引入，
+#     `import /etc/caddy/translator.conf`（见 deploy/caddy/translator.conf）。
+#     本文件被 deploy_seoul.sh 用 mv 整体覆盖时只含本站点 + import 行，不内联 translator，
+#     保证另一项目配置独立不受影响；两端模板保持一致（均含 import 行）。
+#
+# ⚠️ Caddy 2.9 起 on_demand_tls 必须配置 permission/ask 模块，否则整体拒绝加载（两个项目一起挂）。
+#    下方全局块 + :20928 本机 always-200 端点即为此而设（translator 通配符子域名按需签发证书用）。
+
+{
+    on_demand_tls {
+        ask http://127.0.0.1:20928/
+    }
+}
+
+# on_demand_tls 的 ask 校验端点：恒返回 200，仅监听本机(plain HTTP，显式 http:// 关闭自动 HTTPS)
+http://127.0.0.1:20928 {
+    respond 200
+}
+
+quant-trading.top {
+	# 传输安全与压缩
+	encode gzip
+
+	# 后端 API / SSE（handle 精确匹配 /api 前缀，剥离后反代）
+	handle /api/* {
+		reverse_proxy 127.0.0.1:8080
+	}
+
+	# 前端静态资源（其余所有路径）
+	handle {
+		root * /var/www/quant-web
+		file_server
+		# §GAP-20260826 缓存策略：index.html 必须 no-cache——它是 SPA 的入口，
+		# 浏览器/中间代理若启发式缓存旧 index.html（仅 ETag/Last-Modified 无显式头时会发生），
+		# 部署新版后用户仍加载旧 JS bundle，出现"新功能不存在/数据展示口径陈旧"的假故障
+		# （实录：规则细分池上线后 Web 用户看不到因子分仓 chip）。
+		# 带 hash 的 /assets/* 内容不可变，可放心长缓存 immutable。
+		@html path /
+		header @html Cache-Control "no-store"
+		@api path /api/*
+		header @api Cache-Control "no-store"
+		@assets path /assets/*
+		header @assets Cache-Control "public, max-age=31536000, immutable"
+	}
+
+	# 请求体上限（新闻原文/LLM 咨询可能较大）
+	request_body {
+		max_size 10MB
+	}
+
+	# 日志（可关）
+	log {
+		output file /var/log/caddy/quant.access.log {
+			roll_size 10MiB
+			roll_keep 5
+		}
+	}
+}
+
+# 说明：如无需外部日志，可把整个 log 块删掉。
+
+# ===== 翻译助手（同服务器另一项目，独立 conf，见 deploy/caddy/translator.conf） =====
+import /etc/caddy/translator.conf

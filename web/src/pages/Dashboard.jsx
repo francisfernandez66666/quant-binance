@@ -1,0 +1,454 @@
+// ── 仪表盘页面 Dashboard.jsx ──
+// 聚合展示首页核心数据：策略信号统计、热门个股、宏观日历、IPO、热门板块、
+// 最新资讯、按战法胜率归因、数据源健康与实盘链路状态。
+// 使用 TDesign React 组件（Card / Table / Tag / Button / Dialog）。
+import React, { useState, useEffect, useMemo, useRef } from 'react'
+import { Card, Table, Tag, Button } from 'tdesign-react'
+import * as api from '../api/index.js'
+import { on } from '../sseBus.js'
+import { createStaleGuard } from '../utils/staleGuard.js' // §M-10 轮询后到丢弃
+import LogModal from '../components/LogModal.jsx'
+import Disclaimer from '../components/Disclaimer.jsx'
+import IcpFooter from '../components/IcpFooter'
+import SentimentCard from '../components/SentimentCard.jsx'
+
+// 根据 IPO/上市日期计算倒计时或上市状态
+function ipoCountdown(c) {
+  const ds = c.listing_date || c.ipo_date
+  if (!ds) return c.list_status === 'L' ? '已上市' : '即将上市'
+  const t = new Date(+ds.slice(0, 4), +ds.slice(4, 6) - 1, +ds.slice(6, 8))
+  const diff = Math.ceil((t - Date.now()) / 86400000)
+  if (diff > 0) return `${diff}天后`
+  if (diff === 0) return '📌今天'
+  return `${-diff}天前`
+}
+
+// 将时间戳或 ISO 字符串统一格式化为 MM-DD HH:mm
+function fmtNewsTime(dt) {
+  // 空值直接返回空字符串
+  if (dt === null || dt === undefined || dt === '') return ''
+  const s = String(dt)
+  // 纯数字视为 Unix 时间戳（秒），转换为 Date 对象
+  if (/^\d+$/.test(s)) {
+    const t = new Date(Number(s) * 1000)
+    if (!isNaN(t.getTime())) {
+      const mm = String(t.getMonth() + 1).padStart(2, '0')
+      const dd = String(t.getDate()).padStart(2, '0')
+      const hh = String(t.getHours()).padStart(2, '0')
+      const mi = String(t.getMinutes()).padStart(2, '0')
+      return `${mm}-${dd} ${hh}:${mi}`
+    }
+    return ''
+  }
+  // ISO 字符串截取 MM-DD HH:mm 部分
+  return s.length >= 16 ? s.slice(5, 16) : s
+}
+
+// 格式化盈亏比，处理 Infinity、0 与空值
+function fmtProfitFactor(pf) {
+  if (pf === null || pf === undefined) return '--'
+  if (pf === Infinity) return '∞'
+  if (pf === 0) return '--'
+  return pf.toFixed(2)
+}
+
+// 涨跌百分比配色（红涨绿跌）
+function chgColor(v) {
+  return (v || 0) >= 0 ? 'var(--app-up)' : 'var(--app-down)'
+}
+
+/**
+ * 仪表盘页面组件
+ * 聚合展示策略信号、热门个股、宏观日历、IPO、热门板块、数据源与引擎健康等。
+ * @returns {JSX.Element}
+ */
+// newsMark §M3（2026-09-22）新闻源健康点渲染：后端已改真实探测结构体
+// （{status: ok|down|unknown, ...}，键名 cailanshe 修正拼写）。三态口径——
+// ok=●（绿点）、down=○（确证失败）、unknown=–（从未探测，绝不伪装成健康）。
+// （Tri-state glyph for M3's real probe payload: ok ● / down ○ / unknown –.）
+const newsMark = (entry) =>
+  entry?.status === 'ok' ? '●' : entry?.status === 'unknown' || !entry ? '–' : '○'
+
+// §M-9（2026-09-22 修复批）数据源/引擎健康点统一三态（参照同文件 newsMark 样板）：
+// true|'ok' → ●（确证健康）；false|down → ○（确证失败）；字段缺失/健康接口没拉到 → –（unknown）。
+// 旧实现 `x ? '●' : '○'` 把「从未拉到/接口挂了」画成 ○，与真实故障同形（永远灰点的根因之一）。
+// English: §M-9 — tri-state health glyph; a missing/never-fetched entry renders '–' (unknown),
+// never a fake '○' that masquerades as a confirmed failure.
+const healthMark = (v) => {
+  if (v === undefined || v === null) return '–'
+  if (typeof v === 'object') return v.status === 'ok' ? '●' : v.status === 'down' ? '○' : '–'
+  return v ? '●' : '○'
+}
+
+export default function Dashboard() {
+  // 策略信号列表（来自后端扫描结果）
+  const [signals, setSignals] = useState([])
+  // 引擎/扫描整体状态（含 uptime、scan_stats 等）
+  const [status, setStatus] = useState({})
+  // 最新资讯与宏观日历事件
+  const [newsItems, setNewsItems] = useState([])
+  // 热门板块列表
+  const [hotSectors, setHotSectors] = useState([])
+  // 热门个股实时快照
+  const [snapshotStocks, setSnapshotStocks] = useState([])
+  // 快照拉取时刻（仅用于展示）
+  const [snapshotTime, setSnapshotTime] = useState('')
+  // IPO / 上市日历
+  const [ipoCalendar, setIpoCalendar] = useState([])
+  // 日志弹窗显隐
+  const [showLog, setShowLog] = useState(false)
+  // 各行情数据源健康状态（东财/新浪/腾讯/同花顺）
+  const [dataSourceHealth, setDataSourceHealth] = useState({})
+  // §SHORT-4 做空统计卡（决策⑤）：short_enabled 关闭时不渲染任何做空内容
+  const [shortEnabled, setShortEnabled] = useState(false)
+  // 各新闻数据源健康状态（财联社/同花顺/新浪）
+  const [newsSourceHealth, setNewsSourceHealth] = useState({})
+  // 流程引擎各模块健康状态
+  const [engineHealth, setEngineHealth] = useState({})
+  // 按战法统计的胜率/盈亏比等归因数据
+  const [strategyStats, setStrategyStats] = useState({})
+  // 实盘/QMT 链路状态
+  const [qmtState, setQmtState] = useState(null)
+
+  // 主数据刷新定时器（§F5 每 10s 兜底轮询，实时性靠 SSE）
+  const timer = useRef(null)
+  // QMT 状态刷新定时器（每 15s 轮询）
+  const qmtTimer = useRef(null)
+  // SSE 订阅取消函数
+  const sseUnsub = useRef(null)
+  // 页面可见性变化处理函数引用
+  const visibilityHandler = useRef(null)
+
+  // §M-10（2026-09-22 PM 批清扫）轮询请求代号守卫：10s 主轮询/15s QMT 轮询与 SSE 触发
+  // 可交错，旧请求的迟到响应必须整包丢弃，不得覆盖更新一轮已写入的数据（数据倒挂）。
+  const loadGuard = useRef(null)
+  if (!loadGuard.current) loadGuard.current = createStaleGuard()
+  const qmtGuard = useRef(null)
+  if (!qmtGuard.current) qmtGuard.current = createStaleGuard()
+
+  // 从引擎状态中提取扫描统计（监控个股数/板块数等），供指标卡与系统卡展示
+  const scanStats = useMemo(() => status.scan_stats || {}, [status])
+
+  // 统计强信号（strong）信号数量
+  const strongCount = useMemo(() => signals.filter((s) => s.remind_level === 'strong').length, [signals])
+  // 统计观察中（observe）信号数量
+  const observeCount = useMemo(() => signals.filter((s) => s.remind_level === 'observe').length, [signals])
+  // 统计静默（mute）信号数量
+  const muteCount = useMemo(() => signals.filter((s) => s.remind_level === 'mute').length, [signals])
+  // §SHORT-4 做空信号统计：sell=持仓走弱自动卖出 / watch(规避)=非持仓提示
+  const bearCount = useMemo(() => (shortEnabled ? signals.filter((s) => s.direction === '做空').length : 0), [signals, shortEnabled])
+  const bearSellCount = useMemo(() => (shortEnabled ? signals.filter((s) => s.direction === '做空' && s.action === 'sell').length : 0), [signals, shortEnabled])
+
+  // 过滤出宏观日历与政策反制类资讯事件
+  const calendarEvents = useMemo(
+    () => newsItems.filter((n) => n.source === '宏观日历' || n.source === '政策反制'),
+    [newsItems]
+  )
+
+  // 将按战法归因的统计对象扁平化为表格行数组
+  const strategyRows = useMemo(
+    () => Object.entries(strategyStats || {}).map(([name, s]) => ({ name, ...s })),
+    [strategyStats]
+  )
+
+  // 拼接实盘/QMT 链路状态摘要文本（探测正常/模式/是否熔断）
+  const qmtLine = useMemo(() => {
+    const s = qmtState
+    if (!s || !s.enabled) return ''
+    const parts = []
+    parts.push(s.last_probe_ok ? '●' : '○')
+    parts.push(s.mode === 'auto' ? '自动' : '手动')
+    parts.push(s.tripped ? '⚠熔断' + (s.trip_reason ? ':' + s.trip_reason : '') : '正常')
+    return parts.join(' ')
+  }, [qmtState])
+
+  // 加载实盘/QMT 状态（接口异常不阻断整页）
+  // §M-10：15s 轮询与可见性恢复触发可交错，旧响应后到不得覆盖新快照。
+  async function loadQMT() {
+    const token = qmtGuard.current.begin()
+    try {
+      const st = await api.fetchQMTState()
+      if (qmtGuard.current.isStale(token)) return
+      setQMTState(st)
+    } catch (e) { /* 接口异常不影响整页 */ }
+  }
+
+  // §M-9（2026-09-22 修复批）三个健康端点独立拉取函数：随 load() 进入 10s 轮询。
+  // 旧实现仅挂载拉一次且 catch(()=>{}) 吞错——首次失败后 :383/:387 的健康点永远停在
+  // 「○（伪故障）」，成功过之后也再不更新（永远展示陈旧快照）。失败时保留上次值，
+  // 从未成功则由 healthMark 以 '–'（unknown）如实展示，不伪装成 ● 或 ○。
+  // English: §M-9 — health probes now ride the 10s poll; a failed fetch keeps the last snapshot
+  // and a never-fetched one shows the '–' unknown glyph instead of a fake state.
+  async function loadHealth() {
+    const [dsRes, nsRes, ehRes] = await Promise.allSettled([
+      api.fetchDataSourceHealth(), api.fetchNewsSourceHealth(), api.fetchEngineHealth(),
+    ])
+    if (dsRes.status === 'fulfilled' && dsRes.value) setDataSourceHealth(dsRes.value)
+    if (nsRes.status === 'fulfilled' && nsRes.value) setNewsSourceHealth(nsRes.value)
+    if (ehRes.status === 'fulfilled' && ehRes.value) setEngineHealth((ehRes.value.engine) || ehRes.value || {})
+  }
+
+  // 并行加载仪表盘所需的信号、状态、新闻、板块、快照、IPO 与战法统计
+  // §M-10：本轮代号先取后发——allSettled 返回时若已有更新的轮次在途/完成，整包丢弃。
+  async function load() {
+    const token = loadGuard.current.begin()
+    // §M-9 健康端点并入主轮询（10s）；独立 allSettled，不阻断主数据
+    loadHealth()
+    const [sigRes, stRes, newsRes, secRes, snapRes, ipoRes, dashRes] = await Promise.allSettled([
+      api.fetchSignals(), api.fetchStatus(), api.fetchNews(true), api.fetchSectorHot(),
+      api.fetchHotSnapshot(), api.fetchIPOCalendar(), api.fetchDashboard(),
+    ])
+    if (loadGuard.current.isStale(token)) return // 后到的旧轮次响应：不得覆盖新数据
+    // 逐项处理各接口返回结果，任一失败不阻断其他数据展示
+    if (sigRes.status === 'fulfilled' && Array.isArray(sigRes.value)) setSignals(sigRes.value)
+    if (stRes.status === 'fulfilled' && stRes.value) setStatus(stRes.value)
+    if (newsRes.status === 'fulfilled' && Array.isArray(newsRes.value)) setNewsItems(newsRes.value)
+    if (secRes.status === 'fulfilled' && Array.isArray(secRes.value)) setHotSectors(secRes.value)
+    // 快照数据需同时更新股票列表与快照时间
+    if (snapRes.status === 'fulfilled' && Array.isArray(snapRes.value) && snapRes.value.length) {
+      setSnapshotStocks(snapRes.value)
+      setSnapshotTime(new Date().toLocaleTimeString())
+    }
+    if (ipoRes.status === 'fulfilled' && Array.isArray(ipoRes.value)) setIpoCalendar(ipoRes.value)
+    // 战法归因统计从仪表盘接口的 report_stats 中提取
+    if (dashRes.status === 'fulfilled' && dashRes.value && dashRes.value.report_stats) {
+      setStrategyStats(dashRes.value.report_stats.by_strategy || {})
+    }
+    // §SHORT-4 仪表盘接口自带 short_enabled，直接取用（失败保持 false=隐藏做空内容）
+    if (dashRes.status === 'fulfilled' && dashRes.value) {
+      setShortEnabled(!!dashRes.value.short_enabled)
+    }
+  }
+
+  // SSE 推送到达时刷新仪表盘数据
+  function handleSSE() {
+    load()
+  }
+
+  // 页面挂载：加载数据、启动定时刷新、订阅 SSE、监听可见性变化；卸载时清理
+  useEffect(() => {
+    load()
+    // 主数据每 10s 兜底轮询（实时靠 SSE 事件）
+    timer.current = setInterval(load, 10000)
+    loadQMT()
+    // QMT 链路状态每 15s 轮询刷新
+    qmtTimer.current = setInterval(loadQMT, 15000)
+    api.connectSSE()
+    sseUnsub.current = on(['scan', 'message', 'score'], handleSSE) // §UAT-D2 原订阅的 'tick' 后端从未广播（死订阅），移除
+    visibilityHandler.current = () => {
+      if (document.hidden) {
+        if (timer.current) { clearInterval(timer.current); timer.current = null }
+        if (qmtTimer.current) { clearInterval(qmtTimer.current); qmtTimer.current = null }
+      } else {
+        if (!timer.current) {
+          load()
+          // 恢复页面后重启主数据 10s 兜底轮询
+          timer.current = setInterval(load, 10000)
+        }
+        if (!qmtTimer.current) {
+          loadQMT()
+          // 恢复页面后重启 QMT 15s 轮询
+          qmtTimer.current = setInterval(loadQMT, 15000)
+        }
+      }
+    }
+    document.addEventListener('visibilitychange', visibilityHandler.current)
+    // §M-9（2026-09-22 修复批）三个健康端点不再单独"挂载拉一次 + catch 吞"：
+    // 已并入 load()→loadHealth()，随挂载/10s 轮询/SSE/可见性恢复统一刷新。
+    return () => {
+      if (timer.current) clearInterval(timer.current)
+      if (qmtTimer.current) clearInterval(qmtTimer.current)
+      if (visibilityHandler.current) document.removeEventListener('visibilitychange', visibilityHandler.current)
+      if (sseUnsub.current) sseUnsub.current()
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
+
+  // 热点个股表格列定义：代码、名称、板块（含原因 title 悬浮）、现价、涨跌幅
+  const stockColumns = [
+    { colKey: 'code', title: '代码', width: 90 },
+    { colKey: 'name', title: '名称', width: 100 },
+    { colKey: 'sector', title: '板块', ellipsis: true, cell: ({ row }) => <span title={row.sector_reason || ''}>{row.sector || '—'}</span> },
+    { colKey: 'price', title: '现价', width: 90, cell: ({ row }) => '¥' + (row.price || 0).toFixed(2) },
+    { colKey: 'change_pct', title: '涨跌', width: 100, cell: ({ row }) => (
+      <span style={{ color: chgColor(row.change_pct) }}>{(row.change_pct || 0) > 0 ? '+' : ''}{(row.change_pct || 0).toFixed(2)}%</span>
+    ) },
+  ]
+
+  // 按战法归因表格列定义：战法、样本数、已平仓、胜率、平均盈亏、盈亏比、持仓中
+  const strategyColumns = [
+    { colKey: 'strategy', title: '战法', width: 140, cell: ({ row }) => row.strategy || row.name },
+    { colKey: 'total', title: '样本', width: 70 },
+    { colKey: 'closed', title: '已平仓', width: 80 },
+    { colKey: 'win_rate', title: '胜率', width: 80, cell: ({ row }) => (
+      <span style={{ color: (row.win_rate || 0) >= 50 ? 'var(--app-up)' : 'var(--app-down)' }}>{(row.win_rate || 0).toFixed(1)}%</span>
+    ) },
+    { colKey: 'avg_win_pct', title: '平均盈', width: 80, cell: ({ row }) => <span style={{ color: 'var(--app-up)' }}>{(row.avg_win_pct || 0).toFixed(1)}%</span> },
+    { colKey: 'avg_loss_pct', title: '平均亏', width: 80, cell: ({ row }) => <span style={{ color: 'var(--app-down)' }}>{(row.avg_loss_pct || 0).toFixed(1)}%</span> },
+    { colKey: 'profit_factor', title: '盈亏比', width: 80, cell: ({ row }) => fmtProfitFactor(row.profit_factor) },
+    { colKey: 'holding', title: '持仓中', width: 70 },
+  ]
+
+  // 渲染单条资讯卡片：时间、标题、利好/利空标签、影响等级、关联板块与个股
+  function renderNewsItem(n, i) {
+    // 资讯标题行：时间 + 标题
+    const titleRow = (
+      <div style={{ display: 'flex', gap: 8, fontSize: 13 }}>
+        <span className="muted">{fmtNewsTime(n.datetime)}</span>
+        <span>{n.title}</span>
+      </div>
+    )
+    // 利好/利空标签
+    const directionTag = n.direction && <Tag theme={n.direction === '利好' ? 'success' : n.direction === '利空' ? 'danger' : 'default'} size="small">{n.direction}</Tag>
+    // 影响等级标签
+    const impactTag = n.impact_level && <Tag size="small" variant="light">{n.impact_level}影响</Tag>
+    // 关联板块标签列表
+    const sectorTags = n.sectors?.length && n.sectors.map((sec) => <Tag key={sec} size="small" theme="primary" variant="light">{sec}</Tag>)
+    // 关联个股标签列表
+    const stockTags = n.stocks?.length && n.stocks.map((stk) => <Tag key={stk} size="small" theme="warning" variant="light">{stk}</Tag>)
+    // 资讯标签行：利好/利空、影响等级、关联板块、关联个股
+    const tagRow = (
+      <div style={{ display: 'flex', gap: 6, marginTop: 4, flexWrap: 'wrap' }}>
+        {directionTag}
+        {impactTag}
+        {sectorTags}
+        {stockTags}
+      </div>
+    )
+    // 卡片主体：标题行 + 标签行
+    const cardBody = (
+      <div key={'n' + i} style={{ padding: '6px 0', borderBottom: '1px solid #e7e7e7' }}>
+        {titleRow}
+        {tagRow}
+      </div>
+    )
+    return cardBody
+  }
+
+  /* 仪表盘页面主渲染：指标卡 → 热门个股与资讯双栏 → 战法胜率表 → 系统状态 */
+  return (
+    <div className="page">
+      {/* 右上角日志按钮：点击弹出 LogModal 查看后端运行日志 */}
+      <div style={{ display: 'flex', justifyContent: 'flex-end', marginBottom: 12 }}>
+        <Button theme="default" variant="outline" onClick={() => setShowLog(true)}>📋 日志</Button>
+      </div>
+
+      {/* §Dashboard 情绪面板 A：当前相位徽章 + 30 日色带 + 涨停/连板/建议仓位三指标 */}
+      <SentimentCard />
+
+      {/* 核心指标卡：强信号/观察中/静默/监控个股数量一目了然 */}
+      <div style={{ display: 'flex', gap: 12, marginBottom: 16, flexWrap: 'wrap' }}>
+        {[
+          { n: strongCount, l: '强信号', c: 'var(--app-up)' },
+          { n: observeCount, l: '观察中', c: 'var(--td-warning-color)' },
+          { n: muteCount, l: '静默', c: 'var(--app-muted)' },
+          // §SHORT-4 做空统计卡（仅做空开关开启时出现）
+          ...(shortEnabled ? [
+            { n: bearCount, l: '做空信号', c: 'var(--app-up)' },
+            { n: bearSellCount, l: '做空自动卖出', c: '#c9353f' },
+          ] : []),
+          { n: (scanStats.total_stocks || snapshotStocks.length || 0), l: '监控个股', c: 'var(--td-brand-color)' },
+        ].map((s) => (
+          <Card key={s.l} style={{ flex: '1 1 150px' }}>
+            <div style={{ fontSize: 28, fontWeight: 700, color: s.c }}>{s.n}</div>
+            <div className="muted">{s.l}</div>
+          </Card>
+        ))}
+      </div>
+
+      {/* 左栏热门个股 + 右栏资讯动态，双栏并列展示 */}
+      <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 16, marginBottom: 16 }}>
+        {/* 热门个股实时快照表格（带 LIVE 标签），无数据时显示等待提示 */}
+        <Card title={<span>🔥 热门个股 <Tag theme="warning" size="small">LIVE</Tag></span>}>
+          {snapshotStocks.length ? (
+            <Table data={snapshotStocks} columns={stockColumns} rowKey="code" size="small" pagination={false} fixedHeader maxHeight={320} />
+          ) : (
+            <div className="muted" style={{ padding: 24, textAlign: 'center' }}>等待行情数据...</div>
+          )}
+          <div className="muted" style={{ marginTop: 8 }}>{snapshotTime}</div>
+        </Card>
+
+        {/* 最新动态面板：宏观日历、IPO日历、热门板块、资讯四块分区展示 */}
+        <Card title="最新动态">
+          <SectionLabel>📅 宏观日历</SectionLabel>
+          {calendarEvents.length ? calendarEvents.map((c, i) => (
+            <div key={'c' + i} style={{ display: 'flex', gap: 10, padding: '4px 0', fontSize: 13 }}>
+              <span className="muted">{c.datetime ? c.datetime.slice(5, 10) : ''}</span>
+              <span>{c.title}</span>
+            </div>
+          )) : <div className="muted">暂无日历事件</div>}
+
+          <Divider />
+
+          <SectionLabel>📋 IPO日历</SectionLabel>
+          {ipoCalendar.length ? ipoCalendar.map((c, i) => (
+            <div key={'ipo' + i} style={{ display: 'flex', gap: 8, padding: '4px 0', fontSize: 13, alignItems: 'center' }}>
+              <span className="muted">{c.listing_date ? c.listing_date.slice(5, 10) : (c.ipo_date ? c.ipo_date.slice(5, 10) : '')}</span>
+              <span>{c.name}（{c.code}）</span>
+              {c.issue_price && <span>¥{c.issue_price.toFixed(2)}</span>}
+              <Tag size="small" theme={c.list_status === 'L' ? 'success' : 'default'} style={{ marginLeft: 'auto' }}>{ipoCountdown(c)}</Tag>
+            </div>
+          )) : <div className="muted">暂无IPO日历</div>}
+
+          <Divider />
+
+          {hotSectors.length > 0 && <SectionLabel>🔥 热门板块</SectionLabel>}
+          {hotSectors.length > 0 && hotSectors.slice(0, 5).map((s, i) => (
+            <div key={'s' + i} style={{ display: 'flex', gap: 10, padding: '4px 0', fontSize: 13, alignItems: 'center' }}>
+              <span style={{ color: chgColor(s.change_pct), width: 64 }}>{(s.change_pct || 0) > 0 ? '+' : ''}{(s.change_pct || 0).toFixed(1)}%</span>
+              <span>{s.name}</span>
+              <span className="muted" style={{ marginLeft: 'auto' }}>净流入 {s.net_inflow ? (s.net_inflow / 1e8).toFixed(1) + '亿' : '—'}</span>
+            </div>
+          ))}
+
+          <Divider />
+
+          {/* 资讯列表：按时间倒序展示最新 15 条，含利好/利空/影响等级/关联板块标签 */}
+          {newsItems.length > 0 && <SectionLabel>📰 资讯</SectionLabel>}
+          {newsItems.slice(0, 15).map(renderNewsItem)}
+          {/* 无数据时的空状态占位 */}
+          {!newsItems.length && !hotSectors.length && !calendarEvents.length && (
+            <div className="muted" style={{ padding: 16, textAlign: 'center' }}>等待数据...</div>
+          )}
+        </Card>
+      </div>
+
+      {/* 按战法胜率归因表格：展示各战法样本数、胜率、盈亏比等指标 */}
+      {strategyRows.length > 0 && (
+        <Card title="按战法胜率" style={{ marginBottom: 16 }}>
+          <Table data={strategyRows} columns={strategyColumns} rowKey="name" size="small" pagination={false} />
+        </Card>
+      )}
+
+      {/* 系统状态面板：运行时间、数据源健康、新闻源、快照统计、流程引擎、实盘链路 */}
+      <Card title="系统">
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 6, fontSize: 13 }}>
+          <span>运行 {status.uptime || '-'}</span>
+          {/* §M-9（2026-09-22 修复批）健康点走 healthMark 三态：●=确证健康 / ○=确证故障 / –=未取到（unknown），
+              旧的 `x ? '●' : '○'` 二态会把「接口没拉到」画成故障点、把「故障」与「无数据」混为一谈 */}
+          <span>数据源：东财{healthMark(dataSourceHealth.eastmoney)} 新浪{healthMark(dataSourceHealth.sina)} 腾讯{healthMark(dataSourceHealth.tencent)} 同花顺{healthMark(dataSourceHealth.ths)}</span>
+          <span>新闻：财联社{newsMark(newsSourceHealth.cailanshe)} 同花顺{newsMark(newsSourceHealth.kuaixun)} 新浪{newsMark(newsSourceHealth.sina)}</span>
+          <span>快照 {scanStats.total_stocks || 0}股 / {scanStats.hot_sector_count || 0}板块</span>
+          <span>原始 {scanStats.raw_signals || 0} → 最终 {scanStats.final_signals || 0}</span>
+          <span>流程引擎：新闻抓取{healthMark(engineHealth.news_agent)} 策略引擎{healthMark(engineHealth.strategy_engine)} 板块验证{healthMark(engineHealth.sector_agent)} 战法扫描{healthMark(engineHealth.combat_agent)} LLM{healthMark(engineHealth.llm)} 同花顺{healthMark(engineHealth.ths)} 聚合器{healthMark(engineHealth.aggregator)}</span>
+          {qmtLine && <span>实盘链路：{qmtLine}</span>}
+        </div>
+      </Card>
+
+      {/* §F6 免责声明页脚（UAT 4.1） */}
+      <Disclaimer variant="footer" />
+      {/* ICP 备案号页脚（管局要求：首页底部展示备案号并链接工信部首页，沪ICP备2026045551） */}
+      <IcpFooter variant="footer" />
+      <LogModal visible={showLog} onClose={() => setShowLog(false)} />
+    </div>
+  )
+}
+
+// 板块小标题
+function SectionLabel({ children }) {
+  return <div style={{ fontWeight: 600, margin: '8px 0 4px', fontSize: 13 }}>{children}</div>
+}
+// 分隔线
+function Divider() {
+  return <div style={{ height: 1, background: 'var(--app-border)', margin: '10px 0' }} />
+}

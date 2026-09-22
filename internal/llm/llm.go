@@ -1,0 +1,2195 @@
+// Package llm 支持 OpenAI 兼容协议的 NLP 分析与热点标记封装。
+// （Package llm wraps NLP analysis and hot-topic tagging over an OpenAI-compatible protocol.）
+package llm
+
+import (
+	"bufio"
+	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"log"
+	"math/rand"
+	"net/http"
+	"net/url"
+	"regexp"
+	"strconv"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
+)
+
+// Client LLM API 客户端，封装与 SiliconFlow 对话接口的通信。
+// （Client is the LLM API client wrapping communication with the SiliconFlow chat interface.）
+type Client struct {
+	httpClient *http.Client // HTTP 客户端（超时可配置，默认 60s；禁用 HTTP2 强制走 HTTP1.1）
+	apiKey     string       // API 密钥（Authorization: Bearer，单 key 兼容字段）
+	apiKeys    []string     // 多 API 密钥（并发请求按 key 轮询分发，突破单 key 限流）
+	keyIdx     uint64       // 轮询分发计数（sync/atomic）
+	apiURL     string       // chat/completions 请求地址
+	model      string       // 模型名称
+	streaming  bool         // 是否启用流式（SSE）响应；false 走一次性非流式
+	// idleTimeout 流式"相邻分片空闲"阈值——§FIX-3(20260919) 语义修正：旧实现分片到达从不重置
+	// ticker，该值实为整段硬超时（与注释相反）。现在读循环每收到一行即 Reset，恢复"空闲"本义；
+	// 整段防卡死改由 streamTotalTimeout 独立兜底。
+	idleTimeout time.Duration
+	// streamTotalTimeout 流式响应总时长硬上限（§FIX-3）：即便分片一直在滴，超总限也掐断，
+	// 防"永远在滴"型慢速卡流占住请求与计费。默认 DefaultStreamTotalTimeout。
+	streamTotalTimeout time.Duration
+
+	batchConcurrency int    // 批量分析最大并发批次（默认 8）
+	classifierModel  string // 可选分类专用模型（Stage0/1 等快速分类/初筛，空则用主模型）
+
+	// §GAP5.1 成本治理：当日调用/token 计数与预算熔断。计数原子维护，跨日自动归零。
+	usageDay    atomic.Int64 // 当日戳 yyyymmdd（变更即重置计数）
+	usageCalls  atomic.Int64 // 当日已发请求数
+	usageTokens atomic.Int64 // 当日 prompt+completion token 总量
+	callBudget  atomic.Int64 // 日调用预算（0=不设限）
+	tokenBudget atomic.Int64 // 日 token 预算（0=不设限）
+	// §FIX-7(20260919) 咨询单独当日预算计数：全体用户共用运营 key，总预算之外咨询再封顶。
+	consultCalls  atomic.Int64 // 当日咨询调用数
+	consultBudget atomic.Int64 // 咨询日调用预算（0=不设限）
+	keyCoolUntil  []atomic.Int64
+}
+
+// DefaultBatchConcurrency 未显式配置时的批量分析默认并发批次。
+// 默认 8：在 API 配额允许时最大化盘前新闻归因吞吐（Stage0/1 与 Stage2 分批调用并发执行）。
+// （DefaultBatchConcurrency is the default concurrent batch count for batched analysis.
+// Default 8: maximizes premarket news-attribution throughput when API quota allows.）
+const DefaultBatchConcurrency = 8
+
+// BatchConcurrency 返回批量分析最大并发批次。（BatchConcurrency returns the max concurrent batch count.）
+func (c *Client) BatchConcurrency() int { return c.batchConcurrency }
+
+// DefaultModel 未显式指定模型时的默认模型。
+// （DefaultModel is the fallback model when none is explicitly specified.）
+const DefaultModel = "THUDM/GLM-Z1-9B-0414"
+
+// DefaultTimeout 未显式配置时的默认"等待响应头"超时（默认 60s）。
+// 主要防护上游"迟迟不开始生成"的故障：配合流式+空闲看门狗，让卡住的请求尽快失败进入重试/兜底；
+// 正常推理模型流式长输出（CoT 持续心跳）由 StreamIdleTimeout 与整体请求超时下限兜底，不受此值误杀。
+// 2026-09-16 固化：30s→60s。实测免费/排队型网关（cavoti Qwen3.8-Flash）首包 8~50s 抖动，
+// 30s 会把 Stage0/D1 的正常慢启动成片误杀（当日新闻事件池全空→D1 全员归 0→N 形只剩龙头）。
+// （Bumped 30s→60s: queued free gateways show 8-50s time-to-first-byte; 30s mass-killed legit
+// Stage0/D1 calls, emptying the news event pool and zeroing every D1 score.）
+const DefaultTimeout = 60 * time.Second
+
+// minTotalTimeout 流式请求整体超时的下限（保底 120s）：推理模型（GLM-Z1 等）单批流式长输出总时长
+// 可能超过 60s，若总超时随之收紧会把正常慢流误判为超时。故整体请求超时最低保底 120s，可经
+// timeout_sec 调高；响应头等待单独用 DefaultTimeout/配置值，用于快速探测"不开始生成"。
+// （2026-09-16 固化：60s→120s，同因——慢模型整批长输出被总超时腰斩。Floor raised to 120s.）
+const minTotalTimeout = 120 * time.Second
+
+// DefaultStreamIdleTimeout 流式下默认"相邻分片空闲"阈值：超过视为模型卡死。
+// §FIX-3(20260919)：该阈值现在是真·空闲（每个分片到达即重置），不再是整段硬超时。
+// （DefaultStreamIdleTimeout is the idle threshold between adjacent stream chunks; exceeding
+// it means the model is considered stuck.）
+const DefaultStreamIdleTimeout = 60 * time.Second
+
+// DefaultStreamTotalTimeout 流式响应总时长硬上限（§FIX-3）：空闲阈值修正后，"每 59s 滴一个
+// 分片、永远滴不完"的慢速卡流不再被误伤为空闲超时，需要独立的总时长兜底，防其占住请求
+// 与计费。默认 300s，可经 Config.StreamTotalTimeout 调整（测试用）。
+const DefaultStreamTotalTimeout = 300 * time.Second
+
+// Timeout 返回客户端单次请求超时时间（供配置校验/展示）。
+// （Timeout returns the client's per-request timeout, for config validation/display.）
+func (c *Client) Timeout() time.Duration { return c.httpClient.Timeout }
+
+// KeyCount 返回实际生效的密钥池数量（启动日志/诊断用，不暴露密钥本身）。
+// §UI-AUTHORITATIVE 修复：此前部署自检只数环境变量里的 key，UI 保存的按账号密钥池
+// 生效时报告数对不上，误导排障。（English: reports the live key-pool size; the old
+// self-check only counted env keys and misreported UI-saved pools.）
+func (c *Client) KeyCount() int { return len(c.apiKeys) }
+
+// providerBaseVersionRe 供应商 base URL 的「版本段」形态：v1 / v2 / v1beta / v1.0 …
+var providerBaseVersionRe = regexp.MustCompile(`^v\d+([a-z0-9.\-]*)$`)
+
+// defaultAPIURL 内置默认供应商地址（SiliconFlow）——完整 chat/completions endpoint。
+// 单一常量：客户端缺省值与探测缺省值必须同源，否则"探测通过但客户端打到别的地址"的
+// 鬼故事会再次出现。注意它同时是 `llm.DefaultModel` 的配套供应商，因此
+// **「页面上看到 SiliconFlow」无法区分是用户存的值还是代码默认值**。
+const defaultAPIURL = "https://api.siliconflow.cn/v1/chat/completions"
+
+// normalizeAPIURL 把「供应商 base URL」规范成可调用的 chat/completions 完整地址。
+//
+// §P0 2026-09-18（用户报障「前端填了 LLM 的 api 和 key 却一直用不了」）：
+// 客户端把 APIURL **原样**当请求地址（post/streamPost 都是 http.NewRequest(POST, c.apiURL, …)，
+// 全仓没有任何拼接补全），而各家文档给的都是 base URL（如 https://api.siliconflow.cn/v1），
+// 设置页的占位符也是 base 形态（https://api.openai.com/v1）——照抄进去就会 POST 到 /v1 上，
+// 供应商回 404/405：**配置存对了、页面回显也对，就是一次都调不通**，极难自查。
+//
+// 规则（保守：只补两种明确的 base 形态，绝不猜非标准路径）：
+//  1. 只有主机名（https://api.siliconflow.cn）→ 补 /v1/chat/completions（OpenAI 兼容通例）；
+//  2. 路径末段是版本段（/v1、/v1/、/v1beta …）→ 补 /chat/completions；
+//     其余一律原样保留（已带完整 endpoint，或自建网关的非版本路径）。
+//
+// query/fragment 原样保留（自建网关常把鉴权参数挂在 query 上）。
+//
+// English: normalizes a provider *base* URL into the callable chat/completions endpoint the client
+// needs, since the request URL is used verbatim. Only the two unambiguous base shapes are completed;
+// anything else is left untouched.
+func normalizeAPIURL(raw string) string {
+	s := strings.TrimSpace(raw)
+	if s == "" {
+		return s
+	}
+	// scheme://host 之后的第一个 '/' 才是 path 起点（跳过 "://"）。
+	start := 0
+	if i := strings.Index(s, "://"); i >= 0 {
+		start = i + 3
+	}
+	slash := strings.Index(s[start:], "/")
+	if slash < 0 {
+		// 只有主机名。
+		return s + "/v1/chat/completions"
+	}
+	schemeHost := s[:start+slash] // scheme://host
+	pathPart := s[start+slash:]   // /path[?query][#frag]
+	tail := ""                    // ?query / #frag
+	// 只对 path 段做 endpoint 规范化，?query / #frag 先摘出来最后原样拼回，
+	// 否则会拼出 /chat/completions?key=... 之类丢参数的地址。
+	path := pathPart
+	if i := strings.IndexAny(pathPart, "?#"); i >= 0 {
+		path, tail = pathPart[:i], pathPart[i:]
+	}
+	p := strings.TrimRight(path, "/")
+	if p == "" {
+		return schemeHost + "/v1/chat/completions" + tail
+	}
+	last := p[strings.LastIndex(p, "/")+1:]
+	if providerBaseVersionRe.MatchString(last) {
+		return schemeHost + p + "/chat/completions" + tail
+	}
+	return s
+}
+
+// New 创建 LLM 客户端。
+// （New creates an LLM client.）
+func New(cfg Config) *Client {
+	// 未指定地址/模型/超时时填充默认值，保证客户端可直接使用
+	if cfg.APIURL == "" {
+		cfg.APIURL = defaultAPIURL
+	}
+	// §P0 2026-09-18：把供应商 base URL 规范成可调用的完整 endpoint（详见 normalizeAPIURL）。
+	cfg.APIURL = normalizeAPIURL(cfg.APIURL)
+	if cfg.Model == "" {
+		cfg.Model = DefaultModel
+	}
+	if cfg.Timeout <= 0 {
+		cfg.Timeout = DefaultTimeout
+	}
+	if cfg.StreamIdleTimeout <= 0 {
+		cfg.StreamIdleTimeout = DefaultStreamIdleTimeout
+	}
+	if cfg.StreamTotalTimeout <= 0 {
+		cfg.StreamTotalTimeout = DefaultStreamTotalTimeout
+	}
+
+	// 响应头等待用 cfg.Timeout（快速探测"不开始生成"）；整体请求超时保底 minTotalTimeout，
+	// 防止收紧后的默认超时误杀推理模型流式长输出（CoT 期间有持续心跳，不依赖总超时兜底）。
+	totalTimeout := cfg.Timeout
+	if totalTimeout < minTotalTimeout {
+		totalTimeout = minTotalTimeout
+	}
+	transport := &http.Transport{
+		ForceAttemptHTTP2: false,
+		// 响应头等待单独限时：流式下首个分片秒级即到，此字段是"服务端迟迟不开始
+		// 生成/协议不兼容"时的兜底，避免整段等待被统一超时吃掉。
+		ResponseHeaderTimeout: cfg.Timeout,
+	}
+
+	// 可配置超时；禁用 HTTP2（ForceAttemptHTTP2=false），强制走 HTTP1.1 规避连接复用问题
+	bc := cfg.BatchConcurrency
+	if bc <= 0 {
+		bc = DefaultBatchConcurrency
+	}
+	// 多 key：显式 APIKeys 优先；否则回退单 APIKey（兼容旧配置）
+	apiKeys := cfg.APIKeys
+	if len(apiKeys) == 0 {
+		if cfg.APIKey != "" {
+			apiKeys = []string{cfg.APIKey}
+		}
+	}
+	// 去空白、去重，保留有效 key
+	seen := make(map[string]bool, len(apiKeys))
+	keys := make([]string, 0, len(apiKeys))
+	for _, k := range apiKeys {
+		k = strings.TrimSpace(k)
+		if k == "" || seen[k] {
+			continue
+		}
+		seen[k] = true
+		keys = append(keys, k)
+	}
+	first := ""
+	if len(keys) > 0 {
+		first = keys[0]
+	}
+	c := &Client{
+		httpClient: &http.Client{
+			Timeout:   totalTimeout,
+			Transport: transport,
+		},
+		apiKey:             first,
+		apiKeys:            keys,
+		apiURL:             cfg.APIURL,
+		model:              cfg.Model,
+		streaming:          cfg.Streaming,
+		idleTimeout:        cfg.StreamIdleTimeout,
+		streamTotalTimeout: cfg.StreamTotalTimeout,
+		batchConcurrency:   bc,
+		classifierModel:    cfg.ClassifierModel,
+	}
+	c.usageDay.Store(llmToday())
+	c.callBudget.Store(cfg.DailyCallBudget)
+	c.tokenBudget.Store(cfg.DailyTokenBudget)
+	c.consultBudget.Store(cfg.ConsultDailyCalls) // §FIX-7
+	// §S6 多 key 健康度：每 key 独立冷却槽
+	c.keyCoolUntil = make([]atomic.Int64, len(keys))
+	return c
+}
+
+// key 冷却时长（§S6）：401/403=鉴权失效长冷却；429=限流按 Retry-After（缺省 60s）；5xx=短冷却。
+const (
+	keyCoolAuthFail = 30 * time.Minute
+	keyCoolRateLim  = 60 * time.Second
+	keyCoolServer   = 10 * time.Second
+)
+
+// pickKey §S6 健康感知选 key：轮询起点随机化后跳过冷却中的 key；
+// 全部冷却时仍返回轮询 key（降级可用优先于拒绝请求）。
+func (c *Client) pickKey() string {
+	if len(c.apiKeys) <= 1 {
+		return c.apiKey
+	}
+	now := time.Now().Unix()
+	start := atomic.AddUint64(&c.keyIdx, 1)
+	for i := uint64(0); i < uint64(len(c.apiKeys)); i++ {
+		idx := (start + i) % uint64(len(c.apiKeys))
+		if c.keyCoolUntil[idx].Load() <= now {
+			return c.apiKeys[idx]
+		}
+	}
+	return c.apiKeys[start%uint64(len(c.apiKeys))]
+}
+
+// markKeyStatus §S6 按响应状态给 key 记冷却：401/403 长冷却、429 读 Retry-After、5xx 短冷却。
+func (c *Client) markKeyStatus(key string, status int, retryAfter time.Duration) {
+	if len(c.apiKeys) <= 1 {
+		return // 单 key 无可回避，标记无意义
+	}
+	// 按状态码映射冷却时长并写入对应 key 槽位，直至其过期前不再被轮询使用。
+	var cool time.Duration
+	switch {
+	case status == 401 || status == 403:
+		cool = keyCoolAuthFail
+	case status == 429:
+		cool = keyCoolRateLim
+		if retryAfter > 0 {
+			cool = retryAfter
+		}
+	case status >= 500:
+		cool = keyCoolServer
+	default:
+		return
+	}
+	for i, k := range c.apiKeys {
+		if k == key {
+			until := time.Now().Add(cool).Unix()
+			c.keyCoolUntil[i].Store(until)
+			log.Printf("[llm] key#%d 进入冷却 %s（HTTP %d）", i, cool, status)
+			return
+		}
+	}
+}
+
+// parseRetryAfter 解析 Retry-After 头（秒数或 HTTP 日期），非法/缺失返回 0。
+func parseRetryAfter(v string) time.Duration {
+	if v == "" {
+		return 0
+	}
+	if secs, err := strconv.Atoi(strings.TrimSpace(v)); err == nil && secs > 0 {
+		return time.Duration(secs) * time.Second
+	}
+	if t, err := http.ParseTime(v); err == nil {
+		if d := time.Until(t); d > 0 {
+			return d
+		}
+	}
+	return 0
+}
+
+// SetBudgets §GAP5.1 配置当日预算（热更新；0=不设限）。
+// English: SetBudgets hot-updates the daily call/token budgets (0 = unlimited).
+func (c *Client) SetBudgets(dailyCalls, dailyTokens int64) {
+	c.callBudget.Store(dailyCalls)
+	c.tokenBudget.Store(dailyTokens)
+}
+
+// SetConsultBudget §FIX-7(20260919) 咨询当日调用预算热更新（0=不设限）。
+func (c *Client) SetConsultBudget(dailyCalls int64) { c.consultBudget.Store(dailyCalls) }
+
+// ErrBudgetExceeded 预算熔断哨兵错误：preFlight/preFlightConsult 超限时以 %w 包裹返回，
+// HTTP 层据此把"当日额度用尽"映射为 429（区别于 500 上游故障），用户看到的是额度文案而非裸堆栈。
+// English: sentinel so handlers can map budget exhaustion to 429 instead of a generic 500.
+var ErrBudgetExceeded = errors.New("LLM 预算已用尽")
+
+// ErrNoAPIKey 未配置任何 API Key 的哨兵错误（§FIX-9d）：消息与旧裸串完全一致
+// （"LLM_API_KEY not set"，兼容关键字匹配的历史消费方），但允许 HTTP 层 errors.Is
+// 机读分流为"依赖未配置"（503 + llm_not_configured），不再混入 500。
+// English: sentinel for missing API keys; message kept byte-identical to the legacy string.
+var ErrNoAPIKey = errors.New("LLM_API_KEY not set")
+
+// ErrUpstreamNotAPI 上游回了 2xx，但响应体不是 LLM 接口响应（网页 HTML / 非 JSON）。
+//
+// §P0 2026-09-20（生产实录）：用户把 api_url 填成了供应商**网页控制台**域名
+// （cloud.<vendor>.cn）。该域名对任意路径都 307 跳到 account.<vendor>.cn/login，
+// 而 Go 的 http.Client 默认跟随重定向 → 客户端拿到**登录页 HTML + HTTP 200**：
+//   - 启动预检 Ping 只看状态码 → "启动预检通过"，每轮启动日志都显示一切正常；
+//   - 配置探测只看状态码 → "8/8 key 可用 verified=true"，热更新照常生效；
+//   - 咨询时才炸，报的是 "no response from LLM (流式: data分片=0, 响应摘录=<!DOCTYPE html>…)"，
+//     **用户完全看不出是地址填错了**（HTML 摘录等于没给线索）。
+//
+// 这条哨兵让三个出口都说同一句人话："上游返回的是网页，不是模型接口 —— 地址很可能填成了
+// 网页控制台/登录页"，由 server 层映射成 502 + llm_upstream_not_api。
+// English: sentinel for "upstream answered 2xx with a web page, not a chat completion",
+// i.e. the configured api_url is not an LLM endpoint at all.
+var ErrUpstreamNotAPI = errors.New("上游返回的不是 LLM 接口响应")
+
+// notAPIError 组装"上游回的是网页"的可操作错误：带最终落点（重定向后地址）与原始配置地址，
+// 让用户一眼看出该改哪里。**不含密钥材料**。
+func notAPIError(configured, final, excerpt string) error {
+	var b strings.Builder
+	b.WriteString("上游返回的是网页(HTML)而不是模型接口响应。当前 api_url=")
+	b.WriteString(redactURL(configured))
+	if final != "" && final != redactURL(configured) {
+		b.WriteString("，请求实际被重定向到 " + final)
+	}
+	b.WriteString("；这通常是把供应商的**网页控制台/登录页**地址当成了 API 地址，" +
+		"请改成 API 端点（形如 https://api.<供应商域名>/v1/chat/completions）")
+	if excerpt != "" {
+		b.WriteString("；响应摘录: " + excerpt)
+	}
+	return fmt.Errorf("%w：%s", ErrUpstreamNotAPI, b.String())
+}
+
+// redactURL 去掉 URL 的 query/fragment/userinfo —— 记录地址时避免把挂在 query 上的
+// 一次性令牌/鉴权参数带进日志与错误文案。
+func redactURL(raw string) string {
+	u, err := url.Parse(strings.TrimSpace(raw))
+	if err != nil {
+		return raw
+	}
+	u.RawQuery, u.Fragment, u.RawFragment, u.User = "", "", "", nil
+	return u.String()
+}
+
+// isHTMLContentType 响应头是否声明为网页。
+func isHTMLContentType(resp *http.Response) bool {
+	ct := strings.ToLower(resp.Header.Get("Content-Type"))
+	return strings.Contains(ct, "text/html") || strings.Contains(ct, "application/xhtml")
+}
+
+// peekBodyExcerpt 取响应体开头一小段用于判定"是不是网页"（不消耗流式解析：仅在
+// postCtx 的 2xx 分支用于早退，此时请求即将被判为失败）。
+func peekBodyExcerpt(body io.Reader) string {
+	b, _ := io.ReadAll(io.LimitReader(body, 512))
+	return strings.Join(strings.Fields(string(b)), " ")
+}
+
+// UpstreamError 上游供应商返回非 2xx 的结构化错误（§FIX-9d）：Status 供 HTTP 层按
+// 语义归类（429/5xx→503 可重试，其余 4xx→502），Detail 保留原始响应摘录仅供日志——
+// 外发文案不再直出上游 body（可能含 URL/密钥回显）。Error() 与旧消息串逐字一致。
+// English: typed upstream-HTTP failure; status for handler classification, detail for logs only.
+type UpstreamError struct {
+	Status int    // 上游 HTTP 状态码
+	Detail string // 上游响应摘录（仅供日志，勿直出客户端）
+}
+
+// Error 拼装对外错误串（格式与旧消息串逐字一致；供日志与归类，Status 才是分类依据）。
+func (e *UpstreamError) Error() string {
+	return fmt.Sprintf("LLM API 返回 %d: %s", e.Status, e.Detail)
+}
+
+// llmToday 返回本地日期戳 yyyymmdd（预算跨日归零依据）。
+func llmToday() int64 {
+	t := time.Now()
+	return int64(t.Year())*10000 + int64(t.Month())*100 + int64(t.Day())
+}
+
+// rollUsageDay 跨日归零计数（CAS 保证只由翻日者清一次）。
+func (c *Client) rollUsageDay() {
+	today := llmToday()
+	for {
+		d := c.usageDay.Load()
+		if d == today {
+			return
+		}
+		if c.usageDay.CompareAndSwap(d, today) {
+			c.usageCalls.Store(0)
+			c.usageTokens.Store(0)
+			c.consultCalls.Store(0) // §FIX-7 咨询计数同日归零
+		}
+	}
+}
+
+// preFlight §GAP5.1 预算熔断检查 + 计一次调用。超限返回错误（当日不再发新请求）。
+// §FIX-7：错误以 ErrBudgetExceeded 包装，HTTP 层据此回 429。
+func (c *Client) preFlight() error {
+	c.rollUsageDay()
+	if b := c.callBudget.Load(); b > 0 && c.usageCalls.Load() >= b {
+		return fmt.Errorf("LLM 日调用预算已用尽(%d 次)，次日自动恢复: %w", b, ErrBudgetExceeded)
+	}
+	if b := c.tokenBudget.Load(); b > 0 && c.usageTokens.Load() >= b {
+		return fmt.Errorf("LLM 日 token 预算已用尽(%d)，次日自动恢复: %w", b, ErrBudgetExceeded)
+	}
+	c.usageCalls.Add(1)
+	return nil
+}
+
+// preFlightConsult §FIX-7(20260919) 咨询单独当日预算检查 + 计数（在总预算之外再封顶）。
+// 计数落本方法而非调用方：进程内咨询只有 ChatMessagesCtx 一个入口，入口收紧一处即可证明完备。
+func (c *Client) preFlightConsult() error {
+	c.rollUsageDay()
+	if b := c.consultBudget.Load(); b > 0 && c.consultCalls.Load() >= b {
+		return fmt.Errorf("咨询日调用预算已用尽(%d 次)，次日自动恢复: %w", b, ErrBudgetExceeded)
+	}
+	c.consultCalls.Add(1)
+	return nil
+}
+
+// recordUsage 累加单次响应的 token 用量（usage 缺失时按内容长度粗估，防漏计）。
+func (c *Client) recordUsage(prompt, completion int64) {
+	if prompt <= 0 && completion <= 0 {
+		return
+	}
+	c.rollUsageDay()
+	c.usageTokens.Add(prompt + completion)
+}
+
+// UsageStats 当日用量快照（/api/llm-debug 与成本观测消费）。
+func (c *Client) UsageStats() map[string]int64 {
+	c.rollUsageDay()
+	return map[string]int64{
+		"day":          c.usageDay.Load(),
+		"calls":        c.usageCalls.Load(),
+		"tokens":       c.usageTokens.Load(),
+		"call_budget":  c.callBudget.Load(),
+		"token_budget": c.tokenBudget.Load(),
+		// §FIX-7 咨询专属预算观测（设置页/管理端可见缺口）
+		"consult_calls":  c.consultCalls.Load(),
+		"consult_budget": c.consultBudget.Load(),
+	}
+}
+
+// Message 对话消息，包含角色和内容。
+// （Message is a chat message with a role and content.）
+type Message struct {
+	// 角色（system/user/assistant）
+	Role string `json:"role"`
+	// 消息内容
+	Content string `json:"content"`
+	// §PROD-LLM2（2026-09-18 生产实录）响应侧思维链字段：部分推理模型/网关（非流式）把正文只写进
+	// reasoning_content 而 content 为空。请求体里恒为空串，omitempty 保证不出现在出站 JSON。
+	// English: §PROD-LLM2 — response-side chain-of-thought field; some reasoning models/gateways put the
+	// answer only in reasoning_content with empty content. omitempty keeps it out of request bodies.
+	ReasoningContent string `json:"reasoning_content,omitempty"`
+}
+
+// ChatRequest 聊天补全请求体。
+// （ChatRequest is the chat-completion request body.）
+type ChatRequest struct {
+	// 模型名
+	Model string `json:"model"`
+	// 消息列表
+	Messages []Message `json:"messages"`
+}
+
+// ChatResponse 聊天补全响应体。
+// （ChatResponse is the chat-completion response body.）
+type ChatResponse struct {
+	// 候选回复
+	Choices []struct {
+		// 回复消息
+		Message Message `json:"message"`
+		// §PROD-LLM2 结束原因（stop/length/content_filter…）——空响应诊断证据字段
+		// English: §PROD-LLM2 — finish reason, carried in the empty-response diagnostic error.
+		FinishReason string `json:"finish_reason"`
+	} `json:"choices"`
+	// §GAP5.1 token 用量（成本治理）
+	Usage llmUsage `json:"usage"`
+}
+
+// llmUsage 单次请求的 token 用量元数据（OpenAI 兼容口径）。
+type llmUsage struct {
+	// 提示 token 数
+	PromptTokens int64 `json:"prompt_tokens"`
+	// 补全 token 数
+	CompletionTokens int64 `json:"completion_tokens"`
+	// 总 token 数
+	TotalTokens int64 `json:"total_tokens"`
+}
+
+// Chat 向 SiliconFlow API 发送对话请求。先传入 system 提示词（设定角色和输出格式），再传入 user 问题。
+// 默认走流式（SSE）响应：推理模型在非流式下需等整段生成（含思维链）完毕才返回，首字延迟极高、
+// 易被"等待响应头超时"误杀；流式下首个分片秒级到达，CoT 期间持续有 reasoning_content 心跳，
+// 只有真正卡死（相邻分片超过 idleTimeout）才报错。流式解析失败时自动回落到非流式一次性取回。
+// 上游 API 失败/超时返回错误，调用方应据此做好重试或兜底。
+// （Chat sends a chat request to the SiliconFlow API: a system prompt first (role + output format),
+// then the user question. It streams (SSE) by default: reasoning models return the first token quickly
+// in streaming, with reasoning_content heartbeats during CoT; only a real stall (adjacent chunks beyond
+// idleTimeout) errors out. A failed stream parse falls back to a one-shot non-streaming call. Errors on
+// upstream API failure/timeout let callers retry or fall back.）
+func (c *Client) Chat(system, user string) (string, error) {
+	if len(c.apiKeys) == 0 {
+		return "", ErrNoAPIKey // 未配置任何 key，直接报错（§FIX-9d 哨兵化，消息不变）
+	}
+
+	req := ChatRequest{
+		Model: c.model,
+		Messages: []Message{
+			{Role: "system", Content: system},
+			{Role: "user", Content: user},
+		},
+	}
+	return c.do(req) // 走统一请求路径（含流式/非流式/多 key 轮换）
+}
+
+// ChatClassifier 用分类专用模型执行对话（未配置分类模型时回落到主模型，与 Chat 一致）。
+// 供 Stage0/1 等"快速分类/初筛"批量调用使用：可用轻量快速模型分流，把深度分析（D1 评分、
+// Stage2 深度归因、股票咨询）留给主模型，从而在保证质量的前提下显著加快分类吞吐。
+// （ChatClassifier runs the chat with the optional classifier model, falling back to the main model when
+// unset (identical to Chat). It serves cheap classification/screening batches like Stage0/1, letting a
+// lighter/faster model handle the volume while the main model stays on deep work such as D1 scoring,
+// Stage2 attribution and stock consultation.）
+func (c *Client) ChatClassifier(system, user string) (string, error) {
+	model := c.model
+	if c.classifierModel != "" {
+		model = c.classifierModel // 配置了独立分类模型时优先使用（更快/更便宜）
+	}
+	req := ChatRequest{
+		Model: model,
+		Messages: []Message{
+			{Role: "system", Content: system},
+			{Role: "user", Content: user},
+		},
+	}
+	return c.do(req)
+}
+
+// ChatD1 用主模型执行 D1 评分的非流式调用，显式指定 max_tokens 限制推理长度（§信号速度 S3）。
+// 配置项 rules.llm.d1_max_tokens 由引擎注入；maxTokens<=0 时回退默认 2048。
+// D1 输出为结构化 JSON（个股+分数+理由），限制 max_tokens 可在不损失评分质量的前提下显著
+// 降低单股耗时（原走 nonStreamChat 硬编码 4096）。
+// English: ChatD1 runs the D1-scoring chat non-streamingly with an explicit max_tokens cap (§speed S3),
+// fed by the rules.llm.d1_max_tokens config. maxTokens<=0 falls back to the default 2048. Since D1 emits
+// structured JSON, capping max_tokens cuts per-stock latency without hurting score quality (previously the
+// non-streaming path hardcoded 4096).
+func (c *Client) ChatD1(system, user string, maxTokens int) (string, error) {
+	if len(c.apiKeys) == 0 {
+		return "", ErrNoAPIKey // 未配置任何 key，直接报错（§FIX-9d 哨兵化，消息不变）
+	}
+	if maxTokens <= 0 {
+		maxTokens = defaultD1MaxTokens // 未显式指定时用默认 D1 输出上限
+	}
+	req := ChatRequest{
+		Model: c.model,
+		Messages: []Message{
+			{Role: "system", Content: system},
+			{Role: "user", Content: user},
+		},
+	}
+	return c.nonStreamChatMax(req, maxTokens) // 非流式 + 限 token，控延迟
+}
+
+// defaultD1MaxTokens D1 评分默认推理长度上限（§信号速度 S3，未配置 rules.llm.d1_max_tokens 时）。
+const defaultD1MaxTokens = 2048
+
+// messages 为完整消息序列，首条必须是 system（角色+注入数据），后接历史与当前提问。
+// 只透传调用方组装好的消息，不再自动追加 system，避免出现多条/中途 system 导致模型上下文错乱。
+// 与 Chat 一致默认走流式响应，解析失败自动回落到非流式。
+// （ChatMessages calls the LLM with a multi-turn conversation (used by the stock-consultation page).
+// messages is the full sequence, first entry must be system (role + injected data), followed by history
+// and the current question. It only passes through caller-assembled messages—no automatic system is
+// appended—to avoid multi/mid-list system roles corrupting the model context. Like Chat it streams by
+// default and falls back to non-streaming on parse failure.）
+func (c *Client) ChatMessages(messages []Message) (string, error) {
+	return c.ChatMessagesCtx(context.Background(), messages)
+}
+
+// ChatMessagesCtx 带取消语义的多轮对话调用（§FIX-4(20260919)）：调用方 ctx（咨询请求 =
+// r.Context()）取消时，整条链路（退避 sleep → 流式读 → 出呼 HTTP）随之中止，不再出现
+// "用户早已断开、服务端还在为它出呼计费"的悬空请求。
+// English: ctx-aware ChatMessages; cancellation propagates through retry backoff, stream reading
+// and the outbound HTTP request.
+func (c *Client) ChatMessagesCtx(ctx context.Context, messages []Message) (string, error) {
+	if len(c.apiKeys) == 0 {
+		return "", ErrNoAPIKey // 未配置任何 key，直接报错（§FIX-9d 哨兵化，消息不变）
+	}
+	// §FIX-7(20260919)：咨询专属日预算（总预算之外再封顶，超限 ErrBudgetExceeded→429）。
+	if err := c.preFlightConsult(); err != nil {
+		return "", err
+	}
+	return c.doCtx(ctx, ChatRequest{Model: c.model, Messages: messages})
+}
+
+// isTransientLLMError 判定是否值得重试的上游瞬时错误：HTTP 5xx（含 502/503/504，
+// cavoti 聚合网关偶发）与网络类错误（连接重置/超时）。4xx（鉴权/参数/额度）不重试。
+func isTransientLLMError(err error) bool {
+	if err == nil {
+		return false
+	}
+	s := err.Error()
+	for _, code := range []string{"500", "502", "503", "504"} {
+		if strings.Contains(s, "HTTP "+code) || strings.Contains(s, "返回 "+code) || strings.Contains(s, " "+code+":") {
+			return true
+		}
+	}
+	for _, kw := range []string{"connection reset", "EOF", "timeout", "context deadline", "broken pipe"} {
+		if strings.Contains(strings.ToLower(s), kw) {
+			return true
+		}
+	}
+	return false
+}
+
+// stripThinkTags 剥离思考型模型（minimax-m3 等）混入 content 的 <think>…</think> 推理原文：
+// 这些模型不把思维链放 reasoning_content 字段而是直接写进正文，不剥离会漏进咨询回复/
+// 干扰 JSON 解析，且白耗 max_tokens。
+func stripThinkTags(s string) string {
+	if !strings.Contains(s, "<think>") {
+		return s
+	}
+	if a, b := strings.Index(s, "<think>"), strings.LastIndex(s, "</think>"); a >= 0 && b > a {
+		return strings.TrimSpace(s[:a] + s[b+len("</think>"):])
+	}
+	return s
+}
+
+// do 发起单次对话请求（无 ctx 变体，转发 doCtx(Background)）。
+func (c *Client) do(req ChatRequest) (string, error) {
+	return c.doCtx(context.Background(), req)
+}
+
+// do 发起单次对话请求：优先流式解析，特定失败场景回落到非流式一次性取回。
+// §GAP5.1 入口处执行日预算熔断检查（超限当日拒绝，次日自动恢复）。
+// §固化 2026-09-16：对上游 5xx/网络类失败做最多 2 次补射（1s/3s 退避）——cavoti 等聚合网关
+// 在大上下文+推理模型下 502 偶发（用户实录 17:11 咨询 502），换任何模型网关都不应让
+// 用户直接看到 502。JSON 解析类失败不在此层重试。
+// §FIX-4(20260919)：退避 sleep 改为 ctx 感知——请求已被取消（用户断开咨询）时立刻放弃重试，
+// 不再白占 1~3s 与上游配额。
+// （do sends one chat request with up to 2 extra attempts on transient upstream 5xx/network errors.）
+func (c *Client) doCtx(ctx context.Context, req ChatRequest) (string, error) {
+	if err := c.preFlight(); err != nil {
+		return "", err
+	}
+	var lastErr error
+	for attempt := 1; attempt <= 3; attempt++ {
+		if attempt > 1 {
+			if err := sleepCtx(ctx, time.Duration(1<<(attempt-1))*time.Second); err != nil {
+				return "", err
+			}
+		}
+		content, err := c.doOnceCtx(ctx, req)
+		if err == nil {
+			return content, nil
+		}
+		lastErr = err
+		if !isTransientLLMError(err) {
+			return "", err
+		}
+		log.Printf("LLM 上游瞬时失败(第%d次,至多重试2次): %v", attempt, err)
+	}
+	return "", lastErr
+}
+
+// sleepCtx 可取消退避：ctx 先结束则返回 ctx.Err()。
+func sleepCtx(ctx context.Context, d time.Duration) error {
+	if d <= 0 {
+		return nil
+	}
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	case <-t.C:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+// doOnce 执行一次完整请求（流式优先+特定失败回落非流式），供 do 的重试循环调用（无 ctx 变体）。
+func (c *Client) doOnce(req ChatRequest) (string, error) {
+	return c.doOnceCtx(context.Background(), req)
+}
+
+// doOnceCtx 执行一次完整请求（流式优先+特定失败回落非流式），供 doCtx 的重试循环调用。
+func (c *Client) doOnceCtx(ctx context.Context, req ChatRequest) (string, error) {
+	if c.streaming {
+		content, streamErr := c.streamChatCtx(ctx, req)
+		if streamErr == nil {
+			return stripThinkTags(content), nil
+		}
+		// §FIX-0921 流式卡死回落（2026-09-01 实录）：GLM-Z1 流式下上游长时间不吐增量分片
+		// （思维链被上游缓冲、无心跳）→ 空闲超时误杀"模型疑似卡死"；同一请求非流式可正常
+		// 完成（实测 200）。空闲超时与"无有效内容"两类失败回落非流式重试一次；其余（网络/
+		// 5xx/已收到分片后中途死亡）仍直接返回交由上层重试，避免重复放大延迟。
+		// §FIX-3：回落判定依赖 streamChatCtx 错误文案中的「空闲超时」子串，改文案勿破坏该契约。
+		if ctx.Err() == nil && (strings.Contains(streamErr.Error(), "no response") || strings.Contains(streamErr.Error(), "空闲超时")) {
+			if content, err := c.nonStreamChatCtx(ctx, req); err == nil {
+				log.Printf("LLM 流式无有效内容(%v), 已回落到非流式成功", streamErr)
+				return stripThinkTags(content), nil
+			}
+		}
+		return "", streamErr
+	}
+	return c.nonStreamChatCtx(ctx, req)
+}
+
+// chatCompletionRequest 透传给上游的完整请求体（ChatRequest 上叠加流式/长度控制参数）。
+// （chatCompletionRequest is the full request body sent upstream: ChatRequest plus streaming/max-tokens controls.）
+type chatCompletionRequest struct {
+	ChatRequest
+	// 是否流式
+	Stream bool `json:"stream"`
+	// 最大生成 token
+	MaxTokens int `json:"max_tokens,omitempty"`
+}
+
+// streamChat 以 SSE 流式读取完整对话响应（无 ctx 变体，转发 streamChatCtx(Background)）。
+func (c *Client) streamChat(req ChatRequest) (string, error) {
+	return c.streamChatCtx(context.Background(), req)
+}
+
+// streamChatCtx 以 SSE 流式读取完整对话响应，返回累加后的最终 content。
+// 累加 delta.content；§PROD-LLM2（2026-09-18 生产实录「no response from LLM」）起 content 全空但
+// reasoning_content 非空时以思维链正文兜底（部分推理模型/网关只填 reasoning 字段），并打日志留痕；
+// 两者皆空时报错携带诊断证据（分片数/finish_reason/usage/原始行摘录），遇 [DONE] 结束。
+// §S5 根修：扫描在独立 goroutine 进行，外层 select 持空闲 ticker——
+// 此前空闲检查只在读到新行时执行，服务端真卡死时 Scan() 永久阻塞、idleTimeout 永不触发
+// （仅剩 http.Client 总超时兜底）；现在无论是否阻塞，空闲阈值到点即关连接返回错误。
+// §FIX-3(20260919) 语义修正：§S5 的重构遗留了"分片到达永不重置 ticker"的缺陷——idleTimeout
+// 实际是整段硬超时，与注释/配置项本义（相邻分片间隔）相反，慢而正常的长推理流式被误杀。
+// 现在读 goroutine 每收到一行向 progress 通道打一个非阻塞心跳，外层循环收到心跳即 Reset 空闲
+// ticker；"整段不卡死"改由两个独立兜底负责：streamTotalTimeout 总时长硬上限 + ctx 取消。
+// 错误文案保留「空闲超时」子串——doOnce 的流式→非流式回落判定依赖它（llm.go 回落分支）。
+func (c *Client) streamChatCtx(ctx context.Context, req ChatRequest) (string, error) {
+	body, err := c.postCtx(ctx, req, true, 0)
+	if err != nil {
+		return "", err
+	}
+	defer body.Close()
+
+	// streamOut 流式响应通道结果：拼接内容 + usage 统计 + 错误。
+	type streamOut struct {
+		content string
+		usage   *llmUsage
+		err     error
+	}
+	out := make(chan streamOut, 1)
+	// progress 分片心跳（§FIX-3）：容量 64 + 非阻塞发送，心跳丢失只影响重置精度，绝不阻塞读 goroutine。
+	progress := make(chan struct{}, 64)
+
+	go func() {
+		sc := bufio.NewScanner(body)
+		sc.Buffer(make([]byte, 1024*1024), 4*1024*1024) // 首分片可能携带完整 usage 元数据，行可能很大
+		sc.Split(bufio.ScanLines)
+
+		var sb strings.Builder
+		var reasoning strings.Builder
+		var lastUsage *llmUsage
+		var finishReason string
+		var chunkCount int
+		var rawSample strings.Builder // §PROD-LLM2 摘录响应开头若干行（含非 data 行，覆盖"200 但返回非 SSE"）
+		// 逐行解析 SSE 分片：非 data: 前缀跳过，[DONE] 结束，chunk 携带 usage 则记录。
+		for sc.Scan() {
+			// §FIX-3：每读到一行（含 SSE 心跳空行以外的任意行）即上报一次"流仍在滴"。
+			select {
+			case progress <- struct{}{}:
+			default:
+			}
+			line := strings.TrimSpace(sc.Text())
+			if line == "" {
+				continue
+			}
+			if rawSample.Len() < 320 {
+				rawSample.WriteString(line)
+				rawSample.WriteString(" | ")
+			}
+			if !strings.HasPrefix(line, "data:") {
+				continue
+			}
+			data := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
+			if data == "[DONE]" {
+				break
+			}
+			var chunk chatCompletionChunk
+			if err := json.Unmarshal([]byte(data), &chunk); err != nil {
+				continue
+			}
+			chunkCount++
+			if chunk.Usage != nil {
+				lastUsage = chunk.Usage
+			}
+			if len(chunk.Choices) == 0 {
+				continue
+			}
+			sb.WriteString(chunk.Choices[0].Delta.Content)
+			reasoning.WriteString(chunk.Choices[0].Delta.ReasoningContent)
+			if fr := chunk.Choices[0].FinishReason; fr != "" {
+				finishReason = fr
+			}
+		}
+		if serr := sc.Err(); serr != nil {
+			out <- streamOut{err: fmt.Errorf("流式读取失败: %w", serr)}
+			return
+		}
+		content := sb.String()
+		if strings.TrimSpace(content) == "" {
+			if r := strings.TrimSpace(reasoning.String()); r != "" {
+				log.Printf("LLM 流式 content 全空，改用 reasoning_content 兜底(len=%d, finish_reason=%s)", len(r), finishReason)
+				out <- streamOut{content: r, usage: lastUsage}
+				return
+			}
+			// §P0 2026-09-20：0 分片 + 摘录看着像网页 → 这是"地址不是 API 端点"，不是模型出错。
+			// 网关若不声明 Content-Type: text/html，postCtx 那道判断题就漏过去了，这里兜底：
+			// 与其报"no response from LLM"，不如直接说清是地址填成了网页控制台/登录页。
+			if looksLikeHTMLPage([]byte(rawSample.String())) {
+				out <- streamOut{err: notAPIError(c.apiURL, "", truncateRunes(strings.TrimSpace(rawSample.String()), 160))}
+				return
+			}
+			out <- streamOut{err: fmt.Errorf("no response from LLM (流式: data分片=%d, finish_reason=%q, reasoning字数=%d, usage=%s, 响应摘录=%.400s)",
+				chunkCount, finishReason, len([]rune(reasoning.String())), usageText(lastUsage), rawSample.String())}
+			return
+		}
+		out <- streamOut{content: content, usage: lastUsage}
+	}()
+
+	idle := time.NewTicker(c.idleTimeout)
+	defer idle.Stop()
+	// total §FIX-3 整段硬上限：空闲会 reset、总时长不 reset，兜住"永远在滴"型慢速卡流。
+	total := time.NewTimer(c.streamTotalTimeout)
+	defer total.Stop()
+	var res streamOut
+	// 外层循环四条退路：读完(out) / 空闲(idle，收到分片即重置) / 总限(total) / 取消(ctx)。
+	// 后三条均先 body.Close() 解除 goroutine 的 Scan 阻塞——结果发入带缓冲 channel 后自然退出，
+	// 不留 goroutine 悬挂。
+	// English: any of the last three cases closes the body to unblock Scan; the buffered channels
+	// guarantee the reader goroutine exits even after we've returned.
+waitLoop:
+	for {
+		select {
+		case res = <-out:
+			break waitLoop
+		case <-progress:
+			idle.Reset(c.idleTimeout)
+		case <-idle.C:
+			body.Close()
+			return "", fmt.Errorf("流式响应空闲超时(%s): 模型疑似卡死", c.idleTimeout)
+		case <-total.C:
+			body.Close()
+			return "", fmt.Errorf("流式响应总时长超限(%s): 分片持续但未在限内读完，已掐断", c.streamTotalTimeout)
+		case <-ctx.Done():
+			body.Close()
+			return "", ctx.Err()
+		}
+	}
+	if res.err != nil {
+		return "", res.err
+	}
+	// §GAP5.1 用量入账：优先 usage 元数据，缺失时按内容长度粗估（≈3 字符/token）
+	if res.usage != nil && (res.usage.PromptTokens > 0 || res.usage.CompletionTokens > 0) {
+		c.recordUsage(res.usage.PromptTokens, res.usage.CompletionTokens)
+	} else {
+		c.recordUsage(estimateTokens(reqMessagesText(req)), estimateTokens(res.content))
+	}
+	return res.content, nil
+}
+
+// reqMessagesText 拼接请求消息文本（token 粗估用）。
+func reqMessagesText(req ChatRequest) string {
+	var sb strings.Builder
+	for _, m := range req.Messages {
+		sb.WriteString(m.Content)
+	}
+	return sb.String()
+}
+
+// jitterBackoff §S6 给退避时长加 ±20% 抖动：多实例/多批同时失败时避免同步重试风暴。
+func jitterBackoff(base time.Duration) time.Duration {
+	if base <= 0 {
+		return 0
+	}
+	j := base / 5
+	if j > 0 {
+		base += time.Duration(rand.Int63n(int64(2*j))) - j
+	}
+	return base
+}
+
+// estimateTokens 按长度粗估 token 数（英文 ≈4 字符/token；中文按 1.5 字符/token 折中）。
+func estimateTokens(s string) int64 {
+	n := len([]rune(s))
+	if n == 0 {
+		return 0
+	}
+	return int64(n / 3)
+}
+
+// chatCompletionChunk 流式响应单分片（只取需要的字段）。
+// （chatCompletionChunk is a single streaming response chunk, keeping only the needed fields.）
+type chatCompletionChunk struct {
+	// 候选回复
+	Choices []struct {
+		// 流式增量内容
+		Delta struct {
+			// 消息内容
+			Content string `json:"content"`
+			// §PROD-LLM2 思维链增量（content 全空时作为正文兜底，见 streamChat）
+			// English: §PROD-LLM2 — chain-of-thought delta, used as fallback text when content is empty.
+			ReasoningContent string `json:"reasoning_content"`
+		} `json:"delta"`
+		// §PROD-LLM2 末分片结束原因，空响应诊断证据
+		FinishReason string `json:"finish_reason"`
+	} `json:"choices"`
+	// §GAP5.1 末分片常携带用量元数据
+	Usage *llmUsage `json:"usage"`
+}
+
+// usageText §PROD-LLM2 空响应诊断证据的 usage 摘要（nil 显示 none）。
+// English: §PROD-LLM2 — usage summary for the empty-response diagnostic error.
+func usageText(u *llmUsage) string {
+	if u == nil {
+		return "none"
+	}
+	return fmt.Sprintf("prompt=%d/completion=%d/total=%d", u.PromptTokens, u.CompletionTokens, u.TotalTokens)
+}
+
+// nonStreamChat 非流式一次性取回完整响应（回落/关闭流式时使用，无 ctx 变体）。
+// （nonStreamChat fetches the full response in one non-streaming call (used on fallback/streaming off).）
+func (c *Client) nonStreamChat(req ChatRequest) (string, error) {
+	return c.nonStreamChatCtx(context.Background(), req)
+}
+
+// nonStreamChatCtx 带 ctx 的非流式一次性取回，max_tokens 用默认值。
+func (c *Client) nonStreamChatCtx(ctx context.Context, req ChatRequest) (string, error) {
+	return c.nonStreamChatMaxCtx(ctx, req, defaultNonStreamMaxTokens)
+}
+
+// defaultNonStreamMaxTokens 非流式调用的默认 max_tokens（防超长输出触发上游 504/截断）。
+const defaultNonStreamMaxTokens = 4096
+
+// nonStreamChatMax 非流式一次性取回完整响应，显式指定 max_tokens（§信号速度 S3：
+// D1 评分输出为结构化 JSON，无需超长思维链，限制推理长度可显著降低单股评分耗时）。
+// nonStreamChatMax fetches the full response in one non-streaming call with an explicit max_tokens cap
+// (§speed S3: D1 scoring emits structured JSON needing no long chain-of-thought, so capping length cuts
+// per-stock latency).
+func (c *Client) nonStreamChatMax(req ChatRequest, maxTokens int) (string, error) {
+	return c.nonStreamChatMaxCtx(context.Background(), req, maxTokens)
+}
+
+// nonStreamChatMaxCtx 非流式调用的最终实现：带 ctx 与显式 max_tokens，其余三个变体均汇聚于此。
+func (c *Client) nonStreamChatMaxCtx(ctx context.Context, req ChatRequest, maxTokens int) (string, error) {
+	body, err := c.postCtx(ctx, req, false, maxTokens)
+	if err != nil {
+		return "", err
+	}
+	defer body.Close()
+
+	respBody, err := io.ReadAll(body)
+	if err != nil {
+		return "", err
+	}
+	var chatResp ChatResponse
+	if err := json.Unmarshal(respBody, &chatResp); err != nil {
+		// §P0 2026-09-20：解析失败且响应体是网页 → 地址不是 API 端点（而非"响应格式怪"）。
+		if looksLikeHTMLPage(respBody) {
+			return "", notAPIError(c.apiURL, "", truncateRunes(strings.Join(strings.Fields(string(respBody)), " "), 160))
+		}
+		return "", fmt.Errorf("非流式响应解析失败: %v（响应摘录: %.400s）", err, strings.TrimSpace(string(respBody)))
+	}
+	// §PROD-LLM2（2026-09-18 生产实录）：旧实现在此抛裸 "no response from LLM"，零诊断信息。
+	// 现在错误携带 finish_reason/usage/原始响应摘录；choices 存在但 content 为空时先看
+	// message.reasoning_content（部分推理网关正文只落在该字段），仍空才报错。
+	// English: §PROD-LLM2 — the old code threw a bare "no response from LLM"; errors now carry
+	// finish_reason/usage/raw excerpt, and empty content falls back to message.reasoning_content.
+	if len(chatResp.Choices) == 0 {
+		return "", fmt.Errorf("no response from LLM (非流式: choices=0, usage=%s, 响应摘录: %.400s)",
+			usageText(&chatResp.Usage), strings.TrimSpace(string(respBody)))
+	}
+	msg := chatResp.Choices[0].Message
+	content := strings.TrimSpace(msg.Content)
+	if content == "" {
+		if r := strings.TrimSpace(msg.ReasoningContent); r != "" {
+			log.Printf("LLM 非流式 content 全空，改用 reasoning_content 兜底(len=%d, finish_reason=%s)", len(r), chatResp.Choices[0].FinishReason)
+			content = r
+		} else {
+			return "", fmt.Errorf("no response from LLM (非流式: choices=%d, finish_reason=%q, content为空, usage=%s, 响应摘录: %.400s)",
+				len(chatResp.Choices), chatResp.Choices[0].FinishReason, usageText(&chatResp.Usage), strings.TrimSpace(string(respBody)))
+		}
+	}
+	// §GAP5.1 用量入账（非流式响应自带 usage；缺失按内容粗估）
+	if chatResp.Usage.PromptTokens > 0 || chatResp.Usage.CompletionTokens > 0 {
+		c.recordUsage(chatResp.Usage.PromptTokens, chatResp.Usage.CompletionTokens)
+	} else {
+		c.recordUsage(estimateTokens(reqMessagesText(req)), estimateTokens(content))
+	}
+	// D1/Stage0 走本非流式通道：同样剥思考型模型的 <think> 正文（§生产 20260916）
+	return stripThinkTags(content), nil
+}
+
+// post 构造并发送 chat/completions 请求（无 ctx 变体，转发 postCtx(Background)）。
+func (c *Client) post(req ChatRequest, stream bool, maxTokens int) (io.ReadCloser, error) {
+	return c.postCtx(context.Background(), req, stream, maxTokens)
+}
+
+// postCtx 构造并发送 chat/completions 请求，返回可读响应体。非 2xx 状态码读响应体构造错误。
+// stream=true 时请求带 stream 参数且不设 max_tokens（避免截断思维链/长输出，靠空闲看门狗防卡死）；
+// 非流式时设 max_tokens 兜底，防超长输出触发上游 504/截断。
+// §FIX-4(20260919) 两处根修：
+//  1. 连接泄漏：旧实现在非 2xx 分支 io.ReadAll(resp.Body) 后直接 return，从不 Close——错误响应
+//     每一发就漏一条 HTTP 连接（HTTP1.1 强制不复用放大此问题），盘中高频失败会耗尽本地端口。
+//     现在读取截断到 4KB（错误体只需给人看的摘录）并显式 Close。
+//  2. ctx 断链：旧实现用裸 http.NewRequest，请求无法随调用方（如咨询请求被客户端断开）取消。
+//     现在 NewRequestWithContext，ctx 取消即中止出呼、释放连接。
+//
+// （English: postCtx binds the outbound request to ctx and closes/limits the error-response body —
+// the old non-2xx branch leaked the connection on every failed call and ignored cancellation.）
+func (c *Client) postCtx(ctx context.Context, req ChatRequest, stream bool, maxTokens int) (io.ReadCloser, error) {
+	payload := chatCompletionRequest{
+		ChatRequest: req,
+		Stream:      stream,
+		MaxTokens:   maxTokens,
+	}
+	data, err := json.Marshal(payload)
+	if err != nil {
+		return nil, err
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	httpReq, err := http.NewRequestWithContext(ctx, "POST", c.apiURL, bytes.NewReader(data))
+	if err != nil {
+		return nil, err
+	}
+	key := c.pickKey() // §S6 健康感知选 key
+	httpReq.Header.Set("Authorization", "Bearer "+key)
+	httpReq.Header.Set("Content-Type", "application/json")
+
+	resp, err := c.httpClient.Do(httpReq)
+	if err != nil {
+		return nil, err
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		// §FIX-4 错误分支必须 Close：先掐成 4KB 摘录再关，供逐把 key 探测/日志使用。
+		msg, _ := io.ReadAll(io.LimitReader(resp.Body, 4<<10))
+		resp.Body.Close()
+		// §S6 健康度记忆：按状态给该 key 记冷却（429 优先读 Retry-After）
+		c.markKeyStatus(key, resp.StatusCode, parseRetryAfter(resp.Header.Get("Retry-After")))
+		return nil, &UpstreamError{Status: resp.StatusCode, Detail: strings.TrimSpace(string(msg))}
+	}
+	// §P0 2026-09-20：2xx 也可能是"一页网页"。地址填成供应商网页控制台域名时，
+	// 控制台会 307 跳到登录页，而 http.Client 默认跟随重定向 → 这里拿到 HTML + 200，
+	// 下游 SSE 解析出 0 个 data 分片，最终报"no response from LLM"（用户看不出是地址错）。
+	// 在唯一出呼出口就识别掉，错误文案直接指向"地址填成了网页控制台"。
+	// 这里只看响应头（Content-Type）——读 body 会与流式解析抢数据，不安全的窥探不做；
+	// 响应体形态的兜底判定放在流式/非流式的出口（那时 body 已经在手上）。
+	if isHTMLContentType(resp) {
+		excerpt := peekBodyExcerpt(resp.Body)
+		resp.Body.Close()
+		return nil, notAPIError(c.apiURL, redactURL(respURL(resp)), truncateRunes(excerpt, 160))
+	}
+	return resp.Body, nil
+}
+
+// respURL 客户端跟随重定向后真正落到的地址（去 query/fragment）；拿不到返回空串。
+func respURL(resp *http.Response) string {
+	if resp == nil || resp.Request == nil || resp.Request.URL == nil {
+		return ""
+	}
+	return resp.Request.URL.String()
+}
+
+// truncateRunes 按字符（非字节）截断，避免把多字节字符切成乱码。
+func truncateRunes(s string, n int) string {
+	r := []rune(s)
+	if len(r) <= n {
+		return s
+	}
+	return string(r[:n]) + "…"
+}
+
+// consultSystemPrompt 股票咨询多轮对话的系统提示词：设定有独立分析能力的 A 股顾问角色。
+// 定位是"接得住问题的顾问"，不是数据播报员；不写死输出模板，紧扣用户问题灵活作答。
+// 强约束三点：讲人话、只引用注入的实测数据、严禁编造任何术语或数字（含正反示范引导小模型遵守）。
+// （consultSystemPrompt is the system prompt for the multi-turn stock-consultation dialogue: it sets the
+// role of an A-share advisor with independent analysis. It must answer questions directly with plain
+// language, only cite the injected real-time data, and never fabricate any terms or numbers.）
+// §FIX-2(20260919 批三)钉死：下方"错误示范"里的假数字（2383万/1.2亿/25305 等）只是反面教材，
+// 严禁被采集为 trusted——引擎侧 ConsultLLM 的数字白名单只吃 ⟦DATA⟧ 边界内数据块、用户消息与
+// 历史，本模板整体出局。改采集链的人注意：把 system 再传进 collectTrustedNumbers = 守卫自击穿
+// （模型原样复现提示词假数字即被放行，历史上真出过这个洞）。
+var consultSystemPrompt = `你是专业的A股股票投资顾问，负责回答用户的股市问题。回答要像和对股票有了解、但听不懂花哨术语的朋友解释一样，把逻辑讲清楚、说人话，让用户听完能明白"到底怎么回事、该怎么办"。
+
+你的信息来源只有两个，除此之外任何内容都不得出现：
+（1）会话附带的"实时行情实测数据"里的数字和字段，原样引用、不要推算猜测（比如数据给了现价和昨收，你可以据此算涨跌幅，但不要去编其他数字）；
+（2）用户自己在问题里描述的现象（如"2点半急拉、半小时回落、全天振幅12个点、板块一起走"）。
+
+作答铁律（最重要，违反即不合格）：
+1. 写任何数字或名词前先自查：这个数字/名称/指标在注入数据里吗？是用户亲口说的吗？都不是，就删掉，换成"这个我这边没有数据，无法确认"。哪怕数字看起来再合理，也一律禁止编造（成交额、撤单、净流入、振幅、持仓、机构席位、期货合约价、个股名、板块内具体票的表现等统统算）。
+2. 只能用白话，不堆术语。不要出现数据里没有的"量化信号/模型/指标/概念"名称（如某某量化、频谱交易、DDE、龙虎榜占比、期指贴水、回转交易、逼仓等），编一个都算违规。
+3. 不知道就承认不知道。宁可回答得短一点、朴素一点，也不要硬凑一句听起来专业但站不住脚的话。
+4. 可以用A股市场的一般规律、常见逻辑做定性分析（如"尾盘急拉回落常见于情绪资金抢跑、次日接力意愿弱"，"板块联动走强后要警惕情绪退潮"），但必须用"一般规律/经验上"这类措辞，且绝不往这些定性描述里填具体数字。
+
+数字引用铁律（新增，最关键——避免被系统判为编造而隐去成"[数据缺失]"）：
+- 数据块里给了数字，引用时**必须原样照抄数字和单位**（含"股""元""万元""万""%"），**绝对禁止**加千分位逗号、换算单位（如把"股"改成"手"、把"元"改成"亿"）、四舍五入或写科学计数。一旦改写，系统会判定为编造并把整段数字隐去成"[数据缺失]"，看起来就像数据丢失。
+- 数据块某字段若写"数据源未返回/未提供"（如盘前主力净流入常未更新），你**直接告诉用户"该数据我这边暂未取到"**，绝对不要自己补一个数字——补了也会被系统隐去，反而显得数据丢失。
+- 成交量数据块同时给了"股"和"手"两种口径，引用时任选其一、原样照抄即可，不要再加逗号或四舍五入。
+
+回答结构（推荐，避免一大段不分点）：
+- 第一句直接给结论/定调：核心判断用 1-2 句话说清楚（如"这票高高低低，我的看法是……"）。
+- 用 2-4 个"## "小标题分段（例如 ## 量价、## 资金、## 位置、## 接下来看什么），每段 2-4 个短句或"- "项目符号，别堆一大段。
+- 结尾用一句"操作参考"收口，明确这是参考、不是绝对指令。
+- 总长度优先控制在 300 字以内，信息密度优先，少水话。
+
+语气：像朋友聊股，短句为主，少用"首先/其次/综上所述"这类公文腔；可以适当用"说白了""简单讲"拉近距离。
+
+作答要求：
+- 先正面回应用户问题：问了什么答什么，直接给明确观点，再讲依据。判断用户真正想知道的（"是不是量化拉升""这走势说明什么""我该不该动"），而不是把字段罗列一遍。
+- 回答要细、要有层次：量价怎么演变的、资金进出迹象、同板块其他票是不是一个路子、个股处于什么位置、接下来重点看哪几个点。每一点讲清楚"因为什么、所以怎么看"，别只报数据不解释。
+- 有实测数据就用数据支撑观点；数据缺失时如实指出缺口，提示需要补哪些数据才能更准，但不要因此去编。
+- 分辨"数据事实"与"你的推断"：推断标注为推测（如"从量价看更可能是…"），措辞审慎，不承诺收益、不给绝对化的买卖指令。
+- 用中文，自然成文，不套固定模板，不堆术语。
+
+正确示范（无该股数据时）：
+"你描述的'尾盘急拉又半小时内砸回来、板块一起走'，这个形态在A股很常见，一般规律上是短线情绪资金集中抢跑留下的冲高回落，次日能否承接主要看开盘量能和板块内有没有真龙。你说的机器人板块是不是真起来了，我更倾向先当作情绪驱动的冲高回落来看，但具体到资金净流入这些数字我这边没有实时数据，没法给你量化判断。"
+
+错误示范（严禁出现这类句子）：
+"集合竞价撤单达2383万"、"美术院特供3连板"、"铜期货主力合约昨收25305"、"主力净流出1.2亿"。这些数字都不在数据里，出现任何一个都算编造。`
+
+// ConsultSystemPrompt 返回股票咨询的角色提示词（供引擎组装唯一 system 消息使用）。
+// （ConsultSystemPrompt returns the consultation role prompt for the engine to build the sole system message.）
+func ConsultSystemPrompt() string { return consultSystemPrompt }
+
+// HotTopic 热点新闻结构化分析结果。
+// （HotTopic is the structured analysis result of a hot news item.）
+type HotTopic struct {
+	// 新闻标题
+	Title string `json:"title"`
+	// 事件级别：板块 / 个股
+	Level string `json:"level"`
+	// 情感：正面 / 负面 / 中性
+	Sentiment string `json:"sentiment"`
+	// 带符号强度：正=利好 负=利空 0=中性
+	Score float64 `json:"score"`
+	// 影响级别：高 / 中 / 低
+	ImpactLevel string `json:"impact_level"`
+	// 事件类型：政策/财报/行业/公司/宏观/事件驱动
+	EventType string `json:"event_type"`
+	// 紧急程度：立即 / 关注 / 观察
+	Urgency string `json:"urgency"`
+	// 方向：利好 / 利空 / 中性
+	Direction string `json:"direction"`
+	// 直接影响板块
+	Sectors []string `json:"sectors"`
+	// 上游产业链受影响板块
+	UpstreamSectors []string `json:"upstream_sectors"`
+	// 下游产业链受影响板块
+	DownstreamSectors []string `json:"downstream_sectors"`
+	// §D1 归因护栏1（2026-09-21，docs/REFACTOR_UNIFIED_SELL_20260921.md §八）：
+	// 原 related_stocks/upstream_stocks/downstream_stocks 三个自由归因字段已物理删除——
+	// LLM 发明受益个股是打分偏移主源，个股名单改由数据源供给（新闻自带 stock_list、
+	// 标题全称匹配、板块成分股表），LLM 只保留板块目录点选权（护栏2）。
+	// English: guardrail-1 — the LLM no longer emits beneficiary stock lists; individual-stock
+	// attribution comes from data sources only, the model just picks sectors from the real catalog.
+	// 匹配战法：N形/龙头/双凸/龙回头/无
+	Strategy string `json:"strategy"`
+	// 简要分析理由
+	Reason string `json:"reason"`
+	// 事件来源地域：国内 / 海外
+	Region string `json:"region"`
+	// 海外事件与A股板块关系：对抗制裁/合作/不涉及
+	Relation string `json:"relation"`
+	// 上游传导方向：利好/利空/中性
+	UpstreamDirection string `json:"upstream_direction"`
+	// 下游传导方向：利好/利空/中性
+	DownstreamDirection string `json:"downstream_direction"`
+}
+
+// sectorCatalog §D1 归因护栏2（2026-09-21）：真实板块目录（同花顺行业+概念名清单），
+// 由引擎在 refreshSectors 后注入。板块归因从"LLM 发明"降级为"目录点选"——提示词尾部
+// 追加白名单，模型只能逐字复制目录内板块名；目录未注入（冷启动/数据源全断）时不加白名单，
+// 由引擎侧 verifySectorAttribution 的验真剔除兜底（行为与旧版一致，不放任也不报错）。
+// English: guardrail-2 — the real sector catalog injected by the engine; the prompt gains a
+// whitelist suffix so the model can only copy sector names verbatim (selection, not invention).
+var sectorCatalog atomic.Value // []string
+
+// SetSectorCatalog 注入/刷新板块点选白名单（空列表不清旧目录：宁可用略旧名单也不退回自由发明）。
+func SetSectorCatalog(names []string) {
+	if len(names) == 0 {
+		return
+	}
+	cp := make([]string, 0, len(names))
+	seen := make(map[string]bool, len(names))
+	for _, n := range names {
+		n = strings.TrimSpace(n)
+		if n == "" || seen[n] {
+			continue
+		}
+		seen[n] = true
+		cp = append(cp, n)
+	}
+	if len(cp) > 0 {
+		sectorCatalog.Store(cp)
+	}
+}
+
+// sectorCatalogSection 拼提示词白名单后缀；目录未注入时返回空串（保持旧行为）。
+func sectorCatalogSection() string {
+	names, _ := sectorCatalog.Load().([]string)
+	if len(names) == 0 {
+		return ""
+	}
+	return "\n\n【板块点选白名单】sectors/upstream_sectors/downstream_sectors 只能从下列真实板块名中逐字点选，不得改写、不得输出名单之外的板块名，无贴切板块则留空：\n" +
+		strings.Join(names, "、") + "\n"
+}
+
+// valueChainSection 产业链价值传导推理规则：决定事件归因到产业链上/下游的准确性。
+// 核心机制：国内事件全链同向传导；海外事件先判对抗/合作关系，
+// 合作→同向传导，对抗制裁→上游利好/下游利空；海外自产关键材料=价值确认→利好掌握上游原料供给的国内公司。
+// （valueChainSection contains the industrial-chain value-propagation reasoning rules that determine the
+// accuracy of attributing events to upstream/downstream links: domestic events propagate in the same
+// direction along the whole chain; overseas events are judged on confrontation/cooperation first—
+// cooperation propagates the same direction, confrontation → upstream bullish/downstream bearish; overseas
+// self-production of a key material confirms its value → bullish for domestic upstream suppliers.）
+var valueChainSection = `
+
+产业链价值传导推理（最重要，直接决定归因质量，必须严格执行）：
+- 先判定事件来源地域 region："国内"=事件主体为境内公司/政策/市场；"海外"=事件主体为境外公司/政府（美国/欧洲/日本/韩国等）。
+- 若为海外事件，再判定 relation（该事件与A股相关板块的关系）：
+  - "对抗制裁"：美国等对中国特定产业/公司实施制裁、出口管制、加征关税、技术封锁，或中国对美/全球实施关键原料（磷化铟/锗/铟/镓/稀土等）出口管制反制
+  - "合作"：海外公司正常扩产/并购/技术合作/订单采购，不涉及制裁对抗
+  - "不涉及"：事件与中国产业链无关联，score=0 中性
+- 按关系推导上/下游传导方向：
+  - 国内事件 → 全链同向传导：direction 为上、下游共同方向（如国内扩产同时利好上游原料与下游应用）
+  - 海外事件 relation="合作" → 同向传导，上游/下游方向与 direction 一致
+  - 海外事件 relation="对抗制裁" → 上游传导利好、下游传导利空：上游=中国掌控供给或可国产替代/自主可控的关键原料/材料/设备环节（利好），下游=依赖被制裁市场或进口技术的环节（利空）
+- 价值确认传导机制（对抗制裁下的关键推理）：
+  - 当海外公司自产/扩产某关键材料，而中国掌握该材料上游原料供给时，海外自产本身即确认了该材料的战略核心价值 → 间接证明国内掌握该原料供给的上游板块与个股价值 → 传导为国内上游重大利好（+0.75）
+  - 示例："诺基亚收购恩智浦一工厂 计划自产磷化铟半导体" → 背景：美国制裁中国光模块、中国掌控全球磷化铟上游原料供给 → 海外自产确认磷化铟核心价值 → 利好国内磷化铟上游（云南锗业/有研新材/光智科技/南大光电等，+0.75 重大利好），下游光模块受制裁利空（-0.50~-0.75）
+- sectors 只填同花顺真实板块名（半导体材料/小金属/光模块/光通信等）；概念名（如"磷化铟"）不要放进 sectors，写进 reason
+- 对抗制裁且上/下游方向不同时，必须同时给出 upstream_sectors/downstream_sectors（上游=关键原料材料设备板块如"半导体材料/小金属"，下游=受制裁环节板块如"光模块"），不得合并成一个 sectors
+- 注意：你不需要也不允许产出个股名单（related/upstream/downstream_stocks 字段已废除）——
+  受益/受损个股由系统按真实板块成分股数据注入，你只做板块归因；把判断依据写进 reason 即可
+`
+
+// hotTopicSystemPrompt 单条热点分析的 system 提示词：约束 LLM 输出严格 JSON 格式的评分/归因结果。
+// （hotTopicSystemPrompt is the system prompt for single hot-topic analysis, forcing strict-JSON scoring/attribution output.）
+var hotTopicSystemPrompt = `你是一个A股多维度热点分析专家。对提供的新闻标题进行全方位分析，严格按JSON格式返回。
+
+首先判断事件级别：
+- 个股级别：股东增持/减持/回购/质押/公司公告/个股经营变动等仅影响单一公司的事件 → level="个股", sectors/upstream_sectors/downstream_sectors全部置为[]空数组
+- 板块级别：政策/行业景气/宏观数据/技术突破等影响整个产业链的事件 → level="板块", 正常填写sectors
+
+评分规则（score 为带符号数值，正=利好 负=利空，表示事件强度）：
+- +0.75 强利好：业绩翻倍/扭亏为盈、龙头大额回购/增持、重磅新药获批、重大政策利好、重组获批
+- +0.50 中利好：业绩小幅增长、普通中标/订单、一般增持、行业景气上行
+- -0.50 中利空：业绩小幅下滑/不及预期、一般减持、行业景气下行、质押
+- -0.75 强利空：业绩巨亏/预亏、被立案调查/处罚、大股东大幅减持、退市风险警示、重大政策利空
+- 0    中性：海外指数波动、常规公告（董事会决议/人事变动）、无个股/板块归因的行情播报、无实质影响的行业新闻
+- 注意：尽量使用 ±0.50 / ±0.75，避免使用 ±0.25 弱档；无明确方向一律输出 0
+
+方向判定（与 score 符号一致）：
+- 利好：业绩增长、中标/订单、增持/回购、新药获批、政策利好、重组/收购
+- 利空：业绩下滑/亏损、减持/质押、被调查/处罚、退市/ST、政策利空
+- 中性：海外指数波动、常规公告、行情播报、无归因的一般新闻
+
+板块归因要求（§D1 护栏2：只许点选、不许发明）：
+- sectors/upstream_sectors/downstream_sectors 只能从系统注入的真实板块目录中逐字点选（见板块点选白名单）；目录中没有的板块名一律不得输出，找不到贴切板块就留空
+- 不输出个股名单（related/upstream/downstream_stocks 字段已废除）：个股级事件由系统按新闻自带标签与标题公司名自动关联，板块级个股由系统按成分股表注入
+- 例："凯莱英拟增资10.5亿元" → level=个股, sectors=[]
+- 例："SpaceX美股盘前涨超2%" → 无A股板块归因 → score=0 中性
+
+字段说明：
+{
+  "level": "板块|个股",
+  "sentiment": "正面|负面|中性",
+  "score": 带符号数值(正利好/负利空/0中性),
+  "impact_level": "高|中|低",
+  "event_type": "政策|财报|行业|公司|宏观|事件驱动",
+  "urgency": "立即|关注|观察",
+  "direction": "利好|利空|中性",
+  "sectors": ["直接影响板块"],
+  "upstream_sectors": ["上游产业链受影响板块"],
+  "downstream_sectors": ["下游产业链受影响板块"],
+  "strategy": "N形|龙头|双凸|龙回头|无",
+  "reason": "简要分析理由",
+  "region": "国内|海外",
+  "relation": "对抗制裁|合作|不涉及",
+  "upstream_direction": "利好|利空|中性",
+  "downstream_direction": "利好|利空|中性"
+}
+只输出JSON，不要多余文字。
+
+补充规则：
+- 宏观数据走弱（GDP增速放缓/低于预期、PMI走弱或跌破荣枯线、核心通胀高企黏性、就业走弱）→ level="板块", event_type="宏观", score=-0.50~-0.75, direction="利空"
+- 海外龙头公司（苹果/特斯拉/微软/英伟达等）财报或业绩指引不及预期、盘后大幅下跌，且涉及A股产业链（消费电子/苹果产业链/存储/算力/半导体等）→ level="板块", event_type="行业", score=-0.50~-0.75, direction="利空", sectors填对应A股产业链板块，不得按"海外行情播报"忽略
+- 澄清/否认公告（"无参股X""无涉足X业务""不涉及X概念""XX与公司无关""目前不具备/暂无X计划"等否定性表态）→ 这是对炒作题材的否定性澄清，不等于利好；一律 score=0, sentiment="中性", direction="中性", event_type="公司"（如"达实智能：无参股宇树科技，无机器人业务"→ score=0 中性，严禁判利好）
+` + valueChainSection
+
+// batchSystemPrompt 批量热点分析的 system 提示词：从编号列表中筛选实质影响事件并输出 JSON 数组。
+// （batchSystemPrompt is the system prompt for batch hot-topic analysis: filter substantive events from
+// the numbered list and output a JSON array.）
+var batchSystemPrompt = `你是一个A股多维度热点分析专家。从以下新闻中筛选出对A股有实质性影响的重大事件（如政策、行业景气、公司重大利好/利空、宏观数据、技术突破等），忽略娱乐、社会、体育、影视、名人八卦、灾难事故等无关新闻。
+
+必须忽略以下噪音类型（score一律输出0）：
+- 机构观点/专家评论/券商研报/分析师看市（如"机构观点""专家看市""某券商认为"）
+- 股吧/互动问答/投资者关系/董秘回复
+- 海外市场行情播报（美股/港股/欧股/外汇/黄金/原油盘面，无A股板块/个股归因）
+
+对筛选出的每条事件按JSON格式输出，整体为一个JSON数组。如果无重大事件，只输出[]。
+
+首先判断事件级别：
+- 个股级别：股东增持/减持/回购/质押/公司公告/个股经营变动等仅影响单一公司的事件 → level="个股", sectors/upstream_sectors/downstream_sectors全部置为[]空数组
+- 板块级别：政策/行业景气/宏观数据/技术突破等影响整个产业链的事件 → level="板块", 正常填写sectors
+
+评分规则（score 为带符号数值，正=利好 负=利空，表示事件强度）：
+- +0.75 强利好：业绩翻倍/扭亏为盈、龙头大额回购/增持、重磅新药获批、重大政策利好、重组获批
+- +0.50 中利好：业绩小幅增长、普通中标/订单、一般增持、行业景气上行
+- -0.50 中利空：业绩小幅下滑/不及预期、一般减持、行业景气下行、质押
+- -0.75 强利空：业绩巨亏/预亏、被立案调查/处罚、大股东大幅减持、退市风险警示、重大政策利空
+- 0    中性：海外指数波动、常规公告（董事会决议/人事变动）、无个股/板块归因的行情播报、无实质影响的行业新闻
+- 注意：尽量使用 ±0.50 / ±0.75，避免使用 ±0.25 弱档；无明确方向一律输出 0
+
+方向判定（与 score 符号一致）：
+- 利好：业绩增长、中标/订单、增持/回购、新药获批、政策利好、重组/收购
+- 利空：业绩下滑/亏损、减持/质押、被调查/处罚、退市/ST、政策利空
+- 中性：海外指数波动、常规公告、行情播报、无归因的一般新闻
+
+板块归因要求（§D1 护栏2：只许点选、不许发明）：
+- sectors/upstream_sectors/downstream_sectors 只能从系统注入的真实板块目录中逐字点选（见板块点选白名单）；目录中没有的板块名一律不得输出，找不到贴切板块就留空
+- 不输出个股名单（related/upstream/downstream_stocks 字段已废除）：个股级事件由系统按新闻自带标签与标题公司名自动关联，板块级个股由系统按成分股表注入
+- 例："凯莱英拟增资10.5亿元" → level=个股, sectors=[]
+- 例："SpaceX美股盘前涨超2%" → 无A股板块归因 → score=0 中性
+
+每条新闻的格式: "序号. 标题"
+返回格式:
+[
+  {
+    "index": 序号,
+    "level": "板块|个股",
+    "sentiment": "正面|负面|中性",
+    "score": 带符号数值(正利好/负利空/0中性),
+    "impact_level": "高|中|低",
+    "event_type": "政策|财报|行业|公司|宏观|事件驱动",
+    "urgency": "立即|关注|观察",
+    "direction": "利好|利空|中性",
+    "sectors": ["直接影响板块"],
+    "upstream_sectors": ["上游产业链受影响板块"],
+    "downstream_sectors": ["下游产业链受影响板块"],
+    "strategy": "N形|龙头|双凸|龙回头|无",
+    "reason": "简要分析理由",
+    "region": "国内|海外",
+    "relation": "对抗制裁|合作|不涉及",
+    "upstream_direction": "利好|利空|中性",
+    "downstream_direction": "利好|利空|中性"
+  }
+  ]
+只输出JSON数组，不要多余文字。
+
+补充规则：
+- 宏观数据走弱（GDP增速放缓/低于预期、PMI走弱或跌破荣枯线、核心通胀高企黏性、就业走弱）→ level="板块", event_type="宏观", score=-0.50~-0.75, direction="利空"
+- 海外龙头公司（苹果/特斯拉/微软/英伟达等）财报或业绩指引不及预期、盘后大幅下跌，且涉及A股产业链（消费电子/苹果产业链/存储/算力/半导体等）→ level="板块", event_type="行业", score=-0.50~-0.75, direction="利空", sectors填对应A股产业链板块，不得按"海外行情播报"忽略
+- 澄清/否认公告（"无参股X""无涉足X业务""不涉及X概念""XX与公司无关""目前不具备/暂无X计划"等否定性表态）→ 这是对炒作题材的否定性澄清，不等于利好；一律 score=0, sentiment="中性", direction="中性", event_type="公司"（如"达实智能：无参股宇树科技，无机器人业务"→ score=0 中性，严禁判利好）
+` + valueChainSection
+
+// llmBatchSize LLM 单次批量处理的最大条数，防止超大批次导致超时。
+// 推理模型（GLM-Z1-9B）对大批次首 token 极慢，30 条会 240s 超时等不到响应头，
+// 调小到 10 条使单批在超时内完成（与 classifier.go 的 llmBatchSize 保持一致）。
+// （llmBatchSize caps the per-call batch size to avoid timeouts on oversized batches. Reasoning models
+// like GLM-Z1-9B are slow to produce the first token on large batches; shrinking to 10 per call keeps
+// each batch within the timeout (kept in sync with classifier.go's llmBatchSize).）
+const llmBatchSize = 10
+
+// batchBounds 将 n 个元素按 size 分块，返回 [start,end) 区间列表。
+// （batchBounds splits n items into size-sized chunks and returns the [start,end) ranges.）
+func batchBounds(n, size int) [][2]int {
+	var out [][2]int
+	for start := 0; start < n; start += size {
+		end := start + size
+		if end > n {
+			end = n
+		}
+		out = append(out, [2]int{start, end})
+	}
+	return out
+}
+
+// AnalyzeHotTopicBatch 批量分析多条新闻，按 llmBatchSize 分批并**并发**调用合并结果。
+// 子批失败做隔离：该子批保留 nil 占位（不生成关键词兜底结果），不 abort 全批，
+// 保证某几个坏子批不会拖垮整批 Stage2（主干继续）。
+// 返回第三个值 failedIdx：LLM 重试耗尽失败的全局索引，调用方据此把对应新闻
+// 留在未归因队列供下一轮重试，避免"LLM 偶发失败 = 该新闻永久丢失"。
+// （AnalyzeHotTopicBatch analyzes many news items in batches of llmBatchSize, run **concurrently**.
+// Sub-batch failures are isolated: the failed sub-batch is left as nil placeholders (no keyword-fallback
+// results) instead of aborting the whole batch. The third return failedIdx lists the global indices that
+// failed, so the caller can keep those news in the unattributed queue for the next round rather than
+// permanently losing them to a transient LLM failure.）
+func (c *Client) AnalyzeHotTopicBatch(titles []string) ([]*HotTopic, []int, error) {
+	result := make([]*HotTopic, len(titles))
+	if len(titles) == 0 {
+		return result, nil, nil
+	}
+
+	// 并发度兜底：客户端没显式设置时回落到默认值，信号量按它限流，
+	// 避免一次热门题材批量分析把上游连接数瞬间打满。
+	concurrency := c.batchConcurrency
+	if concurrency < 1 {
+		concurrency = DefaultBatchConcurrency
+	}
+	sem := make(chan struct{}, concurrency)
+	var wg sync.WaitGroup
+	var failedMu sync.Mutex
+	var failedIdx []int
+
+	// 逐子批派发协程：先抢信号量再起 goroutine，子批失败只登记自己那段索引，
+	// 主干结果继续合并，不因为几个坏子批整批作废。
+	for _, b := range batchBounds(len(titles), llmBatchSize) {
+		start, end := b[0], b[1]
+		wg.Add(1)
+		sem <- struct{}{}
+		go func(start, end int) {
+			defer wg.Done()
+			defer func() { <-sem }()
+			sub, err := c.analyzeBatch(titles[start:end])
+			if err != nil {
+				log.Printf("LLM[%d] 子批%d..%d 重试队列用尽, 该子批%d条留待重试(nil占位, 主干继续): %v",
+					len(titles), start+1, end, end-start, err)
+				failedMu.Lock()
+				for i := start; i < end; i++ {
+					failedIdx = append(failedIdx, i)
+				}
+				failedMu.Unlock()
+				return
+			}
+			copy(result[start:end], sub)
+		}(start, end)
+	}
+	wg.Wait()
+	return result, failedIdx, nil
+}
+
+// analyzeBatch 单批 LLM 批量分析（内部使用，批次规模 ≤ llmBatchSize）。
+// API 失败 与 JSON 解析失败 都纳入重试队列（最多5次：2s/4s/8s/16s/30s），
+// 仍失败返回错误；由 AnalyzeHotTopicBatch 做子批隔离（只丢本子批，不影响主干）。
+// （analyzeBatch runs one batch of LLM analysis (internal use, batch size ≤ llmBatchSize). Both API
+// failures and JSON-parse failures enter a retry queue (up to 5 times: 2s/4s/8s/16s/30s); if it still
+// fails it returns an error, and AnalyzeHotTopicBatch isolates the sub-batch (only this sub-batch is lost).）
+func (c *Client) analyzeBatch(titles []string) ([]*HotTopic, error) {
+	// 构建批量请求文本
+	var sb strings.Builder
+	for i, t := range titles {
+		sb.WriteString(fmt.Sprintf("%d. %s\n", i+1, t))
+	}
+	prompt := sb.String()
+
+	// 轮询重试（最多5次、间隔递增 2s/4s/8s/16s/30s）：调用失败或解析失败均重试
+	const maxAttempts = 5
+	var raw []stage2Row
+	var lastErr error
+	ok := false
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		resp, err := c.Chat(batchSystemPrompt+sectorCatalogSection(), prompt)
+		if err == nil {
+			resp = cleanJSON(resp)
+			raw, err = parseHotTopicBatch(resp)
+			if err == nil {
+				ok = true
+				break
+			}
+		}
+		lastErr = err
+		log.Printf("LLM[%d] 调用/解析失败(第%d/%d次): %v", len(titles), attempt, maxAttempts, err)
+		if attempt < maxAttempts {
+			time.Sleep(jitterBackoff(time.Duration(1<<uint(attempt)) * time.Second))
+		}
+	}
+	if !ok {
+		log.Printf("LLM[%d] 重试队列用尽仍失败, 该批%d条丢弃: %v", len(titles), len(titles), lastErr)
+		return nil, lastErr
+	}
+
+	// 日志：LLM返回了哪些板块（§D1 护栏1 后个股名单不再由 LLM 产出）
+	for _, r := range raw {
+		sectors := strings.Join(r.Sectors, ",")
+		idx := int(r.Index) - 1
+		title := ""
+		if idx >= 0 && idx < len(titles) {
+			title = titles[idx][:minInt(len(titles[idx]), 30)]
+		}
+		log.Printf("LLM打标: %s → 方向=%s 板块=[%s]", title, r.Direction, sectors)
+	}
+
+	result := make([]*HotTopic, len(titles))
+	for i, title := range titles {
+		// 以空结构初始化（不依赖关键词兜底），再按 LLM 返回序号覆盖对应字段
+		// （未命中字段保留空值/默认值，LLM 明确给出的字段一律采用）。
+		ht := &HotTopic{Title: title}
+		for _, r := range raw {
+			if int(r.Index) == i+1 {
+				ht.Level = r.Level
+				ht.Sentiment = r.Sentiment
+				ht.Score = float64(r.Score)
+				ht.ImpactLevel = r.ImpactLevel
+				ht.EventType = r.EventType
+				ht.Urgency = r.Urgency
+				ht.Direction = r.Direction
+				if len(r.Sectors) > 0 {
+					ht.Sectors = r.Sectors
+				}
+				if len(r.UpstreamSectors) > 0 {
+					ht.UpstreamSectors = r.UpstreamSectors
+				}
+				if len(r.DownstreamSectors) > 0 {
+					ht.DownstreamSectors = r.DownstreamSectors
+				}
+				if r.Strategy != "" {
+					ht.Strategy = r.Strategy
+				}
+				if r.Reason != "" {
+					ht.Reason = r.Reason
+				}
+				if r.Region != "" {
+					ht.Region = r.Region
+				}
+				if r.Relation != "" {
+					ht.Relation = r.Relation
+				}
+				if r.UpstreamDirection != "" {
+					ht.UpstreamDirection = r.UpstreamDirection
+				}
+				if r.DownstreamDirection != "" {
+					ht.DownstreamDirection = r.DownstreamDirection
+				}
+				break
+			}
+		}
+		if ht.Level == "" {
+			ht.Level = "板块"
+		}
+		if ht.Strategy == "" {
+			ht.Strategy = "无"
+		}
+		if ht.Urgency == "" {
+			ht.Urgency = "观察"
+		}
+		result[i] = ht
+	}
+	log.Printf("LLM批量分析完成: %d/%d条", len(raw), len(titles))
+	return result, nil
+}
+
+// AnalyzeHotTopic 对新闻标题进行多维度热点分析。
+// 返回:
+//   - *HotTopic: 分析结果（API 失败/解析失败时返回 nil，不生成关键词兜底结果）
+//   - error: API 调用或 JSON 解析的错误（非 nil 表示分析失败）
+//
+// （AnalyzeHotTopic runs multi-dimensional hot-topic analysis on a news title.
+// Returns:
+//   - *HotTopic: the analysis result (nil on API/parse failure — no keyword-fallback result is fabricated)
+//   - error: API call or JSON-parse error (non-nil means the analysis failed)）
+func (c *Client) AnalyzeHotTopic(title string) (*HotTopic, error) {
+	// 轮询重试（最多5次、间隔递增 2s/4s/8s/16s/30s），与批量路径一致
+	const maxAttempts = 5
+	var resp string
+	var err error
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		resp, err = c.Chat(hotTopicSystemPrompt+sectorCatalogSection(), title)
+		if err == nil {
+			break
+		}
+		if attempt < maxAttempts {
+			log.Printf("LLM API失败(第%d次), 轮询重试(%s): %v", attempt, title[:minInt(len(title), 30)], err)
+			time.Sleep(time.Duration(1<<uint(attempt)) * time.Second)
+		}
+	}
+	if err != nil {
+		log.Printf("LLM API调用失败(%s), 轮询%d次仍失败, 返回nil(由调用方入重试队列): %v", title[:minInt(len(title), 30)], maxAttempts, err)
+		return nil, err
+	}
+
+	resp = cleanJSON(resp)
+
+	var ht HotTopic
+	ht.Title = title
+	if err := json.Unmarshal([]byte(resp), &ht); err != nil {
+		log.Printf("LLM JSON解析失败(%s), 返回nil(由调用方入重试队列): %s", title[:minInt(len(title), 30)], resp[:minInt(len(resp), 100)])
+		return nil, err
+	}
+
+	// 空字段补默认值，保证下游字段齐整
+	if ht.Level == "" {
+		ht.Level = "板块"
+	}
+	if ht.Strategy == "" {
+		ht.Strategy = "无"
+	}
+	if ht.Urgency == "" {
+		ht.Urgency = "观察"
+	}
+	return &ht, nil
+}
+
+// Ping 发送最小请求验证 LLM 通道（API Key / 网络 / 上游服务）可用性。
+// 使用极小的非流式请求（max_tokens=1），成功返回 nil；失败返回上游错误。
+// 供启动时序在进入盘前新闻分析前快速探活，尽早暴露 key 失效/断网问题。
+// （Ping sends a minimal request to verify the LLM channel (API key / network / upstream service).
+// It uses a tiny non-streaming request (max_tokens=1); nil on success, otherwise the upstream error.
+// The startup sequence pings before pre-market news analysis to surface key/network issues early.）
+func (c *Client) Ping() error {
+	if len(c.apiKeys) == 0 {
+		return ErrNoAPIKey // §FIX-9d 哨兵化，消息不变
+	}
+	// 发起一次最小成本请求（单 token 非流式）探测 API 连通性。
+	// §UI-AUTHORITATIVE 修复：超时从硬编码 10s 改为客户端自身超时（≥60s）——推理模型
+	// （如 qwen3.8-flash-free）即使 max_tokens=1 也要先走思维链，首字常超 10s，
+	// 旧值导致启动预检假阴性"降级运行"。（English: give Ping the client timeout; reasoning
+	// models routinely exceed the old hard-coded 10s even for one token.）
+	ctx, cancel := context.WithTimeout(context.Background(), c.Timeout())
+	defer cancel()
+	// 探测请求体：单条中文消息 + max_tokens=1 非流式——成本最小化，且顺带验证中文编解码。
+	payload := chatCompletionRequest{
+		ChatRequest: ChatRequest{
+			Model: c.model,
+			Messages: []Message{
+				{Role: "user", Content: "好"},
+			},
+		},
+		Stream:    false,
+		MaxTokens: 1,
+	}
+	data, err := json.Marshal(payload)
+	if err != nil {
+		return err
+	}
+	httpReq, err := http.NewRequestWithContext(ctx, "POST", c.apiURL, bytes.NewReader(data))
+	if err != nil {
+		return err
+	}
+	httpReq.Header.Set("Authorization", "Bearer "+c.apiKey)
+	httpReq.Header.Set("Content-Type", "application/json")
+	resp, err := c.httpClient.Do(httpReq)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		msg, _ := io.ReadAll(resp.Body)
+		return &UpstreamError{Status: resp.StatusCode, Detail: strings.TrimSpace(string(msg))}
+	}
+	// §P0 2026-09-20：预检也必须看响应体。此前只看状态码，于是"api_url 填成网页控制台"
+	// 这种地址在启动预检里**永远是"通过"**（307 → 登录页 HTML + 200），
+	// 每轮启动日志都打印"[LLM] 启动预检通过"，把排查方向彻底带偏。
+	head, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+	if isHTMLContentType(resp) || looksLikeHTMLPage(head) {
+		return notAPIError(c.apiURL, redactURL(respURL(resp)),
+			truncateRunes(strings.Join(strings.Fields(string(head)), " "), 160))
+	}
+	return nil
+}
+
+// AnalyzeSentiment 简版情感分析（用于快速评分）。
+// （AnalyzeSentiment is a lightweight sentiment analysis for quick scoring.）
+// AnalyzeSentiment 单条文本情感打分（0~1）。失败/解析失败返回错误，不伪造中性分。
+// （AnalyzeSentiment scores a single text's sentiment (0~1). On failure/parse error it returns an error —
+// no fabricated neutral score.）
+func (c *Client) AnalyzeSentiment(text string) (float64, error) {
+	resp, err := c.Chat(
+		"你是一个A股新闻情感分析师。只输出一个0-1之间的数字，0=极负面，0.5=中性，1=极正面。不要多余文字。",
+		text,
+	)
+	if err != nil {
+		return 0, err
+	}
+	resp = strings.TrimSpace(resp)
+	var score float64
+	if _, e := fmt.Sscanf(resp, "%f", &score); e == nil && score >= 0 && score <= 1 {
+		return score, nil
+	}
+	return 0, fmt.Errorf("LLM情感分解析失败: %q", resp[:minInt(len(resp), 100)])
+}
+
+// AnalyzeNews 兼容旧接口（内部调用新分析）。
+// （AnalyzeNews is a legacy-compatible wrapper that internally calls the new analysis.）
+func (c *Client) AnalyzeNews(text string) (string, error) {
+	ht, err := c.AnalyzeHotTopic(text)
+	if err != nil {
+		return "", err
+	}
+	data, _ := json.MarshalIndent(ht, "", "  ")
+	return string(data), nil
+}
+
+// SentimentScore 旧版情感分数接口（原为关键词兜底，现已不再兜底：失败返回错误，由调用方处理重试）。
+// （SentimentScore is the legacy sentiment-score interface — keyword fallback removed; on failure it
+// returns an error for the caller to route into the LLM retry queue.）
+func (c *Client) SentimentScore(text string) (float64, error) {
+	resp, err := c.AnalyzeHotTopic(text)
+	if err != nil {
+		return 0, err
+	}
+	return resp.Score, nil
+}
+
+// cleanJSON 清理 LLM 返回的原始文本，使其能被 json.Unmarshal 正确解析。
+// 1. 去掉 markdown 代码块（```json / ```）——很多 LLM 会用代码块包裹结构化输出。
+// 2. 提取 JSON 数组边界（第一个 [ 到最后一个 ]）——有些推理模型（如 GLM-Z1）会在 JSON 前输出思考/推理过程文本。
+// 3. 移除尾部多余的 . , ; 等非法字符——部分模型在 JSON 结尾后随手加上了句号或逗号。
+// 注意：单条分析会正常解析，批量分析也会从整体中正确截取数组部分。
+// （cleanJSON sanitizes the raw LLM output so json.Unmarshal can parse it: (1) strips markdown code
+// fences, (2) extracts the JSON array bounds (first [ to last ]) to drop stray reasoning text some
+// reasoning models emit before the JSON, and (3) trims trailing illegal chars like . , ; .）
+func cleanJSON(s string) string {
+	s = strings.TrimSpace(s)
+	s = strings.TrimPrefix(s, "```json")
+	s = strings.TrimPrefix(s, "```")
+	s = strings.TrimSuffix(s, "```")
+	s = strings.TrimSpace(s)
+	// 提取 JSON 主体：LLM 可能输出单个对象（HotTopic）或数组（D1 评分等）。
+	// 按首字符区分：'{' 提取首个 { 到末尾 } 之间；'[' 提取首个 [ 到末尾 ] 之间。
+	// 若对象内嵌数组（如 "sectors":["机器人"]）时按第一个 [ 截取会把对象前半截切掉，
+	// 故必须按最外层括号类型提取。
+	// English: extract the JSON body — LLM may emit a single object (HotTopic) or an array
+	// (D1 scoring etc.). Use the first non-space char to choose delimiters: '{' → first { to last };
+	// '[' → first [ to last ]. Slicing at the first '[' would cut off an object whose fields hold
+	// arrays (e.g. "sectors":["机器人"]), so we must match the outermost bracket kind.
+	if start := strings.IndexAny(s, "{["); start >= 0 {
+		open := s[start]
+		close := byte('}')
+		if open == '[' {
+			close = ']'
+		}
+		if end := strings.LastIndexByte(s, close); end > start {
+			s = s[start : end+1]
+		}
+	}
+	// 移除尾部的非法字符（如句号、逗号）只保留 JSON 部分
+	s = strings.TrimRight(s, ".,; ")
+	// 清理非法 '+' 前缀数值：部分小模型输出 "score": +0.75 或 "score": 0.5（裸 + 号），
+	// JSON 数字不允许 '+' 前缀，这里把冒号/逗号/左括号后的 '+' 剥掉（不影响字符串内的 '+'）。
+	s = plusNumberRe.ReplaceAllString(s, "$1 ")
+	// 转义字符串值中的换行符（JSON 不允许字符串内未转义的 \n）
+	// 并清理非法转义：9B 推理模型常在字符串里输出 \( \) 等非法 JSON 转义，
+	// 遇到反斜杠后跟非合法转义集（" \ / b f n r t u）的字符时，丢弃反斜杠保留原字符。
+	var buf strings.Builder
+	inStr := false
+	for i := 0; i < len(s); i++ {
+		ch := s[i]
+		if ch == '\\' && i+1 < len(s) {
+			next := s[i+1]
+			if !isValidJSONEscape(next) {
+				// 非法转义（如 \( \））→ 只保留原字符，丢弃反斜杠
+				buf.WriteByte(next)
+				i++
+				continue
+			}
+			// 合法转义（\" \\ \/ \b \f \n \r \t \u）→ 原样保留，跳过下一字节
+			// 转义的引号不切换 inStr 状态（\" 不会被视为字符串结束符）
+			buf.WriteByte(ch)
+			buf.WriteByte(next)
+			i++
+			continue
+		}
+		if ch == '"' {
+			inStr = !inStr
+			buf.WriteByte(ch)
+			continue
+		}
+		if inStr && (ch == '\n' || ch == '\r') {
+			buf.WriteString("\\n")
+		} else {
+			buf.WriteByte(ch)
+		}
+	}
+	return buf.String()
+}
+
+// isValidJSONEscape 判断字节是否为合法 JSON 转义字符（反斜杠后的有效转义序列首字符）。
+// （isValidJSONEscape reports whether b is the leading char of a valid JSON escape sequence.）
+func isValidJSONEscape(b byte) bool {
+	switch b {
+	case '"', '\\', '/', 'b', 'f', 'n', 'r', 't', 'u':
+		return true
+	}
+	return false
+}
+
+// plusNumberRe 匹配冒号/逗号/左括号后的 '+' 前缀（数值位置），用于剥离非法 '+'。
+// （plusNumberRe matches a '+' prefix after a colon/comma/left bracket (number positions) to strip illegal '+'.）
+var plusNumberRe = regexp.MustCompile(`([:,\[])\s*\+`)
+
+// stage2Row Stage2 批量返回的单行（容错：index 兼容字符串）。
+// （stage2Row is one row of the Stage2 batch response (fault-tolerant: index also accepts strings).）
+type stage2Row struct {
+	// 序号
+	Index flexInt `json:"index"`
+	// 事件级别（个股/板块/行业/宏观）
+	Level string `json:"level"`
+	// 情绪（正面/负面/中性）
+	Sentiment string `json:"sentiment"`
+	// 置信/影响分
+	Score flexibleFloat `json:"score"`
+	// 影响级别（高/中/低）
+	ImpactLevel string `json:"impact_level"`
+	// 事件类型
+	EventType string `json:"event_type"`
+	// 紧迫度
+	Urgency string `json:"urgency"`
+	// 方向（利好/利空）
+	Direction string `json:"direction"`
+	// 相关板块
+	Sectors []string `json:"sectors"`
+	// 上游板块
+	UpstreamSectors []string `json:"upstream_sectors"`
+	// 下游板块
+	DownstreamSectors []string `json:"downstream_sectors"`
+	// §D1 护栏1：related/upstream/downstream_stocks 已从解析层删除——
+	// 即使存量模型照旧吐出这三键也直接丢弃（物理不透传，防旧习惯复活自由归因）。
+	// 策略建议
+	Strategy string `json:"strategy"`
+	// 归因理由
+	Reason string `json:"reason"`
+	// 地域（国内/海外）
+	Region string `json:"region"`
+	// 关联关系
+	Relation string `json:"relation"`
+	// 上游方向
+	UpstreamDirection string `json:"upstream_direction"`
+	// 下游方向
+	DownstreamDirection string `json:"downstream_direction"`
+}
+
+// flexInt 兼容 JSON 中整数为数字或字符串（1 / "1"）的解析。
+// （flexInt parses integers that may be numbers or strings in JSON (1 / "1").）
+type flexInt int
+
+// UnmarshalJSON 实现 json.Unmarshaler：数字或字符串（允许 + 前缀/空白）都能解析。
+// （UnmarshalJSON implements json.Unmarshaler, accepting numbers or quoted-strings; parsed to int,
+// defaulting to 0 on parse failure.）
+func (f *flexInt) UnmarshalJSON(b []byte) error {
+	s := strings.TrimSpace(strings.Trim(string(b), `"`))
+	if s == "" {
+		*f = 0
+		return nil
+	}
+	v, err := strconv.Atoi(s)
+	if err != nil {
+		*f = 0
+	}
+	*f = flexInt(v)
+	return nil
+}
+
+// parseHotTopicBatch 两段式解析 Stage2 批量响应：整体数组解析失败 → 逐对象扫描抢救。
+// 单坏对象只丢该条；整体+逐对象都抢救不出才返回错误（触发重试队列）。
+// （parseHotTopicBatch parses the Stage2 batch response in two passes: a whole-array parse, then a
+// per-object salvage scan if that fails. A single bad object only drops that item; an error is returned
+// only if both passes fail (triggering the retry queue).）
+func parseHotTopicBatch(resp string) ([]stage2Row, error) {
+	var raw []stage2Row
+	if err := json.Unmarshal([]byte(resp), &raw); err == nil {
+		return raw, nil
+	}
+	var out []stage2Row
+	for _, obj := range extractObjects(resp) {
+		obj = strings.ReplaceAll(obj, `':''`, `":"`)
+		obj = llmTrailingJunkRe.ReplaceAllString(obj, `"$1`)
+		obj = llmEmptyValueRe.ReplaceAllString(obj, `$1""`)
+		var one stage2Row
+		if err := json.Unmarshal([]byte(obj), &one); err == nil {
+			out = append(out, one)
+		}
+	}
+	if len(out) == 0 {
+		return nil, fmt.Errorf("批次JSON整体解析失败且逐对象抢救无效")
+	}
+	log.Printf("LLM[%d] 整体解析失败, 逐对象抢救成功 %d 条", len(out), len(out))
+	return out, nil
+}
+
+// extractObjects 用花括号配对扫描提取字符串中所有独立 JSON 对象 `{...}`（含嵌套、无视排版）。
+// （extractObjects scans the string with brace-pair matching to extract every standalone JSON object
+// `{...}` (including nested ones, ignoring whitespace/layout).）
+func extractObjects(s string) []string {
+	var objs []string
+	start := -1
+	depth := 0
+	inStr := false
+	esc := false
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if esc {
+			esc = false
+			continue
+		}
+		if c == '\\' {
+			esc = true
+			continue
+		}
+		if c == '"' {
+			inStr = !inStr
+			continue
+		}
+		if inStr {
+			continue
+		}
+		switch c {
+		case '{':
+			if depth == 0 {
+				start = i
+			}
+			depth++
+		case '}':
+			depth--
+			if depth == 0 && start >= 0 {
+				objs = append(objs, s[start:i+1])
+				start = -1
+			}
+		}
+	}
+	return objs
+}
+
+// llmEmptyValueRe / llmTrailingJunkRe 与 newsagent 的修复规则同源，修复模型畸形输出。
+// （llmEmptyValueRe / llmTrailingJunkRe share their origin with newsagent's fix rules for malformed model output.）
+var llmEmptyValueRe = regexp.MustCompile(`("(?:[^"\\]|\\.)*"\s*:)\s*[}\]]`)
+var llmTrailingJunkRe = regexp.MustCompile(`"\s*[\)']+\s*([,}\]]|$)`)
+
+// flexibleFloat 兼容 JSON 中字段为数字或字符串（如 "0.75" / "+0.75"）的浮点解析。
+// 部分小模型会把数值输出成带符号字符串，导致标准 json.Unmarshal 失败，这里做容错。
+// （flexibleFloat parses floats that may be numbers or strings in JSON (e.g. "0.75" / "+0.75"). Some
+// small models emit signed string numbers, failing standard json.Unmarshal; this adds tolerance.）
+type flexibleFloat float64
+
+// UnmarshalJSON 实现 json.Unmarshaler：数字或字符串（允许 + 前缀/空白）都能解析。
+// （UnmarshalJSON implements json.Unmarshaler, accepting numbers or strings (allowing a + prefix/whitespace).）
+func (f *flexibleFloat) UnmarshalJSON(b []byte) error {
+	s := strings.TrimSpace(strings.Trim(string(b), `"`))
+	if s == "" {
+		*f = 0
+		return nil
+	}
+	s = strings.TrimPrefix(s, "+")
+	v, err := strconv.ParseFloat(s, 64)
+	if err != nil {
+		// 解析失败时按 0 处理，避免整批 JSON 因单个坏值被丢弃
+		*f = 0
+		return nil
+	}
+	*f = flexibleFloat(v)
+	return nil
+}
+
+// minInt 返回两个整数中的较小值（用于截断日志输出长度）。
+// （minInt returns the smaller of two ints (used to truncate log output length).）
+func minInt(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
+
+// SectorTag 解析后的板块标签，含置信度权重。
+// （SectorTag is a parsed sector tag with a confidence weight.）
+type SectorTag struct {
+	// 板块名
+	Name string
+	// 置信度 0~1（无后缀时=1.0）
+	Confidence float64
+}
+
+// ParseSectors 解析 LLM 返回的 sectors 列表。
+// 格式1: "固态电池" → {Name:"固态电池", Confidence:1.0}
+// 格式2: "固态电池(0.8)" → {Name:"固态电池", Confidence:0.8}
+// 复合: "半导体(1.0)/芯片(0.7)" → split后分别解析
+// （ParseSectors parses the sectors list returned by the LLM. Format 1: "固态电池" → Confidence 1.0;
+// format 2: "固态电池(0.8)" → Confidence 0.8; compound "半导体(1.0)/芯片(0.7)" → split and parse each.）
+func ParseSectors(sectors []string) []SectorTag {
+	var result []SectorTag
+	re := regexp.MustCompile(`^(.+?)\(([\d.]+)\)$`)
+	for _, s := range sectors {
+		// 兼容 "/" 分隔的复合格式，逐段解析
+		for _, part := range strings.Split(s, "/") {
+			part = strings.TrimSpace(part)
+			if part == "" {
+				continue
+			}
+			st := SectorTag{Name: part, Confidence: 1.0}
+			// 形如 "固态电池(0.8)" 时提取名称与置信度，解析失败回退默认 1.0
+			if m := re.FindStringSubmatch(part); len(m) == 3 {
+				st.Name = strings.TrimSpace(m[1])
+				if f, err := fmt.Sscanf(m[2], "%f", &st.Confidence); err != nil || f != 1 {
+					st.Confidence = 1.0
+				}
+				// 置信度钳制到 [0,1]
+				if st.Confidence > 1 {
+					st.Confidence = 1
+				}
+				if st.Confidence < 0 {
+					st.Confidence = 0
+				}
+			}
+			result = append(result, st)
+		}
+	}
+	return result
+}
+
+// StockCodeMap 股票名称→代码硬编码映射。
+// 不依赖 LLM prompt 格式，纯后处理。
+// （StockCodeMap is the hardcoded stock-name-to-code mapping, independent of the LLM prompt format—pure post-processing.）
+var StockCodeMap = map[string]string{
+	// 半导体/芯片
+	"中芯国际": "688981.SH", "北方华创": "002371.SZ", "韦尔股份": "603501.SH",
+	"南大光电": "300346.SZ", "中微公司": "688012.SH", "中微半导体": "688012.SH",
+	"华大九天": "301269.SZ", "长电科技": "600584.SH", "兆易创新": "603986.SH",
+	"卓胜微": "300782.SZ", "紫光国微": "002049.SZ", "三安光电": "600703.SH",
+	"士兰微": "600460.SH", "华虹公司": "688347.SH",
+	// AI/算力
+	"科大讯飞": "002230.SZ", "寒武纪": "688256.SH", "浪潮信息": "000977.SZ",
+	"中科曙光": "603019.SH", "海光信息": "688041.SH", "中际旭创": "300308.SZ",
+	"新易盛": "300502.SZ", "天孚通信": "300394.SZ", "工业富联": "601138.SH",
+	// 消费电子
+	"歌尔股份": "002241.SZ", "立讯精密": "002475.SZ", "京东方A": "000725.SZ",
+	"TCL科技": "000100.SZ", "传音控股": "688036.SH",
+	// 金融
+	"平安银行": "000001.SZ", "工商银行": "601398.SH", "建设银行": "601939.SH",
+	"招商银行": "600036.SH", "中国平安": "601318.SH", "中国人寿": "601628.SH",
+	"东方财富": "300059.SZ", "中信证券": "600030.SH", "华泰证券": "601688.SH",
+	"同花顺": "300033.SZ", "中国银行": "601988.SH", "农业银行": "601288.SH",
+	// 新能源/汽车
+	"宁德时代": "300750.SZ", "比亚迪": "002594.SZ", "阳光电源": "300274.SZ",
+	"隆基绿能": "601012.SH", "赣锋锂业": "002460.SZ", "天齐锂业": "002466.SZ",
+	"华友钴业": "600516.SH", "容百科技": "688005.SH", "亿纬锂能": "300014.SZ",
+	"恩捷股份": "002812.SZ", "先导智能": "300450.SZ", "长城汽车": "601633.SH",
+	"上汽集团": "600104.SH", "赛力斯": "601127.SH", "江淮汽车": "600418.SH",
+	"国轩高科": "002074.SZ", "华域汽车": "600741.SH", "宁波华翔": "002048.SZ",
+	// 军工
+	"航发动力": "600893.SH", "中航沈飞": "600760.SH", "中航西飞": "000768.SZ",
+	"中国船舶": "600150.SH", "中航光电": "002179.SZ",
+	// 医药
+	"恒瑞医药": "600276.SH", "药明康德": "603259.SH", "迈瑞医疗": "300760.SZ",
+	"智飞生物": "300122.SZ", "长春高新": "000661.SZ",
+	// 白酒/消费
+	"贵州茅台": "600519.SH", "五粮液": "000858.SZ", "泸州老窖": "000568.SZ",
+	"山西汾酒": "600809.SH", "伊利股份": "600887.SH", "海天味业": "603288.SH",
+	"中国中免": "601888.SH",
+	// 基建/地产
+	"中国建筑": "601668.SH", "中国中铁": "601390.SH", "中国交建": "601800.SH",
+	"保利发展": "600048.SH", "万科A": "000002.SZ",
+	// 软件/互联网
+	"用友网络": "600588.SH", "金山办公": "688111.SH", "恒生电子": "600570.SH",
+	"广联达": "002410.SZ",
+	// 机器人/自动化/工业母机/人形机器人
+	"埃斯顿": "002747.SZ", "汇川技术": "300124.SZ", "绿的谐波": "688017.SH",
+	"华工科技": "000988.SZ",
+	"三花智控": "002050.SZ", "拓普集团": "601689.SH", "双环传动": "002472.SZ",
+	"鸣志电器": "603728.SH", "禾川科技": "688320.SH", "昊志机电": "300503.SZ",
+	"中大力德": "002896.SZ", "丰立智能": "301368.SZ", "步科股份": "688160.SH",
+	"秦川机床": "000837.SZ", "五洲新春": "603667.SH", "长盛轴承": "300718.SZ",
+	// 特斯拉供应链
+	"旭升集团": "603305.SH", "岱美股份": "603730.SH", "爱柯迪": "600933.SH",
+	// 通信/5G
+	"中兴通讯": "000063.SZ", "烽火通信": "600498.SH",
+	// 有色/化工
+	"紫金矿业": "601899.SH", "洛阳钼业": "603993.SH", "万华化学": "600309.SH",
+	"宝钢股份": "600019.SH",
+	// 电力/能源
+	"长江电力": "600900.SH", "中国核电": "601985.SH", "中国石油": "601857.SH",
+	"中国海油": "600938.SH", "中国神华": "601088.SH",
+}
+
+// ResolveStocks 将 LLM 返回的 stocks 列表解析为股票代码列表。
+// 每元素先按 "/" split 处理复合格式（LLM 常用 "中芯国际/北方华创/韦尔股份"）。
+// 解析优先级：硬编码表 > 正则提取 (XXXXXX) > 纯6位数字自动补后缀。
+// 返回 (已解析代码列表, 未解析的名称列表)。
+// （ResolveStocks parses the stocks list from the LLM into stock codes. Each element is first split by
+// "/" to handle compound formats (e.g. "中芯国际/北方华创/韦尔股份"). Priority: hardcoded table >
+// regex (XXXXXX) > bare 6-digit code with auto suffix. Returns (resolved codes, unresolved names).）
+func ResolveStocks(stocks []string) (codes []string, unresolved []string) {
+	re := regexp.MustCompile(`[（(]([A-Za-z0-9]{6})[）)]`)
+	seen := make(map[string]bool)
+	for _, s := range stocks {
+		for _, part := range strings.Split(s, "/") {
+			part = strings.TrimSpace(part)
+			if part == "" {
+				continue
+			}
+			// 跳过 LLM 占位符
+			if strings.Contains(part, "×") || strings.Contains(part, "×") || strings.Contains(part, "待") || strings.Contains(part, "无") {
+				unresolved = append(unresolved, part)
+				continue
+			}
+			// 正则提取 (XXXXXX)
+			if m := re.FindStringSubmatch(part); len(m) == 2 {
+				code := autoSuffix(m[1])
+				if !seen[code] {
+					codes = append(codes, code)
+					seen[code] = true
+				}
+				continue
+			}
+			// 查硬编码表
+			if code, ok := StockCodeMap[part]; ok {
+				if !seen[code] {
+					codes = append(codes, code)
+					seen[code] = true
+				}
+				continue
+			}
+			// 纯6位数字代码
+			if len(part) == 6 && isAlphaNumeric(part) {
+				code := autoSuffix(part)
+				if !seen[code] {
+					codes = append(codes, code)
+					seen[code] = true
+				}
+				continue
+			}
+			unresolved = append(unresolved, part)
+		}
+	}
+	return
+}
+
+// autoSuffix 根据 A 股代码首位数字自动补交易所后缀：
+// 6/9 开头→上海(.SH)，0/3/2 开头→深圳(.SZ)，4/8 开头→北交所(.BJ)。
+// （autoSuffix appends the exchange suffix by the first digit: 6/9 → .SH, 0/3/2 → .SZ, 4/8 → .BJ.）
+func autoSuffix(code string) string {
+	if len(code) != 6 {
+		return code
+	}
+	switch code[0] {
+	case '6', '9':
+		return code + ".SH"
+	case '0', '3', '2':
+		return code + ".SZ"
+	case '4', '8':
+		return code + ".BJ"
+	}
+	return code
+}
+
+// isAlphaNumeric 判断字符串是否全部由字母或数字组成。
+// （isAlphaNumeric reports whether s consists only of letters and digits.）
+func isAlphaNumeric(s string) bool {
+	for _, r := range s {
+		if !((r >= '0' && r <= '9') || (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z')) {
+			return false
+		}
+	}
+	return true
+}

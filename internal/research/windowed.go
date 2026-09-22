@@ -1,0 +1,1025 @@
+// 窗口分块计算（内存优化）：把 discover_factors 的"全量面板常驻（~2.8GB）"改为
+// 按交易日窗口分块，每窗口只装配该区间股票面板、算完即释放，从而把峰值内存压到
+// 单窗口（约 340MB，900M 内）而保持全局口径（每窗口内是完整截面）。
+//
+// 适用场景：服务器 1.6G 内存小 VPS 跑全市场（5545 只 × 近3年 × 全因子含财务）自动研究时
+// 避免 OOM/拖垮系统；代价是每次评估动作需重扫所有窗口（CPU 高、跑得慢，但可接受）。
+//
+// 核心复用：窗口内仍用现有的 CompositeICRange / ICByDate / SpearmanIC / forwardReturn，
+// 只是把"一次性全量 panels"替换为"逐窗口装配 panels → 累积该窗口的 ICRow → 释放"。
+//
+// English: window-chunked computation (memory optimization) — turns discover_factors' "all panels
+// resident in memory (~2.8GB)" into per-trading-day-window chunks: each window only assembles that
+// interval's stock panels, computes, then releases, dropping peak memory to a single window
+// (~340MB, within 900M) while keeping the global cross-section (each window holds the full stock
+// cross-section). Aimed at the 1.6G VPS running full-universe auto research without OOM/starving the
+// system; the cost is that each evaluation re-scans every window (slower, but acceptable).
+package research
+
+import (
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"fmt"
+	"log"
+	"math"
+	"sort"
+	"strings"
+
+	"quant-trading-v2/internal/factor"
+	"quant-trading-v2/internal/store"
+)
+
+// winCkpt 窗口级断点助手（二期）：命中即跳过该窗装配，算完即落库。
+// nil 接收者安全（所有方法判空直通），便于调用方无断点场景复用同一代码路径。
+// English: per-window checkpoint helper — a hit skips that window's assembly; completion persists it.
+// nil-receiver safe so callers without checkpoints share the same code path.
+type winCkpt struct {
+	db        *store.DB
+	resumeKey string
+	stage     string
+}
+
+// load 尝试命中窗口断点并反序列化到 dst：nil 接收者 / 未命中 / JSON 损坏一律返回 false
+// （调用方走正常装配路径，断点只是加速而非正确性依赖）。
+func (c *winCkpt) load(w [2]string, dst any) bool {
+	if c == nil || c.db == nil {
+		return false
+	}
+	js, ok, err := c.db.GetWindowCkpt(c.resumeKey, c.stage, w[0], w[1])
+	if err != nil || !ok {
+		return false
+	}
+	return json.Unmarshal([]byte(js), dst) == nil
+}
+
+// save 把当前窗口的产物落库（序列化失败静默跳过，不阻断发现主流程）。
+// §M-8/N-6（2026-09-22 PM 批）：双吞改为留痕——断点是加速件不是正确性件，失败可继续，
+// 但"整晚断点全没存上"必须看得见（否则续跑收益凭空消失且无人知晓）。
+// English: §M-8/N-6 — checkpoints stay best-effort, but both swallow sites now leave a log trace.
+func (c *winCkpt) save(w [2]string, v any) {
+	if c == nil || c.db == nil {
+		return
+	}
+	js, err := json.Marshal(v)
+	if err != nil {
+		log.Printf("[research] 断点序列化失败（跳过缓存 %s %s-%s）: %v", c.stage, w[0], w[1], err)
+		return
+	}
+	if err := c.db.PutWindowCkpt(c.resumeKey, c.stage, w[0], w[1], string(js)); err != nil {
+		log.Printf("[research] 断点落库失败（下次将重算该窗 %s %s-%s）: %v", c.stage, w[0], w[1], err)
+	}
+}
+
+// noteWindowFail §M-8/N-6 窗口装配失败留痕：逐窗 BuildPanels 失败旧实现静默 continue，
+// IC/触发率/反推结论照常基于"缺窗"样本产出，与全窗成功同形。现统一在阶段收尾打
+// 降级行（失败数/总数+首例），不中断——研究侧缺窗产出仍是有效子集，但必须可辨识。
+// English: §M-8/N-6 — window assembly failures used to vanish under bare `continue`; each stage now
+// emits one degraded line (failed/total + first error) so a missing-window result is identifiable.
+func noteWindowFail(stage string, total, failed int, firstErr error) {
+	if failed == 0 {
+		return
+	}
+	log.Printf("[research] %s 阶段窗口装配降级：%d/%d 窗失败（首例：%v）——结论仅覆盖剩余窗口", stage, failed, total, firstErr)
+}
+
+// stageProgress 阶段进度：把窗口完成数映射到全局百分比带并打印"发现进度 xx%"
+// （worker 按 (?:任务|回测|发现)进度 解析回写队列；同时喂看门狗）。
+// English: maps finished windows into a global percentage band and prints "发现进度 xx%" for the worker.
+type stageProgress struct {
+	lo, hi int // 全局百分比带
+	total  int // 窗口总数
+	done   int
+}
+
+// newStageProgress 构造阶段进度器：total<=0 返回 nil（tick 对 nil 直通，无进度场景零开销）。
+func newStageProgress(lo, hi, total int) *stageProgress {
+	if total <= 0 {
+		return nil
+	}
+	return &stageProgress{lo: lo, hi: hi, total: total}
+}
+
+// tick 每完成一个窗口调用一次：映射到 [lo,hi] 百分比带打印"发现进度 xx%"，
+// worker 正则解析后回写队列并喂看门狗。
+func (p *stageProgress) tick() {
+	if p == nil {
+		return
+	}
+	p.done++
+	if p.done > p.total {
+		p.done = p.total
+	}
+	pct := p.lo + (p.hi-p.lo)*p.done/p.total
+	log.Printf("发现进度 %d%%", pct)
+}
+
+// discoveryResumeKey 断点键：任何影响结果的参数（区间/前瞻/最小样本/窗口宽/因子池/股票池）
+// 变更都会生成新 key，旧缓存自动失效。English: checkpoint key — any result-affecting change rolls a fresh key.
+func discoveryResumeKey(start, end string, horizon, minStocks, winDays int, fids []string, codes []string, excl [][]string) string {
+	sorted := append([]string{}, fids...)
+	sort.Strings(sorted)
+	sum := sha256.Sum256([]byte(fmt.Sprintf("%v", codes)))
+	// §F4 排除组合纳入 key：已驳回组合变化必须使断点缓存失效，否则复用的贪心结果绕过去重。
+	// English: §F4 — fold excluded combos into the key so a change in rejected combos invalidates the
+	// cached greedy windows (otherwise the resume path would bypass de-duplication).
+	ex := make([]string, 0, len(excl))
+	for _, c := range excl {
+		s := append([]string{}, c...)
+		sort.Strings(s)
+		ex = append(ex, strings.Join(s, "+"))
+	}
+	sort.Strings(ex)
+	return fmt.Sprintf("df|%s|%s|h%d|ms%d|w%d|%s|%s|x%s",
+		start, end, horizon, minStocks, winDays,
+		strings.Join(sorted, ","), hex.EncodeToString(sum[:])[:10], strings.Join(ex, ","))
+}
+
+// windowDays 每个窗口包含的交易日数。越小峰值内存越低、但装配次数越多（越慢）。
+// 90→60：2026-08-20 起调小以进一步压低研究峰值内存（~716MB→~450MB），
+// 配合 quant 盘后释放 + MemoryMax 1500M，让 1.6G 小 VPS 的夜间作业不再叠加 OOM。
+// English: trading days per window. Smaller → lower peak memory, more assembles (slower).
+// 90→60 (since 2026-08-20): shrinks the research peak (~716MB→~450MB) so the nightly job no longer
+// stacks with quant on the 1.6G box (alongside quant's after-hours release and MemoryMax 1500M).
+const windowDays = 60
+
+// windowDefs 把因子 ID 列表解析为装配用的 Def 列表（缺省全部已注册）。
+// English: resolves factor IDs into Defs for assembly (defaults to all registered factors).
+func windowDefs(ids []string) []factor.Def {
+	if len(ids) == 0 {
+		return factor.All()
+	}
+	var defs []factor.Def
+	for _, id := range ids {
+		if d, ok := factor.Get(id); ok {
+			defs = append(defs, d)
+		}
+	}
+	return defs
+}
+
+// windowChunks 把交易日列表切成若干窗口（每窗口最多 winDays 天）。
+// 返回各窗口的 [start,end]（YYYYMMDD）。窗口按区间首日切分。
+// English: splits the trade-date list into windows of at most winDays days, returning each
+// window's inclusive [start,end] (YYYYMMDD).
+func windowChunks(dates []string, winDays int) [][2]string {
+	if winDays <= 0 {
+		winDays = windowDays
+	}
+	if len(dates) == 0 {
+		return nil
+	}
+	var out [][2]string
+	for i := 0; i < len(dates); i += winDays {
+		j := i + winDays
+		if j > len(dates) {
+			j = len(dates)
+		}
+		out = append(out, [2]string{dates[i], dates[j-1]})
+	}
+	return out
+}
+
+// nextDayStr 返回 YYYYMMDD 的次日（用于把窗口尾巴多算 h 天以补足前瞻收益）。
+// English: returns the day after a YYYYMMDD (to extend a window's tail by h days for forward returns).
+func nextDayStr(yyyymmdd string) string {
+	if len(yyyymmdd) != 8 {
+		return yyyymmdd
+	}
+	return storeNextDay(yyyymmdd)
+}
+
+// weightsTag 权重集的稳定短标识（断点 stage 用：不同权重 = 不同缓存槽）。
+func weightsTag(w map[string]float64) string {
+	keys := make([]string, 0, len(w))
+	for k := range w {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	sum := sha256.Sum256([]byte(fmt.Sprintf("%v", keys)))
+	return hex.EncodeToString(sum[:])[:8]
+}
+
+// windowTriggerRate §RFIX-3：窗口分块版预期触发率估算（逐窗装配-统计-释放，内存 ~单窗）。
+// 各窗按天数加权合并为全局日均；分位历史仅覆盖窗内（60 日）——runner 用全史分位，
+// 此处为近似口径，只做展示/告警输入，不参与护栏判定。
+// English: chunked expected-trigger-rate estimate; per-window percentile history is an
+// approximation of the runner's full-history percentile — display/alert input only.
+func windowTriggerRate(db *store.DB, codes []string, factors []string, dirs map[string]int, weights map[string]float64, minStocks int, chunks [][2]string, dates []string) TriggerEstimate {
+	out := TriggerEstimate{PerDay: map[float64]float64{}}
+	tot := map[float64]float64{}
+	defs := windowDefs(factors)
+	failed := 0
+	var firstErr error
+	for _, w := range chunks {
+		panels, err := BuildPanels(db, codes, windowAsmStart(dates, w[0]), w[1], defs)
+		if err != nil {
+			// §M-8/N-6 留痕（旧：静默 continue 后触发率照常产出，缺窗不可见）
+			failed++
+			if firstErr == nil {
+				firstErr = err
+			}
+			continue
+		}
+		est := TriggerRateFromPanels(panels, factors, dirs, weights, []float64{70, 95}, w[0], w[1], minStocks)
+		for th, per := range est.PerDay {
+			tot[th] += per * float64(est.Days)
+		}
+		out.Days += est.Days
+	}
+	noteWindowFail("触发率估算", len(chunks), failed, firstErr)
+	if out.Days > 0 {
+		for th, s := range tot {
+			out.PerDay[th] = s / float64(out.Days)
+		}
+	}
+	return out
+}
+
+// windowCompositeIC 按窗口分块装配，累积 CompositeIC 的逐日 IC 行（全区间）。
+// 每窗口：BuildPanels 装配 [winStart, endPlusH]（多算 h 天尾巴保证前瞻收益完整），
+// 然后 CompositeICRange 只统计窗口内日期。窗口算完释放。
+// ck 非 nil 时启用断点（stage 需含权重标识——行值依赖权重）；nil 直通无缓存。
+// English: chunked CompositeIC rows over the full range; checkpoint-aware when ck is non-nil
+// (its stage must embed the weights tag since row values depend on them); nil passes through.
+func windowCompositeIC(db *store.DB, codes []string, factors []string, weights map[string]float64, h, min int, chunks [][2]string, dates []string, ck *winCkpt) []ICRow {
+	defs := windowDefs(factors)
+	var all []ICRow
+	failed := 0
+	var firstErr error
+	for _, w := range chunks {
+		var rows []ICRow
+		if ck.load(w, &rows) {
+			all = append(all, rows...)
+			continue
+		}
+		asmbEnd := w[1]
+		for i := 0; i < h; i++ {
+			asmbEnd = nextDayStr(asmbEnd)
+		}
+		panels, err := BuildPanels(db, codes, windowAsmStart(dates, w[0]), asmbEnd, defs)
+		if err != nil {
+			// §M-8/N-6 留痕：缺窗 IC 照常累积，但收尾必须透出降级行
+			failed++
+			if firstErr == nil {
+				firstErr = err
+			}
+			continue
+		}
+		rows = CompositeICRange(panels, factors, weights, h, min, w[0], w[1])
+		ck.save(w, rows)
+		all = append(all, rows...)
+	}
+	noteWindowFail("复合IC", len(chunks), failed, firstErr)
+	return all
+}
+
+// windowICByAllFactors 每窗口只装配一次（含全部候选因子），算出窗口内**所有**因子的
+// 单因子 IC 行（预筛阶段，装配次数从「因子数×窗口数」降到「窗口数」）。
+// 断点 stage="pre"；prog 上报窗口完成进度。English: single-factor pre-screen per window;
+// checkpoint stage "pre", progress reported per window.
+func windowICByAllFactors(db *store.DB, codes []string, fids []string, h, min int, chunks [][2]string, dates []string, ck *winCkpt, prog *stageProgress) map[string][]ICRow {
+	out := make(map[string][]ICRow, len(fids))
+	if len(fids) == 0 {
+		return out
+	}
+	defs := windowDefs(fids)
+	failed := 0
+	var firstErr error
+	for _, w := range chunks {
+		var winAll map[string][]ICRow
+		if ck.load(w, &winAll) && len(winAll) > 0 {
+			for fid, rows := range winAll {
+				out[fid] = append(out[fid], rows...)
+			}
+			prog.tick()
+			continue
+		}
+		asmbEnd := w[1]
+		for i := 0; i < h; i++ {
+			asmbEnd = nextDayStr(asmbEnd)
+		}
+		panels, err := BuildPanels(db, codes, windowAsmStart(dates, w[0]), asmbEnd, defs)
+		if err != nil {
+			// §M-8/N-6 留痕：预筛缺窗照常 tick 推进进度带（避免看门狗误停），但失败计入降级行
+			failed++
+			if firstErr == nil {
+				firstErr = err
+			}
+			prog.tick()
+			continue
+		}
+		winAll = make(map[string][]ICRow, len(fids))
+		for _, fid := range fids {
+			rows := ICByDate(panels, fid, h, min)
+			var kept []ICRow
+			for _, r := range rows {
+				if r.Date >= w[0] && r.Date <= w[1] {
+					out[fid] = append(out[fid], r)
+					kept = append(kept, r)
+				}
+			}
+			winAll[fid] = kept
+		}
+		ck.save(w, winAll)
+		prog.tick()
+	}
+	noteWindowFail("单因子预筛", len(chunks), failed, firstErr)
+	return out
+}
+
+// WindowFactorIC 有界导出：窗口分块计算多因子的逐日 IC 序列（键=factorID），内存~单窗口。
+// §P1.3 结果集相关度去重专用——对结果内/结果间因子一次性装配算 IC，不驻留全量面板。
+// 断点 key 用独立前缀，避免与发现管线缓存互相覆盖。
+// English: exported, memory-bounded per-factor per-date IC series (key=factorID), ~one window in
+// RAM. Used by §P1.3 results-level correlation dedup, assembling factors once without retaining
+// the full panel set. Uses a dedicated prefix so checkpoints don't collide with the discovery pipe.
+func WindowFactorIC(db *store.DB, codes []string, start, end string, fids []string, h, min int) map[string][]ICRow {
+	out := make(map[string][]ICRow, len(fids))
+	if len(fids) == 0 {
+		return out
+	}
+	if h <= 0 {
+		h = 5
+	}
+	if min <= 0 {
+		min = 10
+	}
+	dates, err := db.TradeDates(start, end)
+	if err != nil || len(dates) < 2 {
+		return out
+	}
+	chunks := windowChunks(dates, windowDays)
+	ck := &winCkpt{db: db, resumeKey: "pfac-dedup:" + start + ":" + end, stage: "dedup"}
+	return windowICByAllFactors(db, codes, fids, h, min, chunks, dates, ck, newStageProgress(0, 1, len(chunks)))
+}
+
+// windowCompositeIR 返回全区间复合 |IR|（窗口分块，断点 stage 含权重标识）。
+func windowCompositeIR(db *store.DB, codes []string, factors []string, weights map[string]float64, h, min int, chunks [][2]string, dates []string, rk string) float64 {
+	ck := &winCkpt{db: db, resumeKey: rk, stage: "ir|" + weightsTag(weights)}
+	rows := windowCompositeIC(db, codes, factors, weights, h, min, chunks, dates, ck)
+	ir := IR(rows)
+	if math.IsNaN(ir) {
+		return 0
+	}
+	return math.Abs(ir)
+}
+
+// windowCompositeICForSubsets 贪心选择的提速版：每窗口只装配一次（含 base+全部候选因子），
+// 在该窗口内对每个候选子集（base+每个 cand）各算 CompositeIC 行并累积。
+// 断点 stage 含 base 标识（base 集不同 = 不同缓存槽）。English: greedy-step speedup with
+// per-window checkpointing keyed by the base set.
+func windowCompositeICForSubsets(db *store.DB, codes []string, base, cands []string, h, min int, chunks [][2]string, dates []string, ck *winCkpt) map[string][]ICRow {
+	out := make(map[string][]ICRow, len(cands))
+	if len(cands) == 0 {
+		return out
+	}
+	// 装配用的因子 = base + 全部候选
+	fids := append(append([]string{}, base...), cands...)
+	defs := windowDefs(fids)
+	failed := 0
+	var firstErr error
+	for _, w := range chunks {
+		var winOut map[string][]ICRow
+		if ck.load(w, &winOut) && len(winOut) > 0 {
+			for cand, rows := range winOut {
+				out[cand] = append(out[cand], rows...)
+			}
+			continue
+		}
+		asmbEnd := w[1]
+		for i := 0; i < h; i++ {
+			asmbEnd = nextDayStr(asmbEnd)
+		}
+		panels, err := BuildPanels(db, codes, windowAsmStart(dates, w[0]), asmbEnd, defs)
+		if err != nil {
+			// §M-8/N-6 留痕：贪心缺窗的候选 IC 基于剩余窗口比较，收尾透出降级行
+			failed++
+			if firstErr == nil {
+				firstErr = err
+			}
+			continue
+		}
+		winOut = make(map[string][]ICRow, len(cands))
+		for _, cand := range cands {
+			candFactors := append(append([]string{}, base...), cand)
+			wm := map[string]float64{}
+			for _, f := range candFactors {
+				wm[f] = 1.0
+			}
+			rows := CompositeICRange(panels, candFactors, wm, h, min, w[0], w[1])
+			out[cand] = append(out[cand], rows...)
+			winOut[cand] = rows
+		}
+		ck.save(w, winOut)
+	}
+	noteWindowFail("贪心子集IC", len(chunks), failed, firstErr)
+	return out
+}
+
+// windowReverseExtension 按窗口分块累积反推泛化的 top/rest 收益数组并做 Welch t 检验。
+// 断点 stage="gen"（每窗缓存 top/rest 数组）。English: window-chunked reverse-extension with
+// per-window checkpoints (stage "gen" caches top/rest arrays).
+func windowReverseExtension(db *store.DB, codes []string, factors []string, dirs map[string]int, weights map[string]float64, opts DiscoverOpts, chunks [][2]string, dates []string, rk string) (float64, float64, float64, float64, float64) {
+	defs := windowDefs(factors)
+	ck := &winCkpt{db: db, resumeKey: rk, stage: "gen"}
+	var topRets, restRets []float64
+	failed := 0
+	var firstErr error
+	for _, w := range chunks {
+		var winTR struct {
+			Top  []float64 `json:"top"`
+			Rest []float64 `json:"rest"`
+		}
+		if ck.load(w, &winTR) {
+			topRets = append(topRets, winTR.Top...)
+			restRets = append(restRets, winTR.Rest...)
+			continue
+		}
+		asmbEnd := w[1]
+		for i := 0; i < opts.Horizon; i++ {
+			asmbEnd = nextDayStr(asmbEnd)
+		}
+		panels, err := BuildPanels(db, codes, windowAsmStart(dates, w[0]), asmbEnd, defs)
+		if err != nil {
+			// §M-8/N-6 留痕：反推缺窗照常 t 检验，但失败计入降级行
+			failed++
+			if firstErr == nil {
+				firstErr = err
+			}
+			continue
+		}
+		// 逐日截面（限定窗口内日期），累积 top/rest 收益
+		type kv struct {
+			sc float64
+			r  float64
+		}
+		for _, d := range unionDates(panels) {
+			if d < w[0] || d > w[1] {
+				continue
+			}
+			var day []kv
+			for _, p := range panels {
+				idx, ok := p.DateIdx[d]
+				if !ok {
+					continue
+				}
+				r := forwardReturn(p.Series, idx, opts.Horizon)
+				if isNaN(r) {
+					continue
+				}
+				sc := compositeScore(p, factors, dirs, weights, d)
+				if isNaN(sc) {
+					continue
+				}
+				day = append(day, kv{sc, r})
+			}
+			if len(day) < opts.MinStocks {
+				continue
+			}
+			var sum, sum2 float64
+			for _, v := range day {
+				sum += v.sc
+				sum2 += v.sc * v.sc
+			}
+			mean := sum / float64(len(day))
+			std := math.Sqrt(sum2/float64(len(day)) - mean*mean)
+			if std <= 0 {
+				continue
+			}
+			for i := range day {
+				day[i].sc = (day[i].sc - mean) / std
+			}
+			sort.Slice(day, func(i, j int) bool { return day[i].sc > day[j].sc })
+			nTop := len(day) / 5
+			if nTop < 1 {
+				nTop = 1
+			}
+			for i, v := range day {
+				if i < nTop {
+					topRets = append(topRets, v.r)
+					winTR.Top = append(winTR.Top, v.r)
+				} else {
+					restRets = append(restRets, v.r)
+					winTR.Rest = append(winTR.Rest, v.r)
+				}
+			}
+		}
+		ck.save(w, winTR)
+	}
+	noteWindowFail("反推泛化", len(chunks), failed, firstErr)
+	if len(topRets) == 0 || len(restRets) == 0 {
+		return 0, 0, 0, 0, nan()
+	}
+	topMean := meanOf(topRets)
+	restMean := meanOf(restRets)
+	excess := topMean - restMean
+	varTop := varianceOf(topRets, topMean)
+	varRest := varianceOf(restRets, restMean)
+	stdErr := math.Sqrt(varTop/float64(len(topRets)) + varRest/float64(len(restRets)))
+	var t float64
+	if stdErr > 0 {
+		t = excess / stdErr
+	} else {
+		t = nan()
+	}
+	return topMean, restMean, excess, stdErr, t
+}
+
+// windowOptimizeWeights 坐标上升权重优化（窗口分块版）。复刻 OptimizeWeights 的算法，
+// 但内部用 windowCompositeIC 代替全量面板的 CompositeIC。权重候选是瞬态的（坐标上升每步
+// 组合都不同），不做窗口断点——断点只覆盖输入确定的阶段（预筛/贪心/分段IR/反推）。
+// §WD-1 该阶段既无窗口断点也不打进度行，而调度器看门狗仅以"发现进度 xx%"行判活性 →
+// 长耗时会被当停滞 terminate（2026-09-20 广州 #268 实录：~336min 的真实计算被 320min 阈值
+// 反复误杀成死循环）。故新增 onTrial 回调：每完成一次真实 trial 评估回调一次，由调用方映射
+// 成进度行喂看门狗。onTrial 为 nil 时行为与旧版完全一致。
+// English: window-chunked coordinate-ascent weight optimization. Candidate weights are transient
+// (different every ascent step), so no window checkpoints here — checkpoints only cover
+// deterministic stages (pre-screen / greedy / split-IR / reverse-extension). onTrial is invoked
+// after every real trial evaluation so the caller can emit watchdog-recognizable progress; nil
+// reproduces the legacy behaviour exactly.
+func windowOptimizeWeights(db *store.DB, codes []string, opts OptimizeOpts, chunks [][2]string, dates []string, onTrial func()) OptResult {
+	if len(opts.Factors) == 0 {
+		return OptResult{Reason: "因子池为空"}
+	}
+	// 参数缺省填充（Horizon/MinStocks/MaxIter/Step）。
+	if opts.Horizon <= 0 {
+		opts.Horizon = 5
+	}
+	if opts.MinStocks <= 0 {
+		opts.MinStocks = 10
+	}
+	if opts.MaxIter <= 0 {
+		opts.MaxIter = 6
+	}
+	if opts.Step <= 0 {
+		opts.Step = 0.1
+	}
+	// 坐标上升贪心搜索：逐因子逐方向试探权重微调，采纳更优者直至一轮无改进。
+	w := make(map[string]float64, len(opts.Factors))
+	for _, f := range opts.Factors {
+		w[f] = 1.0
+	}
+	w = cloneWeights(w)
+	best := windowEval(db, codes, opts, w, chunks, dates)
+	trials := 1 // §ENH-B 试验计数（与 OptimizeWeights 同口径：初值+每次候选评估）
+	if onTrial != nil {
+		onTrial()
+	}
+	for it := 0; it < opts.MaxIter; it++ {
+		improved := false
+		for _, f := range opts.Factors {
+			for _, delta := range []float64{opts.Step, -opts.Step} {
+				cand := cloneWeights(w)
+				cand[f] += delta
+				if cand[f] < 0 {
+					cand[f] = 0
+				}
+				r := windowEval(db, codes, opts, cand, chunks, dates)
+				trials++
+				if onTrial != nil {
+					onTrial()
+				}
+				if better(r, best, opts.Metric) {
+					best = r
+					w = cand
+					improved = true
+				}
+			}
+		}
+		if !improved {
+			break
+		}
+	}
+	best.Trials = trials
+	best.Weights = cloneWeights(w)
+	ir := math.Abs(best.IR)
+	switch {
+	case len(best.Weights) == 0:
+		best.PassGuard, best.Reason = false, "无有效因子"
+	case best.NDays < opts.GuardMinDays:
+		best.PassGuard, best.Reason = false, "有效日不足"
+	case ir < opts.GuardMinIR:
+		best.PassGuard, best.Reason = false, "|IR| 低于护栏"
+	default:
+		best.PassGuard, best.Reason = true, "通过护栏"
+	}
+	return best
+}
+
+// windowEval 用窗口分块计算某权重下的 IC 统计（等价 evaluate，但走窗口内核；无断点）。
+func windowEval(db *store.DB, codes []string, opts OptimizeOpts, w map[string]float64, chunks [][2]string, dates []string) OptResult {
+	rows := windowCompositeIC(db, codes, opts.Factors, w, opts.Horizon, opts.MinStocks, chunks, dates, nil)
+	return OptResult{
+		ICMean: meanIC(rows), ICStd: stdIC(rows), IR: IR(rows), NDays: len(rows),
+	}
+}
+
+// DiscoverFactorsWindowed 内存可控的因子发现（窗口分块版）。
+// 等价于 DiscoverFactors，但接收 db+codes+区间，内部按窗口装配，避免全量面板常驻
+// （~2.8GB），峰值内存压到单窗口（900M 内）。口径与全量版一致。
+// English: memory-bounded factor discovery (window-chunked). Equivalent to DiscoverFactors but takes
+// db+codes+range and assembles per window internally, avoiding the ~2.8GB full-panel residency so
+// peak memory stays within a single window (inside 900M). Same semantics as the full version.
+func DiscoverFactorsWindowed(db *store.DB, codes []string, start, end string, opts DiscoverOpts) DiscoverResult {
+	results := DiscoverFactorsWindowedN(db, codes, start, end, opts, 1)
+	if len(results) == 0 {
+		return DiscoverResult{Directions: map[string]int{}, Weights: map[string]float64{}, Reason: "无结果"}
+	}
+	return results[0]
+}
+
+// DiscoverFactorsWindowedN §S1 多解排他版因子发现：在 DiscoverFactorsWindowed 基础上支持
+// topN>1 时连续求解前 N 个互异最优组合——每轮贪心求出最优组合 W 后把 W 加入排他集
+// （沿用 ExcludeCombos 机制）清空重跑下一轮，产出按优劣排序的互异候选列表。
+// 预筛（单因子 IR）与贪心子集 IC 的行值与排除集无关，统一用 rkBase 缓存跨排他轮复用；
+// 分段/反推(gen)缓存依赖最终组合，用含排除集的 per-rerun key 保证正确性。
+// English: §S1 top-N exclusive rerun discovery — with topN>1 it solves the first N mutually-distinct
+// best combos by excluding each winner and re-running greedy. Pre-screen and greedy-subset IC rows are
+// exclusion-independent and shared under rkBase; segment/gen caches depend on the final combo and use a
+// per-rerun exclusion-sensitive key for correctness.
+func DiscoverFactorsWindowedN(db *store.DB, codes []string, start, end string, opts DiscoverOpts, topN int) []DiscoverResult {
+	res := DiscoverResult{Directions: map[string]int{}, Weights: map[string]float64{}}
+	empty := func(reason string) []DiscoverResult {
+		res.Reason = reason
+		return []DiscoverResult{res}
+	}
+	if topN <= 0 {
+		topN = 1
+	}
+	if opts.Horizon <= 0 {
+		opts.Horizon = 5
+	}
+	if opts.MinStocks <= 0 {
+		opts.MinStocks = 10
+	}
+	if opts.MaxFactors <= 0 {
+		opts.MaxFactors = 8
+	}
+	if opts.Step <= 0 {
+		opts.Step = 0.1
+	}
+	if opts.MinIR <= 0 {
+		opts.MinIR = 0.3
+	}
+	if opts.MinDays <= 0 {
+		opts.MinDays = 20
+	}
+	if opts.SplitPct <= 0 || opts.SplitPct >= 1 {
+		opts.SplitPct = 0.7
+	}
+	if opts.MinGenT >= 0 {
+		opts.MinGenT = -2
+	}
+	if len(opts.Factors) == 0 {
+		for _, d := range factor.All() {
+			opts.Factors = append(opts.Factors, d.ID)
+		}
+	}
+	if len(codes) == 0 {
+		return empty("无有效面板")
+	}
+	// 全局交易日列表 + 分段边界
+	dates, err := db.TradeDates(start, end)
+	if err != nil || len(dates) < 10 {
+		return empty("日期过少")
+	}
+	splitIdx := int(float64(len(dates)) * opts.SplitPct)
+	winDays := windowDays
+	chunks := windowChunks(dates, winDays)
+	// §GAP 二.3#4 真 hold-out：寻优只用样本内窗口（≤splitIdx），样本外留作第 4 步验证
+	inChunks := windowChunks(dates[:splitIdx+1], winDays)
+	splitChunks := windowChunks(dates[splitIdx:], winDays)
+	headChunks := windowChunks(dates[:splitIdx+1], winDays)
+
+	// 窗口级断点（二期）：预筛/贪心子集 IC 与排除集无关，统一用 rkBase 跨排他轮复用；
+	// 分段/反推(gen)依赖最终组合，per-rerun 用含排除集的 rk 保证缓存正确。
+	// English: pre-screen and greedy-subset IC rows are exclusion-independent → shared rkBase;
+	// segment/gen rows depend on the final combo → per-rerun rk carrying the exclusion set.
+	rkBase := discoveryResumeKey(start, end, opts.Horizon, opts.MinStocks, winDays, opts.Factors, codes, nil)
+	log.Printf("[discover] 断点key=%s 窗口数=%d 排他重跑 topN=%d（中断续跑跳过已完成窗口）", rkBase, len(chunks), topN)
+
+	// 1) 单因子预筛：每窗口装配一次（含全部候选因子），§GAP 二.3#4 只算样本内（≤split）|IR|
+	// 进度带 5%–35%。English: single-factor pre-screen (progress band 5–35%), in-sample only.
+	var pre []string
+	preCk := &winCkpt{db: db, resumeKey: rkBase, stage: "pre"}
+	allIC := windowICByAllFactors(db, codes, opts.Factors, opts.Horizon, opts.MinStocks, inChunks, dates[:splitIdx+1], preCk, newStageProgress(5, 35, len(inChunks)))
+	for _, fid := range opts.Factors {
+		rows := allIC[fid]
+		if len(rows) < opts.MinDays {
+			continue
+		}
+		ir := absf(IR(rows))
+		if isNaN(ir) || ir < 0.05 {
+			continue
+		}
+		pre = append(pre, fid)
+	}
+	if len(pre) == 0 {
+		return empty("预筛后无有效因子")
+	}
+
+	// §WD-1 后段进度透出（36–99%）：贪心 / 坐标上升权重优化 / 分段泛化三个阶段原先既不写进度行、
+	// 也无窗口断点，而调度器看门狗只认"发现进度 xx%"行 → 静默数小时被判停滞 kill
+	//（2026-09-20 广州 #268 实录：~336min 的真实计算被 320min 阈值反复误杀成死循环）。
+	// 复用 stageProgress 按真实工作单元 tick：只在该单元完成后再打一行，
+	// 故"长时间无进度行"仍等价于真停滞，不削弱看门狗。
+	// English: emit real progress for the previously-silent post-pre phases so the stall watchdog
+	// can distinguish "still working" from "hung" (2026-09-20 Guangzhou #268 death-loop).
+	postN := topN
+	if postN < 1 {
+		postN = 1
+	}
+	// 坐标上升迭代上限固定为 6（见下方 windowOptimizeWeights 调用点的 MaxIter: 6）；
+	// 这里仅用它估算试验总数以划分进度带，估偏不影响正确性（tick 会钳到带上限）。
+	maxIterEst := 6
+	greedyProg := newStageProgress(36, 52, postN*opts.MaxFactors)
+	optProg := newStageProgress(53, 88, postN*(1+maxIterEst*opts.MaxFactors*2))
+	segProg := newStageProgress(89, 99, postN*3)
+
+	var results []DiscoverResult
+	exclude := append([][]string{}, opts.ExcludeCombos...)
+	for r := 0; r < topN; r++ {
+		// 2) 贪心前向选择（等权），命中排除集（F4 已驳回 + 前几轮冠军）的组合跳过
+		selected := make([]string, 0, opts.MaxFactors)
+		selectedSet := map[string]bool{}
+		bestIR := -1e9
+		for len(selected) < opts.MaxFactors {
+			var cands []string
+			for _, fid := range pre {
+				if !selectedSet[fid] {
+					cands = append(cands, fid)
+				}
+			}
+			if len(cands) == 0 {
+				break
+			}
+			bestFid := ""
+			bestCandIR := bestIR
+			subsetIC := windowCompositeICForSubsets(db, codes, selected, cands, opts.Horizon, opts.MinStocks, inChunks, dates[:splitIdx+1],
+				&winCkpt{db: db, resumeKey: rkBase, stage: "greedy|" + strings.Join(selected, "+")})
+			greedyProg.tick()
+			for _, fid := range cands {
+				if comboExcluded(selected, fid, exclude) {
+					continue
+				}
+				ir := absf(IR(subsetIC[fid]))
+				if isNaN(ir) {
+					continue
+				}
+				if ir > bestCandIR {
+					bestCandIR = ir
+					bestFid = fid
+				}
+			}
+			if bestFid == "" || bestCandIR <= bestIR {
+				break
+			}
+			selected = append(selected, bestFid)
+			selectedSet[bestFid] = true
+			bestIR = bestCandIR
+		}
+		if len(selected) == 0 {
+			break
+		}
+		// per-rerun 断点 key（含排除集 → gen 缓存与最终组合绑定）
+		rk := discoveryResumeKey(start, end, opts.Horizon, opts.MinStocks, winDays, opts.Factors, codes, exclude)
+
+		// 3) 方向 + 权重优化
+		dirs := map[string]int{}
+		for _, fid := range selected {
+			if d, ok := factor.Get(fid); ok {
+				dirs[fid] = dirOfCat(d.Cat)
+			} else {
+				dirs[fid] = 1
+			}
+		}
+		opt := windowOptimizeWeights(db, codes, OptimizeOpts{
+			Factors: selected, Horizon: opts.Horizon, MinStocks: opts.MinStocks,
+			Metric: opts.Metric, Step: opts.Step, MaxIter: 6,
+			GuardMinIR: opts.MinIR, GuardMinDays: opts.MinDays,
+			End: dates[splitIdx],
+		}, inChunks, dates[:splitIdx+1], optProg.tick)
+
+		// 4) E3 分段 + 反推验证（窗口分块，IR 行与 gen 都走 per-rerun rk，跨排他轮隔离）
+		irCk := func() *winCkpt { return &winCkpt{db: db, resumeKey: rk, stage: "ir|" + weightsTag(opt.Weights)} }
+		inRows := windowCompositeIC(db, codes, selected, opt.Weights, opts.Horizon, opts.MinStocks, headChunks, dates, irCk())
+		outRows := windowCompositeIC(db, codes, selected, opt.Weights, opts.Horizon, opts.MinStocks, splitChunks, dates, irCk())
+		segProg.tick()
+
+		// §RFIX-2 样本内方向拟合：dirOfCat 编译期先验可能与市场实际定价方向相反——复合 IC
+		// 内核（CompositeICRange）不消费 dirs，带符号 IR 可为负，而 C2 落库门用带符号
+		// OutsampleIR，导致 |IR| 0.8~1.3 的反向强信号被整晚清零（生产 09-19 实录）。
+		// 裁决只看到样本内（与权重拟合同一纪律，杜绝未来函数）；样本外仍按带符号门
+		// 检验「样本内方向是否延续」，真方向反转的信号（IS正/OOS负）fit 救不回来。
+		// English: in-sample direction fitting — flip all dirs when the IS signed IR of the fitted
+		// weights is negative; OOS still judges whether the fitted direction persisted.
+		fitSign := fitDirsByInSampleSign(IR(inRows), dirs)
+		res.InsampleIR = irOrZero(inRows) * fitSign
+		res.OutsampleIR = irOrZero(outRows) * fitSign
+		if opts.MinYrSign > 0 {
+			res.YearlyConsistentYears, res.YearlyTotalYears = yearlySignConsistency(outRows, 5)
+		}
+		res.GenTopMean, res.GenAllMean, res.GenExcess, res.GenStdErr, res.GenT =
+			windowReverseExtension(db, codes, selected, dirs, opt.Weights, opts, splitChunks, dates, rk)
+		segProg.tick()
+
+		// §RFIX-3 预期触发率透出（样本内逐窗估算、拟合后方向；近似口径只进 reason 不判护栏）。
+		est := windowTriggerRate(db, codes, selected, dirs, opt.Weights, opts.MinStocks, inChunks, dates[:splitIdx+1])
+		res.TrigDays = est.Days
+		segProg.tick()
+		res.Trig70 = est.PerDay[70]
+		res.Trig95 = est.PerDay[95]
+		// §ENH-B 稳健性原料（与 legacy 内核同口径）：试验计数 + PBO-lite 4 块符号一致性。
+		res.Trials = opt.Trials
+		res.PBOConsistent, res.PBOTotal = PBOSignConsistency(outRows, 4, 5)
+
+		res.Factors = selected
+		res.Directions = dirs
+		res.Weights = opt.Weights
+		res.ICMean = opt.ICMean * fitSign
+		res.IR = opt.IR * fitSign
+		res.NDays = opt.NDays
+		res.PassGuard = opt.PassGuard
+		res.Reason = opt.Reason
+
+		if res.OutsampleIR < opts.MinIR {
+			if res.PassGuard {
+				res.Reason = "样本内过护栏但样本外IR不足(" + trimFloat(res.OutsampleIR) + ")"
+				res.PassGuard = false
+			}
+		}
+		if res.PassGuard && !isNaN(res.GenT) && res.GenT < opts.MinGenT {
+			res.Reason = "反推泛化不足（高分组超额" + trimFloat(res.GenExcess) + "，t=" + trimFloat(res.GenT) + "显著为负）"
+			res.PassGuard = false
+		}
+		// §C3a 分年度 IR 符号一致性：样本外非平凡年份中与总体同号的年份不足 → 护栏不过
+		if res.PassGuard && opts.MinYrSign > 0 && res.YearlyTotalYears > opts.MinYrSign &&
+			res.YearlyConsistentYears < opts.MinYrSign {
+			res.Reason = fmt.Sprintf("样本外分年度IR符号一致性不足(%d/%d年与总体同号)", res.YearlyConsistentYears, res.YearlyTotalYears)
+			res.PassGuard = false
+		}
+		results = append(results, res)
+		// 排他：把本轮最优组合加入排除集，保证下一轮产出互异组合
+		exclude = append(exclude, append([]string{}, selected...))
+	}
+	if len(results) == 0 {
+		return empty("前向选择未选出因子")
+	}
+	return results
+}
+
+// fitDirsByInSampleSign §RFIX-2 样本内方向拟合（两内核共用）：以加权组合在样本内段的
+// 带符号 IR 裁决组合方向——isIR<0 时全量翻转 dirs 并返回 -1（报告口径乘该符号；
+// runner 的 w·dir·pct 贡献随之整体单调反向，等价于翻转 composite 后重算 IC：
+// Spearman(-x,y)=-Spearman(x,y)）。isIR≥0 或 NaN（无观测不判定，保守）返回 +1 不动。
+// 方向裁决只允许使用样本内数据（与权重拟合同一纪律，杜绝未来函数）。
+// English: §RFIX-2 shared in-sample direction fit — flips all dirs and returns -1 when the
+// signed in-sample IR is negative; NaN keeps +1 (no observation, no verdict).
+func fitDirsByInSampleSign(isIR float64, dirs map[string]int) float64 {
+	if isNaN(isIR) || isIR >= 0 {
+		return 1
+	}
+	for f := range dirs {
+		dirs[f] = -dirs[f]
+	}
+	return -1
+}
+
+// irOrZero 返回 IR（NaN 归 0）。English: IR with NaN → 0.
+func irOrZero(rows []ICRow) float64 {
+	if len(rows) == 0 {
+		return 0
+	}
+	ir := IR(rows)
+	if isNaN(ir) {
+		return 0
+	}
+	return ir
+}
+
+// yearlySignConsistency §C3a 分年度 IR 符号一致性：按自然年分组，统计"非平凡"年份
+// （样本≥minRows）中 IR 符号与总体 IR 符号一致的年份数。返回 (一致年份数, 非平凡年份总数)。
+// English: §C3a yearly IR sign consistency — groups rows by calendar year and counts non-trivial
+// years (≥ minRows) whose IR sign matches the overall IR sign. Returns (consistent, total).
+func yearlySignConsistency(rows []ICRow, minRows int) (int, int) {
+	if minRows <= 0 {
+		minRows = 5
+	}
+	overall := irOrZero(rows)
+	if overall == 0 || len(rows) < minRows {
+		return 0, 0
+	}
+	byYear := map[string][]ICRow{}
+	for _, r := range rows {
+		if len(r.Date) >= 4 {
+			y := r.Date[:4]
+			byYear[y] = append(byYear[y], r)
+		}
+	}
+	consistent, total := 0, 0
+	for _, yrows := range byYear {
+		if len(yrows) < minRows {
+			continue
+		}
+		yir := irOrZero(yrows)
+		if yir == 0 {
+			continue
+		}
+		total++
+		if (yir > 0) == (overall > 0) {
+			consistent++
+		}
+	}
+	return consistent, total
+}
+
+// storeNextDay 返回 YYYYMMDD 的次日（跨月跨年）。
+// English: returns the next calendar day of a YYYYMMDD (handles month/year rollover).
+func storeNextDay(yyyymmdd string) string {
+	y := atoi8(yyyymmdd[0:4])
+	m := atoi8(yyyymmdd[4:6])
+	d := atoi8(yyyymmdd[6:8])
+	// 用简单的日推进
+	d++
+	dim := daysInMonth(y, m)
+	if d > dim {
+		d = 1
+		m++
+		if m > 12 {
+			m = 1
+			y++
+		}
+	}
+	return itoa4(y) + itoa2(m) + itoa2(d)
+}
+
+// atoi8 手写 8 位数字字符串 → int（YYYYMMDD 日期解析，避免引入 strconv 依赖）。
+// English: hand-rolled 8-digit string→int (YYYYMMDD date parsing, no strconv dependency).
+func atoi8(s string) int {
+	v := 0
+	for i := 0; i < len(s); i++ {
+		v = v*10 + int(s[i]-'0')
+	}
+	return v
+}
+
+// daysInMonth 返回某年某月的天数（含闰年 2 月）。
+// English: returns the number of days in a month (leap-year aware).
+func daysInMonth(y, m int) int {
+	switch m {
+	case 1, 3, 5, 7, 8, 10, 12:
+		return 31
+	case 4, 6, 9, 11:
+		return 30
+	case 2:
+		if (y%4 == 0 && y%100 != 0) || y%400 == 0 {
+			return 29
+		}
+		return 28
+	}
+	return 30
+}
+
+// itoa4/itoa2 定宽零填充整数字符串（4 位年 / 2 位月日），供 storeNextDay 拼回 YYYYMMDD。
+func itoa4(v int) string { return itoaN(v, 4) }
+
+// itoa2 同 itoa4，宽度 2（月/日）。
+func itoa2(v int) string { return itoaN(v, 2) }
+
+// itoaN 手写整数 → 定宽数字字符串（高位补零），供 storeNextDay 拼 YYYYMMDD。
+// English: hand-rolled int→zero-padded fixed-width decimal string (for storeNextDay).
+func itoaN(v, w int) string {
+	s := ""
+	for v > 0 {
+		s = string(rune('0'+v%10)) + s
+		v /= 10
+	}
+	for len(s) < w {
+		s = "0" + s
+	}
+	return s
+}
+
+// windowAsmStart 窗口装配起点：从 w0 左移 patternWarmupDays 个交易日补算子回看预热。
+// 形态/动量类算子含 20 日级回看，若窗口头直接从 w0 装配，头部因子值为 NaN，
+// 造成"窗口版 vs 全量版"系统性分歧；评估仍限定窗口内日期，口径与全量版对齐。
+// English: per-window assembly start — shift back warm-up trade-days so operator lookbacks are
+// fully warmed at every window head (evaluation stays restricted to the window).
+func windowAsmStart(dates []string, w0 string) string {
+	gi := sort.SearchStrings(dates, w0)
+	lo := gi - patternWarmupDays
+	if lo < 0 {
+		lo = 0
+	}
+	return dates[lo]
+}
+
+// WindowChunks 导出版窗口切分：把交易日列表按 winDays 切成 [start,end] 窗口
+// （winDays<=0 用默认 windowDays）。供 B4 全链路回测等大装配场景复用，
+// 与 discover-factors 同一内存口径：峰值只装一个窗口。
+// English: exported window splitter — chunks a trade-date list into [start,end] windows
+// (winDays<=0 uses the default). Reused by the B4 chain backtest so peak memory stays at one window.
+func WindowChunks(dates []string, winDays int) [][2]string {
+	return windowChunks(dates, winDays)
+}

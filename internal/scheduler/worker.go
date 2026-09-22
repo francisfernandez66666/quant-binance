@@ -1,0 +1,1739 @@
+// 队列 worker（子系统统一改造一期核心）：出队 → spawn 唯一入口 run-task →
+// 进度解析 / 控制标志轮询 / 看门狗 / kill 抢占 / 夜间链入队与收尾。
+// 盘后硬门控：NightlyEligible 对一切任务生效（含手动 high），交易时段绝不出队。
+// English: queue worker (phase-1 core) — dequeues, spawns the single run-task entry, parses progress,
+// polls control flags, watchdogs stalls, kill-preempts, and enqueues/drains the nightly chain. The
+// after-hours gate applies to every task including manual high-priority ones.
+package scheduler
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"log"
+	"math"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"regexp"
+	"runtime/debug"
+	"strconv"
+	"strings"
+	"sync"
+	"time"
+
+	"quant-trading-v2/internal/cntime"
+	"quant-trading-v2/internal/config"
+	"quant-trading-v2/internal/opslog"
+	"quant-trading-v2/internal/store"
+)
+
+// taskProgressRe 统一进度协议：兼容各子命令既有的"回测/发现/任务/参数优化进度 xx%"输出行。
+// 扩充"参数优化进度"以覆盖 §P2 全库寻优（sweep）任务的进度回报，避免其进度长期为空被误判停滞。
+// English: progress protocol — matches backtest/discover/task/param-optimize progress lines.
+var taskProgressRe = regexp.MustCompile(`(?:任务|回测|发现|参数优化)进度 (\d+)%`)
+
+// avgExcessRe 匹配 B4 回测 CLI 的平均超额（done 后写 result_num）。
+var avgExcessRe = regexp.MustCompile(`平均超额=(-?\d+(?:\.\d+)?)`)
+
+// btNameZh 内置战法适配器英文名 → 中文显示名（与前端 builtinPatterns/序号映射一致）。
+var btNameZh = map[string]string{
+	"DoubleBump": "双响炮", "Dragon": "龙头", "DragonReturn": "龙回头", "NShape": "N形",
+}
+
+// 回放汇总报告解析：btreplay printReport 每个战法输出一个 ===== 包围的块，
+// 头行为「战法历史回测: <名>（N 只股票）」。旧实现抓指标行丢名字，多战法块无法区分。
+var (
+	btNameRe    = regexp.MustCompile(`(?m)^战法历史回测: (.+?)（`)
+	btTriggerRe = regexp.MustCompile(`(?m)^触发信号数: (\d+)`)
+	btWinRe     = regexp.MustCompile(`(?m)^胜率: (\d+(?:\.\d+)?)%`)
+	btPfRe      = regexp.MustCompile(`(?m)^盈亏比: (\d+(?:\.\d+)?)`)
+	btHoldRe    = regexp.MustCompile(`(?m)^平均持仓天数: (\d+(?:\.\d+)?)`)
+	btExpectRe  = regexp.MustCompile(`(?m)^期望收益: ([+-]\d+(?:\.\d+)?)%`)
+)
+
+// parseBtSummary 按 ===== 分隔块解析回放汇总，每个战法一行、冠以名称标签：
+// 【双响炮】胜率 47.78% 盈亏比 1.31 触发 270 持仓 1.0天
+// English: one labeled line per strategy block, e.g. 【双响炮】win 47.78% PF 1.31 ...
+func parseBtSummary(out string) string {
+	blocks := strings.Split(out, "==============================================")
+	var rows []string
+	for _, blk := range blocks {
+		var name string
+		if m := btNameRe.FindStringSubmatch(blk); len(m) == 2 {
+			name = strings.TrimSpace(m[1])
+			if zh, ok := btNameZh[name]; ok {
+				name = zh
+			}
+		}
+		if name == "" || !strings.Contains(blk, "胜率:") && !strings.Contains(blk, "无触发信号") {
+			continue // 分隔线之间的非报告文本（进度行等）
+		}
+		if strings.Contains(blk, "无触发信号") {
+			rows = append(rows, fmt.Sprintf("【%s】无触发信号", name))
+			continue
+		}
+		row := fmt.Sprintf("【%s】", name)
+		if m := btWinRe.FindStringSubmatch(blk); len(m) == 2 {
+			row += fmt.Sprintf("胜率 %s%% ", m[1])
+		}
+		if m := btPfRe.FindStringSubmatch(blk); len(m) == 2 {
+			row += fmt.Sprintf("盈亏比 %s ", m[1])
+		}
+		if m := btTriggerRe.FindStringSubmatch(blk); len(m) == 2 {
+			row += fmt.Sprintf("触发 %s ", m[1])
+		}
+		if m := btHoldRe.FindStringSubmatch(blk); len(m) == 2 {
+			row += fmt.Sprintf("持仓 %s天", m[1])
+		}
+		if m := btExpectRe.FindStringSubmatch(blk); len(m) == 2 {
+			row += fmt.Sprintf(" 期望 %s%%", m[1])
+		}
+		rows = append(rows, strings.TrimSpace(row))
+	}
+	if len(rows) == 0 {
+		return "无触发信号"
+	}
+	return strings.Join(rows, "\n")
+}
+
+// numField 从结果 map 抽取数值字段：section 非空时从嵌套对象（如 params）取，否则取顶层。
+// English: extracts a numeric field; when section is set, reads from a nested object (e.g. params).
+func numField(r map[string]any, section, key string) float64 {
+	if section != "" {
+		if sec, ok := r[section].(map[string]any); ok {
+			if v, ok := sec[key].(float64); ok {
+				return v
+			}
+		}
+		return 0
+	}
+	if v, ok := r[key].(float64); ok {
+		return v
+	}
+	return 0
+}
+
+// buildOptimizeSummary 把 optimize 任务的 SWEEP_JSON 输出整理为可读的回测结果文本：
+// 战法说明（寻优目标/组合数）+ 各战法冠军参数与指标 + 核心结论。替代原先仅截取前 100 字符的占位日志。
+// English: turns the optimize task's SWEEP_JSON into a readable result: objective/combination count,
+// per-strategy champion params & metrics, and a core verdict.
+func buildOptimizeSummary(out string) string {
+	lines := strings.Split(out, "\n")
+	var rows []string
+	objectives := map[string]bool{}
+	total := 0
+	bestEv := math.Inf(-1)
+	bestLine := ""
+	for _, line := range lines {
+		m := sweepJSONRe.FindStringSubmatch(line)
+		if len(m) != 2 {
+			continue
+		}
+		var payload struct {
+			Strategy  string           `json:"strategy"`
+			Objective string           `json:"objective"`
+			Results   []map[string]any `json:"results"`
+		}
+		if err := json.Unmarshal([]byte(m[1]), &payload); err != nil {
+			continue
+		}
+		if payload.Objective != "" {
+			objectives[payload.Objective] = true
+		}
+		for _, r := range payload.Results {
+			strat, _ := r["strategy"].(string)
+			if ns, _ := r["no_signal"].(bool); ns {
+				rows = append(rows, fmt.Sprintf("【%s】无触发信号", strat))
+				continue
+			}
+			total++
+			tp := numField(r, "params", "take_profit_pct")
+			sl := numField(r, "params", "stop_loss_pct")
+			hold := numField(r, "params", "hold_days")
+			thr := numField(r, "params", "min_score")
+			wr := numField(r, "", "win_rate")
+			pf := numField(r, "", "profit_factor")
+			ev := numField(r, "", "expectancy")
+			ln := fmt.Sprintf("【%s】止盈%.0f%% 止损%.0f%% 持仓%.0f天 门槛%.0f → 胜率%.1f%% 盈亏比%.2f 期望%.2f%%",
+				strat, tp, sl, hold, thr, wr, pf, ev)
+			if ev > bestEv {
+				bestEv = ev
+				bestLine = ln
+			}
+			rows = append(rows, ln)
+		}
+	}
+	if len(rows) == 0 {
+		return parseBtSummary(out)
+	}
+	header := fmt.Sprintf("全库参数寻优完成：共 %d 组参数组合", total)
+	if len(objectives) > 0 {
+		objs := make([]string, 0, len(objectives))
+		for o := range objectives {
+			objs = append(objs, o)
+		}
+		header += "（目标：" + strings.Join(objs, "/") + "）"
+	}
+	concl := "核心结论："
+	if bestEv > 0 {
+		concl += "存在正期望参数组合，建议取冠军参数小仓位实盘验证；"
+	} else {
+		concl += "未发现正期望组合，当前样本下该目标暂不宜实盘；"
+	}
+	concl += "完整排名见「优化结果 / 参数寻优中心」。"
+	if bestEv > math.Inf(-1) && bestLine != "" {
+		concl += "\n冠军：" + bestLine
+	}
+	return header + "\n" + strings.Join(rows, "\n") + "\n" + concl
+}
+
+// sweepJSONRe 匹配子进程输出的机器可读扫参结果行。
+var sweepJSONRe = regexp.MustCompile(`(?m)^SWEEP_JSON:(\{.*\})\s*$`)
+
+// saveSweepResults 解析 optimize 任务输出的 SWEEP_JSON（每战法一条），把排名落 optimization_results。
+// 失败只记日志不回滚任务状态——排名表是展示/审批增强，主结果在 result_text 已保底。
+// English: parses SWEEP_JSON lines (one per strategy) and persists rankings; failures are logged
+// without failing the task because the main result is already in result_text.
+func (s *Scheduler) saveSweepResults(db *store.DB, taskID int64, out string) {
+	lines := strings.Split(out, "\n")
+	log.Printf("[scheduler] 任务 #%d saveSweepResults: 共 %d 行", taskID, len(lines))
+	matched := 0
+	// §寻优修复 2026-08-31：此前逐战法独立调 SaveOptimizationResults——该函数"先清 task 旧行再插"，
+	// 每调一次就把上一战法的排名整批抹掉，多战法寻优只剩最后一条（N形）。现先把各战法 results 收拢
+	// 到一个切片，循环结束后一次性落库（单次 DELETE + 全量 INSERT），多战法排名全部保留。
+	// English: previously SaveOptimizationResults was called per strategy — but it DELETEs the task's old
+	// rows first, so each call wiped the previous strategy's rankings (only the last one survived).
+	// Now all strategies' results are collected into one slice and saved in a single call.
+	var allResults []map[string]any
+	objective := ""
+	// §回测增强实施发现：grid_json 回写必须在 SaveOptimizationResults（DELETE+INSERT 重建）
+	// 之后执行——此前在解析循环内即写，行被重建后 grid_json 归零（多战法版本引入的时序回归）。
+	// 现把各战法 extra 收拢到 map，循环结束、排名落库成功后统一回写。
+	// English: grid_json updates must run AFTER the delete+insert rebuild; collected per strategy
+	// and applied once the rankings are saved.
+	gridExtras := map[string]string{} // strategy → grid_json 载荷
+	// 遍历输出中所有 SWEEP_JSON 行（每战法一条，聚合后整批落库）
+	for _, line := range lines {
+		m := sweepJSONRe.FindStringSubmatch(line)
+		if len(m) != 2 {
+			if strings.Contains(line, "SWEEP_JSON") {
+				log.Printf("[scheduler] 任务 #%d SWEEP_JSON 行未匹配 regex: 行前30=%q", taskID, line[:min(len(line), 30)])
+			}
+			continue
+		}
+		matched++
+		var payload struct {
+			Strategy  string           `json:"strategy"`
+			Objective string           `json:"objective"`
+			Batches   []map[string]any `json:"batches"`
+			Grid      []map[string]any `json:"grid"`
+			Results   []map[string]any `json:"results"`
+			// §回测自动增强 C：顶层新键必须在此声明，否则 json 解析静默丢弃（D 轮前端消费源）
+			Pareto        json.RawMessage `json:"pareto"`
+			SlippageCalib json.RawMessage `json:"slippage_calib"`
+			// §W7 样本门槛审计（btreplay.SweepConfig.MinTriggers 侧输出）
+			Sample json.RawMessage `json:"sample"`
+			// §W7 兜底分支：全部低样本剔除时，results[0] 带 insufficient_sample=true；
+			// 单独透传一个标记供前端展示"样本不足以推荐"横幅。
+			Insufficient bool `json:"insufficient_sample"`
+		}
+		if err := json.Unmarshal([]byte(m[1]), &payload); err != nil {
+			log.Printf("[scheduler] 任务 #%d SWEEP_JSON 解析失败: %v", taskID, err)
+			continue
+		}
+		if objective == "" && payload.Objective != "" {
+			objective = payload.Objective
+		}
+		allResults = append(allResults, payload.Results...)
+		// §D2 冠军行附带信息（热力网格 + 批次冠军明细）回写 grid_json，前端详情渲染源
+		// §回测自动增强 C：pareto / slippage_calib 段捎带进同一 grid_json 容器（零 schema 迁移）；
+		// 旧任务无这些键 → omitempty 不落 null，前端按缺键降级为 champion 展示。
+		if len(payload.Grid) > 0 || len(payload.Batches) > 0 || len(payload.Pareto) > 0 || len(payload.SlippageCalib) > 0 || len(payload.Sample) > 0 {
+			extraMap := map[string]any{"grid": payload.Grid, "batches": payload.Batches}
+			if len(payload.Pareto) > 0 {
+				extraMap["pareto"] = payload.Pareto
+			}
+			if len(payload.SlippageCalib) > 0 {
+				extraMap["slippage_calib"] = payload.SlippageCalib
+			}
+			// §W7 样本门槛审计随附；insufficient_sample 兜底标记同容器
+			if len(payload.Sample) > 0 {
+				extraMap["sample"] = payload.Sample
+			}
+			if payload.Insufficient {
+				extraMap["insufficient_sample"] = true
+			}
+			if extra, jerr := json.Marshal(extraMap); jerr == nil && len(payload.Results) > 0 {
+				strategy, _ := payload.Results[0]["strategy"].(string)
+				gridExtras[strategy] = string(extra)
+			}
+		}
+		log.Printf("[scheduler] 任务 #%d 扫参排名收拢：%s %d 条（目标 %s）",
+			taskID, payload.Strategy, len(payload.Results), payload.Objective)
+	}
+	if len(allResults) > 0 {
+		if err := db.SaveOptimizationResults(taskID, objective, allResults); err != nil {
+			log.Printf("[scheduler] 任务 #%d 扫参排名聚合落库失败: %v", taskID, err)
+		} else {
+			log.Printf("[scheduler] 任务 #%d 扫参排名聚合落库成功: 全部 %d 条（目标 %s）", taskID, len(allResults), objective)
+			// 排名行已就位，回写各战法冠军行的 grid_json（热力网格 + pareto + 校准简报）
+			for strategy, extra := range gridExtras {
+				if err := db.UpdateOptimizationGrid(taskID, strategy, extra); err != nil {
+					log.Printf("[scheduler] 任务 #%d grid_json 回写失败 %s: %v", taskID, strategy, err)
+				}
+			}
+		}
+	}
+	log.Printf("[scheduler] 任务 #%d saveSweepResults 完成: 匹配 %d 条 SWEEP_JSON", taskID, matched)
+}
+
+// injectBacktestPayload §回测自动增强 A0：夜间链 payload 注入回测增强配置（单行 JSON 表，
+// enabled 才注入；无记录/解析失败/停用 = 原样返回 = 引擎旧行为）。
+// 名义额在此解析为显式数值——btreplay 子进程固定出厂默认配置、读不到用户
+// rules.paper.fixed_amount（管线断链结论），只能在持有真实 config.json 的调度端解析。
+// English: injects the backtest enhancement config into a nightly-chain payload (only when
+// enabled), resolving order_value_yuan from the live config the engine subprocess cannot read.
+func (s *Scheduler) injectBacktestPayload(db *store.DB, payload string) string {
+	raw, ok, err := db.GetBacktestSettings()
+	if !ok || err != nil {
+		return payload
+	}
+	var cfg config.BacktestConfig
+	if json.Unmarshal([]byte(raw), &cfg) != nil || !cfg.Enabled {
+		return payload
+	}
+	// 名义额与模拟盘同源：从调度器持有的真实 config.json 解析 paper.fixed_amount
+	if cfg.OrderValueYuan <= 0 {
+		cfg.OrderValueYuan = config.NewManager(s.cfgPath).Get().Paper.FixedAmount
+	}
+	var p map[string]any
+	if json.Unmarshal([]byte(payload), &p) != nil || p == nil {
+		p = map[string]any{}
+	}
+	p["backtest"] = cfg
+	out, jerr := json.Marshal(p)
+	if jerr != nil {
+		return payload
+	}
+	return string(out)
+}
+
+// openStore 懒加载队列库句柄；首次打开执行启动恢复（崩溃遗留 running→preempted 自动续跑）。
+func (s *Scheduler) openStore(cfg config.SchedulerConfig) *store.DB {
+	s.mu.Lock()
+	db := s.storeDB
+	reset := s.storeReset
+	s.mu.Unlock()
+	if db != nil {
+		return db
+	}
+	p := cfg.DB
+	if p == "" {
+		p = defaultDB()
+	}
+	opened, err := store.Open(p)
+	if err != nil {
+		log.Printf("[scheduler] 打开研究队列失败(%s): %v", p, err)
+		return nil
+	}
+	if !reset {
+		if n, err := opened.ResetStaleRunningTasks(); err != nil {
+			log.Printf("[scheduler] 启动恢复失败: %v", err)
+		} else if n > 0 {
+			log.Printf("[scheduler] 启动恢复：%d 个遗留运行任务标记为 preempted（盘后自动续跑）", n)
+			opslog.Logf("research", "启动恢复 %d 个遗留任务为 preempted（盘后续跑）", n)
+		}
+		// §RFIX-4 复活 MarkRunningInterrupted：research_tasks.go:350 注释声称该函数职责已被
+		// 任务队列接管，但接管只覆盖 research_tasks 表——backtest_jobs 的 running 僵尸行
+		// （生产 id=3 自 08-21 挂死）无人回收。研究进程启动同样把残留 running 回放作业标
+		// interrupted（与 quant 侧双写幂等，共用 trading.db）。
+		if n, err := opened.MarkRunningInterrupted(); err != nil {
+			log.Printf("[scheduler] backtest_jobs 启动恢复失败: %v", err)
+		} else if n > 0 {
+			log.Printf("[scheduler] backtest_jobs 恢复：%d 个遗留 running 回放作业标记为 interrupted", n)
+			opslog.Logf("research", "backtest_jobs 启动恢复 %d 个遗留 running 为 interrupted", n)
+		}
+		s.mu.Lock()
+		s.storeReset = true
+		s.mu.Unlock()
+	}
+	s.mu.Lock()
+	s.storeDB = opened
+	s.mu.Unlock()
+	return opened
+}
+
+// drainAllowed 出队许可：盘后窗口内恒可；窗口外仅当存在 preempted 遗留任务
+// （续跑排水，见 workerTick 注释）。English: dequeue permission — always inside the evening
+// window; outside it only to drain preempted leftovers.
+func (s *Scheduler) drainAllowed(db *store.DB, cfg config.SchedulerConfig) bool {
+	if NightlyEligible(s.nowTime(), cfg) {
+		return true
+	}
+	leftovers, err := db.ActiveResearchTasks()
+	if err != nil {
+		return false
+	}
+	for _, t := range leftovers {
+		if t.Status == store.TaskPreempted {
+			return true
+		}
+	}
+	return false
+}
+
+// PreemptForShutdown 停机前置钩子（researchd 收到 SIGTERM 时最先调用）：把当前运行任务
+// 标记抢占态，使其终态落 preempted（断点续跑）而非 error。必须在取消调度 ctx 之前调用；
+// 与 Run 循环里的"服务退出"抢占互为双保险（D-state 子进程退出慢时存在竞态）。
+// English: shutdown pre-hook — mark sticky preemptReq so the running task lands 'preempted'.
+func (s *Scheduler) PreemptForShutdown() {
+	s.mu.Lock()
+	if s.busy {
+		s.preemptReq = true
+	}
+	s.mu.Unlock()
+}
+
+// preemptCurrent 抢占/终止当前运行中的子进程（标 preemptReq，等待 runner 落终态）。
+// 触发方：交易时段开始 / 调度器禁用 / 服务退出 / high 抢占 low。幂等。
+// 竞态安全：即使子进程尚未 Start（taskCancel 未就绪），请求也先粘住，runner 就绪后立即补杀。
+// English: kills the running child (sets a sticky preemptReq; the runner lands the terminal state).
+// Race-safe: if the child hasn't started yet, the request sticks and the runner honors it on readiness.
+func (s *Scheduler) preemptCurrent(reason string) {
+	s.mu.Lock()
+	if !s.busy || s.preemptReq {
+		s.mu.Unlock()
+		return
+	}
+	id, typ := int64(0), ""
+	if s.curTask != nil {
+		id, typ = s.curTask.ID, s.curTask.Type
+	}
+	s.preemptReq = true
+	cancel := s.taskCancel // 可能为 nil（子进程尚未 Start）
+	cur := s.curCmd        // 当前子进程（可能为 nil），用于整组击杀
+	s.mu.Unlock()
+	log.Printf("[scheduler] 终止当前任务 #%d(%s): %s", id, typ, reason)
+	opslog.Logf("research", "抢占任务 #%d(%s): %s", id, typ, reason)
+	// §修复 S3（2026-08-29）：整组击杀而非仅 SIGKILL 直接子进程。子进程设了 Setpgid，
+	// 孙进程（如 research run-task 派生的计算进程）若只杀直接子进程会成为孤儿继续写库。
+	if cur != nil {
+		killProcessGroup(cur)
+	}
+	if cancel != nil {
+		cancel() // CommandContext 取消兜底（单杀 + 取消 context）
+	}
+}
+
+// memGateMB 内存总闸阈值（可经 rules.scheduler.min_free_mem_mb 覆盖，默认 400）：
+// 系统 MemAvailable 低于该值时一律不出队——研究任务再重要也不能把整机挤进
+// swap 死锁（2026-08-23 实录：discover_factors 峰值 + quant 并发 → SSH/HTTPS 全僵死，
+// OOM 重启 → 排水重跑 → 再 OOM 的 crash loop）。English: global memory gate — when system
+// MemAvailable drops below the threshold, no task is dequeued (everything stays queued).
+const memGateDefaultMB = 400
+
+// readMemAvailableMB 系统可用内存（MB）；读取失败返回 -1（闸门放行，不因读数失败卡死队列）。
+// 平台实现见 memgate_unix.go（/proc/meminfo）/ memgate_windows.go（GlobalMemoryStatusEx）。
+func readMemAvailableMB() int {
+	return platformMemAvailableMB()
+}
+
+// memGateOpen 内存总闸判定：MemAvailable ≥ 阈值（或无法读取）时放行。
+// English: gate passes when MemAvailable is above the threshold (or unreadable).
+func memGateOpen(cfg config.SchedulerConfig) bool {
+	thresh := cfg.MinFreeMemMB
+	if thresh <= 0 {
+		thresh = memGateDefaultMB
+	}
+	return memGateDecide(readMemAvailableMB(), thresh)
+}
+
+// memGateDecide 纯决策：avail<0（无法读数）放行不卡队；其余按阈值比较。
+func memGateDecide(availMB, threshMB int) bool {
+	if availMB < 0 {
+		return true
+	}
+	return availMB >= threshMB
+}
+
+// tryStartNext 空闲则出队下一个任务并启动（带盘后门控+内存总闸）。任务完成后的自驱排水入口，
+// 不依赖 30s tick，长队列可在夜班窗口内连续消费。
+// English: dequeues and starts the next task when idle (after-hours + memory gated). Self-draining.
+func (s *Scheduler) tryStartNext(db *store.DB, cfg config.SchedulerConfig) {
+	if !s.drainAllowed(db, cfg) {
+		return // 盘后硬门控（需求#4）：未到窗口且无遗留续跑时不出队
+	}
+	if !memGateOpen(cfg) {
+		// 内存总闸：系统可用内存不足——一切任务留队等待，绝不与量化主程序/系统抢内存。
+		opslog.OncePer("memgate", time.Hour, func() {
+			opslog.Logf("research", "内存总闸拦截 MemAvailable=%dMB 阈值=%dMB 任务留队", readMemAvailableMB(), cfg.MinFreeMemMB)
+		})
+		log.Printf("[scheduler] 内存总闸拦截：MemAvailable=%dMB < %dMB，本轮不出队（任务留队）",
+			readMemAvailableMB(), func() int {
+				t := cfg.MinFreeMemMB
+				if t <= 0 {
+					return memGateDefaultMB
+				}
+				return t
+			}())
+		return
+	}
+	next, err := db.DequeueHighestTask()
+	if err != nil || next == nil {
+		return
+	}
+	// §失败重排队防自旋：刚失败回队尾的任务在冷却期内不出队（队列非空时其他任务先行，
+	// 空队时空转间隔=冷却窗），避免快速失败任务烧 CPU。成功/取消后清除记录。
+	s.mu.Lock()
+	if failAt, cooling := s.failCool[next.ID]; cooling && s.nowTime().Sub(failAt) < failRetryCooldown {
+		s.mu.Unlock()
+		return
+	}
+	s.mu.Unlock()
+	// 窗口外排水限制：仅 preempted（被抢占遗留）可续跑；普通 queued（含手动新提交）
+	// 必须等到盘后窗口——否则"有遗留"会变成绕过门控的后门。
+	// English: outside the window only preempted rows may run; plain queued (incl. fresh manual
+	// submissions) must wait — otherwise leftovers become a gate bypass.
+	if !NightlyEligible(s.nowTime(), cfg) && next.Status != store.TaskPreempted {
+		return
+	}
+	s.mu.Lock()
+	if s.busy {
+		s.mu.Unlock()
+		return
+	}
+	s.busy = true
+	cp := *next
+	s.curTask = &cp
+	s.preemptReq, s.cancelReq, s.paused = false, false, false
+	s.lastProgress = time.Now().Unix()
+	s.mu.Unlock()
+	ok, err := db.ClaimResearchTask(next.ID)
+	if err != nil || !ok {
+		s.mu.Lock()
+		s.busy = false
+		s.curTask = nil
+		s.curCmd = nil // §修复 S3：任务结束后清空当前子进程引用
+		s.mu.Unlock()
+		if err != nil {
+			log.Printf("[scheduler] 认领任务 #%d 失败: %v", next.ID, err)
+		}
+		return
+	}
+	// 认领即预写 1% 基线（§8.6-A）：子进程起步装配期（分钟级）进度条不再空窗。
+	_ = db.UpdateTaskClaimed(next.ID)
+	go s.runTask(db, cfg, cp)
+}
+
+// workerTick 盘后队列驱动：门控 → 夜间链入队 → 抢占检查 / 出队执行。
+func (s *Scheduler) workerTick(cfg config.SchedulerConfig, now time.Time) {
+	db := s.openStore(cfg)
+	if db == nil {
+		return
+	}
+	// 盘后硬门控（需求#4）：未到启动时间/盘中不**新起**任务——手动 high 同样排队等待。
+	// 例外（续跑语义，对齐旧版"在跑的作业让它跑完"）：存在 preempted 遗留任务时，
+	// 非交易时段即允许排水续跑——它们是被会话边界/重启打断的半成品，拖到次日 15:30
+	// 只会让断点缓存白白过期。English: hard gate blocks NEW tasks before the evening window,
+	// except draining preempted leftovers outside sessions (resume semantics).
+	if !NightlyEligible(now, cfg) {
+		hasLeftover := false
+		if leftovers, err := db.ActiveResearchTasks(); err == nil {
+			for _, t := range leftovers {
+				if t.Status == store.TaskPreempted {
+					hasLeftover = true
+					break
+				}
+			}
+		}
+		if !hasLeftover {
+			return
+		}
+		log.Printf("[scheduler] 盘后窗口未到，但存在被抢占遗留任务——仅排水续跑，不新起任务")
+	} else {
+		s.ensureNightlyEnqueue(db, cfg, now)
+	}
+
+	// 一次性取出"当前槽位"快照（是否在跑 + 在跑任务的 ID/优先级），供紧随其后的
+	// 抢占判定使用；锁内只复制字段不做 IO，避免调度循环被慢任务阻塞。
+	s.mu.Lock()
+	busy := s.busy
+	var curID int64
+	curPrio := ""
+	if s.curTask != nil {
+		curID = s.curTask.ID
+		curPrio = s.curTask.Priority
+	}
+	s.mu.Unlock()
+
+	next, err := db.DequeueHighestTask()
+	if err != nil || next == nil {
+		return
+	}
+	if busy {
+		// 决策#1 kill 抢占：high 到来且当前是 low → 杀掉当前子进程（preempted 自动回队首）。
+		if next.ID != curID && next.Priority == "high" && curPrio == "low" {
+			s.preemptCurrent(fmt.Sprintf("高优先级任务 #%d(%s) 抢占", next.ID, next.Type))
+		}
+		return
+	}
+	s.tryStartNext(db, cfg)
+}
+
+// ensureNightlyEnqueue 幂等入队当日夜间步骤链（low、chain_day=今天、chain_seq=序位）。
+// 队列即断点：researchd 重启后已入队未完成的任务天然续跑，不再依赖 research_state.json 步骤下标。
+// 跨日残留的旧链任务按 chain_day 升序先于今日执行（保留已完成工作量，优于旧的直接杀掉重来）。
+// §2026-09-05 多轮发现：原单个 discover_factors 展开为 variants 个变体任务（各自产出 top_n
+// 个排他最优组合），回测开关开启时在其后追加一次 --since 的配对 backtest（回填全部当日候选）。
+// §M15（2026-09-22）半截链自愈：旧实现「ChainHasTasks 有任一任务即整链短路 + enqueue 中途
+// 失败立即 return（Day 也不推进）」——某环入库失败时当晚链永久半截且不再补。现改为：
+//  1. 先把步骤表展开成完整计划（plan），链任务序位 chain_seq=计划下标（序位即身份）；
+//  2. 以当日已占用序位集合（含全部终态）为断点，仅补缺口——重启/中途失败后由后续 tick
+//     （30s）自动补投缺额，全部就位后走无操作稳态路径；
+//  3. 单个序位入队失败只记录并继续投其余环，绝不中断整链；
+//  4. state 照常推进 Day 并留痕 chain_issued/chain_total，缺额在状态文件与 opslog 可见。
+//
+// English: idempotently enqueues today's nightly chain. M15: half-chain self-healing — the plan
+// positions (chain_seq) are the checkpoint; a failing enqueue no longer aborts the chain, and
+// every later tick backfills only the missing positions, with issued/total recorded in state.
+func (s *Scheduler) ensureNightlyEnqueue(db *store.DB, cfg config.SchedulerConfig, now time.Time) {
+	today := cntime.DayCompactOf(now) // §TZ1 北京日历定链日
+	steps := cfg.Nightly.Steps
+	if len(steps) == 0 {
+		steps = config.DefaultSchedulerConfig().Nightly.Steps
+	}
+	// 回测开关：开启时在 discover_factors 之后追加一次 B4 全链路回测（回填候选 avg_excess）；
+	// 并在 discover_patterns 之后追加战法库全量回放（因子+形态启用规则，实盘口径回归验证）——
+	// 修复"自动研究没有形态战法回测"的不对称。
+	// English: when the toggle is on, append the B4 chain backtest after factor discovery AND a
+	// full library replay (factor+pattern rules) after pattern discovery.
+	if cfg.Nightly.BacktestEnabled && !containsStep(steps, "backtest") {
+		steps = insertAfter(steps, "discover_factors", "backtest")
+		log.Printf("[scheduler] 回测开关开启：夜间链追加 backtest 任务")
+	}
+	if cfg.Nightly.BacktestEnabled && !containsStep(steps, "library_replay") {
+		steps = insertAfter(steps, "discover_patterns", "library_replay")
+		log.Printf("[scheduler] 回测开关开启：夜间链追加 library_replay 任务（战法库因子+形态回放）")
+	}
+	// §O1 策略自优化引擎：夜间链追加全库参数寻优（默认开启，推荐制——结果需人工审批应用）
+	if cfg.OptimizeEnabled && !containsStep(steps, "optimize") {
+		steps = insertAfter(steps, "library_replay", "optimize")
+		log.Printf("[scheduler] 策略自优化引擎开启：夜间链追加 optimize 任务（全库参数寻优）")
+	}
+	// §M15 第一步：把步骤表展开为完整计划（不触库，纯计算）——计划下标即 chain_seq。
+	// §多轮发现：expand discover_factors → variants 个变体任务；配对 backtest 仅放置一次，
+	// 之后的显式/auto-inserted "backtest" 步骤跳过，避免重复回测。
+	var plan []chainPlanItem
+	variants := discoverVariants(cfg)
+	backtestPlaced := false
+	for _, step := range steps {
+		switch step {
+		case "discover_factors":
+			for v := 0; v < variants; v++ {
+				typ, payload, ok := discoverVariantPayload(cfg, today, v)
+				if !ok {
+					continue
+				}
+				plan = append(plan, chainPlanItem{typ: typ, step: fmt.Sprintf("discover_factors 变体#%d", v), payload: payload})
+			}
+			log.Printf("[scheduler] 多轮发现：discover_factors 展开为 %d 个变体任务（每变体 top_n 排他最优组合）", variants)
+			if cfg.Nightly.BacktestEnabled {
+				plan = append(plan, chainPlanItem{store.TaskBacktestNightly, "backtest(配对)", nightlyBacktestPayload(cfg, today)})
+				backtestPlaced = true
+				log.Printf("[scheduler] 夜间链追加配对 backtest（--since %s 回填多候选）", today)
+			}
+		case "backtest":
+			if backtestPlaced {
+				backtestPlaced = false
+				continue // 已由 discover_factors 展开配对，跳过重复 backtest
+			}
+			typ, payload, ok := stepTask(step, cfg, today)
+			if !ok {
+				log.Printf("[scheduler] 未知夜间步骤 %q 跳过", step)
+				continue
+			}
+			plan = append(plan, chainPlanItem{typ, step, payload})
+		default:
+			typ, payload, ok := stepTask(step, cfg, today)
+			if !ok {
+				log.Printf("[scheduler] 未知夜间步骤 %q 跳过", step)
+				continue
+			}
+			plan = append(plan, chainPlanItem{typ, step, payload})
+		}
+	}
+	// §M15 第二步：当日已占用序位（全状态：done/error/cancelled/挂起都算已投）——只补缺口。
+	existing, err := db.ChainTaskSeqs(today)
+	if err != nil {
+		log.Printf("[scheduler] 查询当日夜链序位失败(%s): %v", today, err)
+		return
+	}
+	covered, newly, failures := 0, 0, []string{}
+	for i, it := range plan {
+		if existing[i] > 0 {
+			covered++
+			continue
+		}
+		if err := s.enqueueChainStep(db, it, today, i); err != nil {
+			failures = append(failures, it.step) // §M15 失败环显式记录，绝不中断其余环入队
+			continue
+		}
+		newly++
+	}
+	if newly == 0 && len(failures) == 0 {
+		return // 稳态路径：当日链全序位已就位（旧版 ChainHasTasks 短路职责由序位补缺取代）
+	}
+	// §M15 照常推进 Day（旧版入队中途 return 连 Day 都不推进）+ 半截留痕 chain_issued/total。
+	s.mu.Lock()
+	s.state.Day = today
+	s.state.Done = false
+	s.state.ChainTotal = len(plan)
+	s.state.ChainIssued = covered + newly
+	s.mu.Unlock()
+	s.saveState()
+	if len(failures) > 0 {
+		log.Printf("[scheduler] §M15 夜间链 %s 本轮入队半截：%d/%d 已就位，缺额 %v——后续 tick 自动补投",
+			today, covered+newly, len(plan), failures)
+		// opslog 节流（半小时一条）：缺额持续存在时不刷屏，但每日巡检必留痕。
+		opslog.OncePer("nightchain-gap:"+today, 30*time.Minute, func() {
+			opslog.Logf("research", "§M15 夜间链 %s 入队半截 %d/%d，缺额 %v（自动补投中，持续失败需查队列库）",
+				today, covered+newly, len(plan), failures)
+		})
+		return
+	}
+	if covered > 0 {
+		log.Printf("[scheduler] §M15 夜间链 %s 缺额补投 %d 个任务完成，全链 %d/%d 就位", today, newly, covered+newly, len(plan))
+		opslog.Logf("research", "§M15 夜间链 %s 缺额补投 %d 个，全链 %d/%d 就位", today, newly, covered+newly, len(plan))
+		return
+	}
+	log.Printf("[scheduler] 夜间链 %s 已入队 %d 个 low 任务: %v", today, newly, steps)
+	opslog.Logf("research", "夜间链 %s 入队 %d 个任务: %v", today, newly, steps)
+}
+
+// chainPlanItem §M15 夜间链计划中的一个序位（环节）：typ/payload 入库载荷，step 供日志可读。
+type chainPlanItem struct {
+	typ     string
+	step    string
+	payload string
+}
+
+// enqueueChainStep 入队夜链计划中的一个序位（chain_seq=计划下标）。
+// §M15 测试缝：nightlyEnqueueOverride 非 nil 时替代真实入队（单测注入指定序位入库失败）。
+func (s *Scheduler) enqueueChainStep(db *store.DB, it chainPlanItem, today string, seq int) error {
+	// §回测自动增强 A0：夜间链战法回放/寻优任务注入 backtest 配置（enabled 才注入，
+	// 无记录=旧行为）——与 server 端 enqueueBacktestTask 同一管线。
+	payload := it.payload
+	if it.typ == store.TaskBacktestStrategy {
+		payload = s.injectBacktestPayload(db, payload)
+	}
+	t := &store.ResearchTask{
+		Type: it.typ, Priority: "low", Status: store.TaskQueued,
+		Payload: payload, ChainDay: today, ChainSeq: seq,
+	}
+	s.mu.Lock()
+	override := s.nightlyEnqueueOverride
+	s.mu.Unlock()
+	var err error
+	if override != nil {
+		_, err = override(t)
+	} else {
+		_, err = db.EnqueueResearchTask(t)
+	}
+	if err != nil {
+		log.Printf("[scheduler] §M15 入队夜间任务 %s(seq=%d) 失败: %v", it.step, seq, err)
+	}
+	return err
+}
+
+// containsStep 报告 steps 中是否包含指定步骤。
+func containsStep(steps []string, step string) bool {
+	for _, s := range steps {
+		if s == step {
+			return true
+		}
+	}
+	return false
+}
+
+// insertAfter 在 steps 中 anchor 之后插入 step；anchor 不存在则追加到末尾。
+func insertAfter(steps []string, anchor, step string) []string {
+	for i, s := range steps {
+		if s == anchor {
+			out := make([]string, 0, len(steps)+1)
+			out = append(out, steps[:i+1]...)
+			out = append(out, step)
+			out = append(out, steps[i+1:]...)
+			return out
+		}
+	}
+	return append(steps, step)
+}
+
+// stepTask 夜间步骤 → (任务类型, payload JSON)。payload 与旧 buildCommand 参数一一对应，
+// 由 run-task 分发器展平为子命令 CLI 参数。
+func stepTask(step string, cfg config.SchedulerConfig, today string) (string, string, bool) {
+	// 将调度步骤映射为 research 任务类型+参数载荷；未知步骤返回 ok=false。
+	switch step {
+	case "dataload":
+		pyurl := cfg.PyURL
+		if pyurl == "" {
+			pyurl = "http://127.0.0.1:8787"
+		}
+		return store.TaskDataload, mustJSON(map[string]any{"pyurl": pyurl}), true
+	case "sector_rebuild":
+		return store.TaskSectorRebuild, "{}", true
+	case "discover_factors":
+		return store.TaskDiscoverFactors, mustJSON(map[string]any{
+			"start": researchStart, "end": today,
+			"h": 5, "min-stocks": 20, "max-factors": 8,
+			"split": 0.7, "min-ir": 0.3, "min-days": 30,
+		}), true
+	case "discover_patterns":
+		d := cfg.Nightly.Discover
+		mt := d.MinTrigger
+		if mt <= 0 {
+			mt = 20
+		}
+		me := d.MinExcess
+		if me <= 0 {
+			me = 0.01
+		}
+		split := d.Split
+		if split <= 0 || split >= 1 {
+			split = 0.7
+		}
+		return store.TaskDiscoverPatterns, mustJSON(map[string]any{
+			"start": researchStart, "end": today,
+			"h": 5, "min-trigger": mt, "min-excess": me, "split": split,
+		}), true
+	case "backtest":
+		p := map[string]any{"start": researchStart, "end": today, "h": 5}
+		if ev := cfg.Nightly.BacktestEvents; ev > 0 {
+			p["max-per-day"] = ev
+		}
+		return store.TaskBacktestNightly, mustJSON(p), true
+	case "paper_research":
+		return store.TaskPaperResearch, "{}", true
+	case "lifecycle":
+		// §GAP-P1 20260915：策略生命周期评估（实盘衰退自动降级 + 灰度晋升候选生成）。
+		// 阈值零值走 research.DemoteOpts.fill 内置默认（连续 3 日 / IR≥0 / 胜率≥35% / 样本≥3）。
+		// English: nightly lifecycle task (auto-demote declining applied strategies + emit
+		// grayscale promotion candidates); zero thresholds fall back to built-in defaults.
+		l := cfg.Nightly.Lifecycle
+		p := map[string]any{}
+		if l.ConsecDays > 0 {
+			p["consec-days"] = l.ConsecDays
+		}
+		if l.MinIR != 0 {
+			p["min-ir"] = l.MinIR
+		}
+		if l.MinWinRate > 0 {
+			p["min-win-rate"] = l.MinWinRate
+		}
+		if l.MinDailyTrades > 0 {
+			p["min-daily-trades"] = l.MinDailyTrades
+		}
+		if l.DryRun {
+			p["dry-run"] = true
+		}
+		// §RFIX-3/4 透传（>0 才下发；缺省走 research 内置默认 30 天）：
+		// zero-obs-days 零观测告警阈值 / pending-expire-days 寻优 pending 过期天数。
+		if l.ZeroObsDays != 0 {
+			p["zero-obs-days"] = l.ZeroObsDays
+		}
+		if l.PendingExpireDays > 0 {
+			p["pending-expire-days"] = l.PendingExpireDays
+		}
+		return store.TaskLifecycle, mustJSON(p), true
+	case "library_replay":
+		// 战法库全量回放（因子+形态启用规则一起）：夜间对现行战法做实盘口径的
+		// 胜率/盈亏比回归验证，结果落 backtest_jobs（kind=library）供「回测」tab 查看。
+		// §质控：全池（maxstocks=0）+ quality=true——以质控池（剔 ST/退市/多年亏损/地量股）
+		// 替代字母序 300 截断，回归验证覆盖真实可用交易标的。
+		// §节流：replay_throttle_ms>0 时逐股 sleep 摊平全量回放对 2核4G 服务器的瞬时
+		// CPU/内存挤压（盘后十几个小时足够，拉长时长换稳定性）。
+		// English: replays every enabled factor+pattern rule on the quality-screened full universe —
+		// no more maxstocks=300 alphabetical truncation; optional per-stock throttle to flatten
+		// instantaneous load over the long post-close window.
+		p := map[string]any{
+			"kind": "all", "start": researchStart, "end": today, "maxstocks": 0, "quality": true,
+		}
+		if cfg.ReplayThrottleMs > 0 {
+			p["throttle_ms"] = cfg.ReplayThrottleMs
+		}
+		return store.TaskBacktestStrategy, mustJSON(p), true
+	case "optimize":
+		// §策略自优化引擎：全库寻优（贝叶斯搜索+细粒度网格），结果自动排名落库
+		p := map[string]any{"kind": "optimize", "start": researchStart, "end": today, "top_n": 20}
+		return store.TaskBacktestStrategy, mustJSON(p), true
+	case "list":
+		return store.TaskList, "{}", true
+	}
+	return "", "", false
+}
+
+// discoverVariants §2026-09-05 每晚因子发现变体任务数 = ceil(research_rounds / top_n)。
+// 每个变体各产出 top_n 个排他最优组合 → 每晚候选数 = rounds（默认 4 = 2 变体 × 2 排他）。
+// English: nightly factor-discovery variant-task count = ceil(rounds/top_n); candidates/night =
+// rounds (default 4 = 2 variants × top_n=2 exclusive).
+func discoverVariants(cfg config.SchedulerConfig) int {
+	rounds := cfg.Nightly.ResearchRounds
+	if rounds <= 0 {
+		rounds = 4
+	}
+	topN := cfg.Nightly.Discover.TopN
+	if topN <= 0 {
+		topN = 1
+	}
+	v := (rounds + topN - 1) / topN
+	if v < 1 {
+		v = 1
+	}
+	return v
+}
+
+// discoverVariantPayload §2026-09-05 多轮变体第 v 个 payload：参数差异 = 前瞻 h / 窗口年数 /
+// 优化目标 / 风格子池，均从 rules.nightly.discover 读（越界取默认）。start 窗轮换使样本内
+// 每夜真前进，从源头避免滑窗贪心每晚选同一组合；变体天然的 discoveryResumeKey 差异保证
+// 窗口断点缓存互不串扰。English: produces the v-th variant payload — horizon/start-window/metric/
+// style-pool rotation from config; window-rotation genuinely advances the in-sample set each night.
+func discoverVariantPayload(cfg config.SchedulerConfig, today string, v int) (string, string, bool) {
+	d := cfg.Nightly.Discover
+	h := elemInt(d.Horizons, v, 5)
+	years := elemInt(d.StartWindows, v, 3)
+	metric := elemStr(d.Metrics, v, "ir")
+	pool := elemStr(d.FactorPools, v, "")
+	topN := d.TopN
+	if topN <= 0 {
+		topN = 1
+	}
+	minStocks := d.MinStocks
+	if minStocks <= 0 {
+		minStocks = 20
+	}
+	maxFactors := d.MaxFactors
+	if maxFactors <= 0 {
+		maxFactors = 8
+	}
+	split := d.Split
+	if split <= 0 || split >= 1 {
+		split = 0.7
+	}
+	minIR := d.MinIR
+	if minIR <= 0 {
+		minIR = 0.3
+	}
+	minDays := d.MinDays
+	if minDays <= 0 {
+		minDays = 30
+	}
+	minGenT := d.MinGenT
+	if minGenT >= 0 {
+		minGenT = -2
+	}
+	dedupJaccard := d.DedupJaccard
+	if dedupJaccard <= 0 {
+		dedupJaccard = 0.8
+	}
+	guardStrong := d.GuardStrong
+	if guardStrong <= 0 {
+		guardStrong = 0.45
+	}
+	guardWeak := d.GuardWeak
+	if guardWeak <= 0 {
+		guardWeak = 0.2
+	}
+	stalenessDays := d.StalenessDays
+	if stalenessDays <= 0 {
+		stalenessDays = 30
+	}
+	hysteresis := d.Hysteresis
+	if hysteresis <= 0 {
+		hysteresis = 0.05
+	}
+	start := startWindowYear(today, years)
+	return store.TaskDiscoverFactors, mustJSON(map[string]any{
+		"start": start, "end": today,
+		"h": h, "metric": metric, "pool": pool, "top-n": topN,
+		"min-stocks": minStocks, "max-factors": maxFactors,
+		"split": split, "min-ir": minIR, "min-days": minDays, "min-gen-t": minGenT,
+		"dedup-jaccard": dedupJaccard,
+		"guard-strong":  guardStrong, "guard-weak": guardWeak,
+		"min-yr-sign": d.MinYrSign,
+		"change-gate": d.ChangeGate, "staleness-days": stalenessDays,
+		"hysteresis": hysteresis,
+	}), true
+}
+
+// nightlyBacktestPayload §2026-09-05 配对 B4 回测 payload：--since 今日 → 回填当日全部候选
+// （多轮多候选逐一回测），max_per_day/min_limit_ups/top_k/min_stocks 从 discover 配置注入。
+// English: paired B4 backtest payload — --since today backfills every today-created candidate,
+// event/selection params come from the discover config block.
+func nightlyBacktestPayload(cfg config.SchedulerConfig, today string) string {
+	d := cfg.Nightly.Discover
+	p := map[string]any{"start": researchStart, "end": today, "h": 5, "since": today}
+	if ev := cfg.Nightly.BacktestEvents; ev > 0 {
+		p["max-per-day"] = ev
+	} else if d.MaxPerDay > 0 {
+		p["max-per-day"] = d.MaxPerDay
+	}
+	if d.MinLimitUps > 0 {
+		p["min-limit-ups"] = d.MinLimitUps
+	}
+	if d.TopK > 0 {
+		p["top-k"] = d.TopK
+	}
+	if d.MinStocks > 0 {
+		p["min-stocks"] = d.MinStocks
+	}
+	if d.MinBtEvents > 0 {
+		p["min-bt-events"] = d.MinBtEvents
+	}
+	return mustJSON(p)
+}
+
+// elemInt 取数组第 idx 个元素，越界回退默认值。English: index-safe int element lookup.
+func elemInt(v []int, idx, def int) int {
+	if idx >= 0 && idx < len(v) {
+		return v[idx]
+	}
+	return def
+}
+
+// elemStr 取数组第 idx 个元素，越界回退默认值。English: index-safe string element lookup.
+func elemStr(v []string, idx int, def string) string {
+	if idx >= 0 && idx < len(v) {
+		return v[idx]
+	}
+	return def
+}
+
+// startWindowYear 把 YYYYMMDD 前移 years 个自然年（同月同日）。English: shifts a YYYYMMDD back years.
+func startWindowYear(today string, years int) string {
+	if len(today) != 8 || years <= 0 {
+		return today
+	}
+	y, err := strconv.Atoi(today[:4])
+	if err != nil {
+		return today
+	}
+	return fmt.Sprintf("%04d%s", y-years, today[4:])
+}
+
+// mustJSON 序列化为 JSON；失败兜底返回 "{}"（保证 payload 列永远是合法 JSON）。
+func mustJSON(v any) string {
+	b, err := json.Marshal(v)
+	if err != nil {
+		return "{}"
+	}
+	return string(b)
+}
+
+// taskCommand 组装任务的二进制与参数：dataload 直连专用二进制；
+// 其余类型统一走 research run-task --task-id（唯一入口，进程名与 verify_nightly.sh 兼容）。
+// English: builds the child command — dataload runs its own binary; everything else funnels through
+// `research run-task --task-id N`, keeping the process name compatible with verify_nightly.sh.
+func (s *Scheduler) taskCommand(cfg config.SchedulerConfig, tk *store.ResearchTask) (string, []string, error) {
+	dbPath := cfg.DB
+	if dbPath == "" {
+		dbPath = defaultDB()
+	}
+	if tk.Type == store.TaskDataload {
+		bin, err := s.resolveBin(cfg.DataloadBin)
+		if err != nil {
+			return "", nil, err
+		}
+		var p map[string]any
+		_ = json.Unmarshal([]byte(tk.Payload), &p)
+		pyurl := "http://127.0.0.1:8787"
+		if v, ok := p["pyurl"].(string); ok && v != "" {
+			pyurl = v
+		}
+		return bin, []string{"--db", dbPath, "--pyurl", pyurl, "daily"}, nil
+	}
+	bin, err := s.resolveBin(cfg.ResearchBin)
+	if err != nil {
+		return "", nil, err
+	}
+	return bin, []string{"--db", dbPath, "run-task", "--task-id", strconv.FormatInt(tk.ID, 10)}, nil
+}
+
+// runTask 执行单个队列任务子进程：进度逐行解析回写、控制标志轮询（pause/resume/cancel）、
+// 高优先级任务的进度停滞看门狗（15 分钟无进展 kill 置 error；低优先级沿用单步硬超时）、
+// 终态落库 + 链收尾（AbortOnError 取消同链后续 / 链排空置 Done）。
+// English: runs one queued task — streams and parses output into progress, polls control flags,
+// stall-watchdogs only high-priority tasks (lows rely on the per-step hard timeout), lands terminal
+// state, then handles chain bookkeeping (AbortOnError sibling cancellation / chain-drained Done).
+func (s *Scheduler) runTask(db *store.DB, cfg config.SchedulerConfig, tk store.ResearchTask) {
+	defer func() {
+		if r := recover(); r != nil {
+			// §S2 修复：panic 后任务此前永远停留 running（直到进程重启才被捞回），
+			// 期间夜间链 Done 永不置位。现落失败重排队终态并走链收尾。
+			log.Printf("[scheduler] 任务 #%d panic: %v\n%s", tk.ID, r, stackTrace())
+			errMsg := fmt.Sprintf("worker panic: %v", r)
+			if e := db.RequeueFailedTask(tk.ID, errMsg); e != nil {
+				log.Printf("[scheduler] 任务 #%d panic 后回队落库失败: %v", tk.ID, e)
+			}
+			s.noteFailure(tk.ID)
+			s.finishTask(db, cfg, &tk, store.TaskError, errMsg)
+			s.notifySameCauseBreaker(db, &tk, errMsg) // §M14 熔断挂起检测（留痕+告警；置于链收尾后，覆盖展示态为 needs_attention）
+		}
+		s.mu.Lock()
+		s.busy = false
+		s.taskCancel = nil
+		s.curTask = nil
+		s.curCmd = nil // §修复 S3：清空当前子进程引用
+		s.paused = false
+		s.mu.Unlock()
+		// 自驱排水：本任务终态落库后立即尝试下一个（不依赖 30s tick）。
+		s.tryStartNext(db, cfg)
+	}()
+	// preemptReq/cancelReq/paused 已在 tryStartNext 预占时清零；此处不重复复位，
+	// 避免抹掉"预占到启动之间"到达的抢占请求（竞态窗口）。
+	base := func() context.Context {
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		if s.baseCtx == nil {
+			return context.Background()
+		}
+		return s.baseCtx
+	}()
+	log.Printf("[scheduler] 任务 #%d(%s prio=%s ref=%d chain=%s/%d) 启动",
+		tk.ID, tk.Type, tk.Priority, tk.RefID, tk.ChainDay, tk.ChainSeq)
+	opslog.Logf("research", "任务 #%d(%s) 启动 prio=%s chain=%s/%d", tk.ID, tk.Type, tk.Priority, tk.ChainDay, tk.ChainSeq)
+
+	// §失败重排队：失败不再落 error 终态——回队尾（updated_at 尾键沉底）；异因失败不设重试上限
+	// （瞬态失败此设计正确），§M14（2026-09-22）新增「同因连败熔断」兜底确定性失败
+	// （参数非法/数据必缺/缺二进制）：error 指纹连续 store.SameReasonFailLimit 次相同 →
+	// store 置 failed_needs_attention 挂起，本 worker 高优告警一次，不再秒级/冷却级重投。
+	// error 列保留最后失败原因。冷却窗防快速失败自旋。
+	fail := func(errMsg string) {
+		log.Printf("[scheduler] 任务 #%d(%s) 失败→回队尾重试: %s", tk.ID, tk.Type, errMsg)
+		opslog.Logf("research", "任务 #%d(%s) 失败回队重试: %s", tk.ID, tk.Type, errMsg)
+		_ = db.RequeueFailedTask(tk.ID, errMsg)
+		s.noteFailure(tk.ID)
+		s.finishTask(db, cfg, &tk, store.TaskError, errMsg)
+		s.notifySameCauseBreaker(db, &tk, errMsg) // §M14 熔断挂起检测（置于链收尾后，见其注释）
+	}
+
+	// 重活一律交给子进程：先解析该任务类型对应的可执行文件与参数，解析失败（如缺二进制、
+	// 缺配置）直接走 fail 回队尾；再给本次执行套上步骤超时，未配置时兜底 90 分钟。
+	bin, args, err := s.taskCommand(cfg, &tk)
+	if err != nil {
+		fail(err.Error())
+		return
+	}
+	timeout := time.Duration(cfg.StepTimeoutMin) * time.Minute
+	if timeout <= 0 {
+		timeout = 90 * time.Minute
+	}
+	// §质控全量回放超时加固：library_replay 已从 maxstocks=300 改为全池（maxstocks=0）质控池，
+	// 全市场数千标的 × 全库规则回放合法耗时可达数小时——无论 step_timeout_min 配置为何值，
+	// TaskBacktestStrategy 类任务一律至少放宽至 6h（过程持续有"回测进度 xx%"输出，不会误判停滞）。
+	// English: full-market quality-screened replays legitimately take hours — always give
+	// TaskBacktestStrategy at least a 6h budget regardless of the configured per-step timeout;
+	// steady "回测进度 xx%" output means this can't mask a stall.
+	if tk.Type == store.TaskBacktestStrategy && timeout < 6*time.Hour {
+		timeout = 6 * time.Hour
+	}
+	runCtx, cancel := context.WithTimeout(base, timeout)
+	defer cancel()
+	cmd := exec.CommandContext(runCtx, bin, args...)
+	cmd.Dir = dirOfDB(cfg)
+	// §S1 孤儿防护：独立进程组 + Linux Pdeathsig（父死内核杀子），抢占/超时整组击杀
+	configureSysProcAttr(cmd)
+
+	// 输出文件化（架构修复，根除管道死锁）：子进程 stdout/stderr 直写每任务日志文件。
+	// 旧"StdoutPipe+扫描协程"链路一旦消费端停摆（journald 抖动/诊断性 QUIT 巨量输出），
+	// 64KB 管道灌满 → 子进程冻结在 write → 零进度 → 看门狗误杀（#16 实录）。
+	// 写文件永不阻塞；worker 以尾随方式增量解析进度，完整日志同时留存排障。
+	// English: file-based output — the child writes to a per-task log file (never blocks), and the
+	// worker tails it incrementally for progress parsing; full log kept on disk for debugging.
+	logDir := filepath.Join(filepath.Dir(func() string {
+		p := cfg.DB
+		if p == "" {
+			p = defaultDB()
+		}
+		return p
+	}()), "task_logs")
+	_ = os.MkdirAll(logDir, 0o755)
+	// §P1-12 任务日志轮转：每次建任务前清理 30 天前的日志，避免 task_logs 无限膨胀占满磁盘。
+	cleanupTaskLogs(logDir, 30*24*time.Hour)
+	logPath := filepath.Join(logDir, fmt.Sprintf("task_%d.log", tk.ID))
+	_ = os.Remove(logPath) // §P1-12 先清掉同名旧日志（若重跑同 ID），避免与轮转清理/续跑混淆
+	lf, lerr := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o644)
+	if lerr != nil {
+		fail("创建任务日志失败: " + lerr.Error())
+		return
+	}
+	defer lf.Close()
+	cmd.Stdout = lf
+	cmd.Stderr = lf
+
+	if err := cmd.Start(); err != nil {
+		// §停机语义修正：调度器停止（ctx 取消）导致的启动失败落 preempted 断点续跑，
+		// 而不是 error 终态——否则每次 systemctl restart 都会把排队任务打成永久错误
+		// （2026-08-23 实录：restart 后 #35 落 error 需手工回队）。
+		if base.Err() != nil || errors.Is(err, context.Canceled) {
+			errMsg := "调度器停止，断点续跑"
+			log.Printf("[scheduler] 任务 #%d 启动被停机打断 → preempted", tk.ID)
+			opslog.Logf("research", "任务 #%d 启动被停机打断 → preempted", tk.ID)
+			s.finishTask(db, cfg, &tk, store.TaskPreempted, errMsg)
+			return
+		}
+		fail("启动子进程失败: " + err.Error())
+		return
+	}
+	s.mu.Lock()
+	s.taskCancel = cancel
+	s.curCmd = cmd // §修复 S3：记录当前子进程，抢占时整组击杀含孙进程
+	pendingPreempt := s.preemptReq
+	s.mu.Unlock()
+	if pendingPreempt {
+		// 预占到启动之间到达的抢占请求：子进程已就绪，立即补杀。
+		cancel()
+	}
+
+	// 输出收集 + 进度解析：尾随任务日志文件（2s 周期，断行缓存跨读拼接）
+	var rs struct {
+		mu       sync.Mutex
+		out      bytes.Buffer
+		progress string
+		off      int64
+		carry    string
+	}
+	handleLine := func(line string) {
+		line = strings.TrimRight(line, "\r\n")
+		if line == "" {
+			return
+		}
+		rs.mu.Lock()
+		rs.out.WriteString(line)
+		rs.out.WriteString("\n")
+		rs.mu.Unlock()
+		log.Printf("[task#%d:%s] %s", tk.ID, tk.Type, line)
+		if m := taskProgressRe.FindStringSubmatch(line); len(m) == 2 {
+			rs.mu.Lock()
+			rs.progress = m[1] + "%"
+			rs.mu.Unlock()
+			s.mu.Lock()
+			s.lastProgress = time.Now().Unix()
+			s.mu.Unlock()
+			_ = db.UpdateTaskRunState(tk.ID, store.TaskRunning, m[1]+"%", 0, "", "")
+		}
+	}
+	tailFile := func() {
+		lr, err := os.Open(logPath)
+		if err != nil {
+			return
+		}
+		defer lr.Close()
+		rs.mu.Lock()
+		off := rs.off
+		rs.mu.Unlock()
+		st, serr := lr.Stat()
+		if serr != nil || st.Size() <= off {
+			return
+		}
+		if _, err := lr.Seek(off, 0); err != nil {
+			return
+		}
+		data := make([]byte, st.Size()-off)
+		n, _ := io.ReadFull(lr, data)
+		chunk := rs.carry + string(data[:n])
+		lines := strings.Split(chunk, "\n")
+		rs.mu.Lock()
+		rs.carry = lines[len(lines)-1]
+		rs.off += int64(n)
+		rs.mu.Unlock()
+		for _, ln := range lines[:len(lines)-1] {
+			handleLine(ln)
+		}
+	}
+	tailStop := make(chan struct{})
+	tailDone := make(chan struct{})
+	go func() {
+		defer close(tailDone)
+		t := time.NewTicker(2 * time.Second)
+		defer t.Stop()
+		for {
+			select {
+			case <-tailStop:
+				// 收尾模式：持续读文件至 EOF 稳定（无新增长且偏移不变）才退出。
+				tailFile() // 收尾冲刷最后一段（含无换行的尾部）
+				for {      // 持续读到 EOF 稳定，确保汇总数据完整
+					rs.mu.Lock()
+					off := rs.off
+					beforeOut := rs.out.Len()
+					rs.mu.Unlock()
+					st, serr := os.Stat(logPath)
+					if serr != nil || st.Size() <= int64(off) {
+						return
+					}
+					tailFile()
+					rs.mu.Lock()
+					afterOut := rs.out.Len()
+					rs.mu.Unlock()
+					if afterOut == beforeOut && rs.off == off {
+						return
+					}
+				}
+			case <-t.C:
+				tailFile()
+			}
+		}
+	}()
+
+	// 控制标志轮询（~2s）：API 只写 control 列，这里消费并转成进程信号。
+	quit := make(chan struct{})
+	go func() {
+		t := time.NewTicker(2 * time.Second)
+		defer t.Stop()
+		for {
+			select {
+			case <-quit:
+				return
+			case <-runCtx.Done():
+				return
+			case <-t.C:
+			}
+			// §运行时熔断：任务跑着跑着把系统内存吃到危急线（如夜间排水撞上其他占用）
+			// ——主动抢占自己落 preempted，断点续跑；绝不拖垮 SSH/caddy/quant。
+			// 阈值=总闸一半（默认200MB）：入口闸放行后环境恶化时这里是最后一道防线。
+			// §W4-b 运行时熔断阈值从配置派生：入口闸 min_free_mem_mb 可配，
+			// 最后防线取其一半（默认 400/2=200 与旧行为一致），不再与入口闸脱钩。
+			floorSrc := cfg.MinFreeMemMB // §W4-b：与入口闸同一配置源（外层 tick 持有 cfg）
+			if floorSrc <= 0 {
+				floorSrc = memGateDefaultMB
+			}
+			runtimeFloor := floorSrc / 2
+			if av := readMemAvailableMB(); av >= 0 && av < runtimeFloor {
+				log.Printf("[scheduler] 运行时熔断：MemAvailable=%dMB < %dMB，抢占当前任务 #%d(%s) 留队续跑",
+					av, runtimeFloor, tk.ID, tk.Type)
+				opslog.Logf("research", "运行时熔断抢占 #%d(%s) MemAvailable=%dMB<%dMB", tk.ID, tk.Type, av, runtimeFloor)
+				s.preemptCurrent("系统内存危急(运行时熔断)")
+			}
+			// 消费任务控制指令：暂停/恢复/取消三种状态机切换。
+			c, err := db.ConsumeTaskControl(tk.ID)
+			if err != nil || c == "" {
+				continue
+			}
+			switch c {
+			case store.ControlPause:
+				s.mu.Lock()
+				paused := s.paused
+				s.mu.Unlock()
+				if !paused && cmd.Process != nil {
+					pauseProcess(cmd)
+					s.mu.Lock()
+					s.paused = true
+					s.mu.Unlock()
+					rs.mu.Lock()
+					pg := rs.progress
+					rs.mu.Unlock()
+					_ = db.UpdateTaskRunState(tk.ID, store.TaskPaused, pg, 0, "", "")
+				}
+			case store.ControlResume:
+				s.mu.Lock()
+				paused := s.paused
+				if !paused {
+					s.mu.Unlock()
+					continue
+				}
+				s.paused = false
+				s.lastProgress = time.Now().Unix()
+				s.mu.Unlock()
+				if cmd.Process != nil {
+					resumeProcess(cmd)
+				}
+				rs.mu.Lock()
+				pg := rs.progress
+				rs.mu.Unlock()
+				_ = db.UpdateTaskRunState(tk.ID, store.TaskRunning, pg, 0, "", "")
+			case store.ControlCancel:
+				s.mu.Lock()
+				s.cancelReq = true
+				s.mu.Unlock()
+				killProcessGroup(cmd)
+			}
+		}
+	}()
+
+	// 看门狗：所有「已对齐进度协议」的任务启用进度停滞保护，避免单个卡死任务长期霸占
+	// 唯一 busy 槽、饿死整条队列（"一直卡排队"根因之一：低优先级夜间/战法库回放任务挂死时，
+	// 旧逻辑仅高优先级有看门狗，低优先级只能等单步硬超时(90min~3h)才被回收，期间全队停滞）。
+	// 高优先级手动任务更敏感（30min）；低优先级夜间任务放宽至单步硬超时的 2/3
+	// （默认 90min 超时→60min；战法库回放 3h→120min）。
+	// 仅对已对齐进度协议（回测进度/发现进度/参数优化进度）的类型启用——其余类型
+	// （dataload/sector_rebuild/list 等）未输出匹配进度行，仍靠单步硬超时兜底，避免误杀健康长任务。
+	// English: stall watchdog now covers progress-emitting tasks of any priority, so a hung task
+	// cannot starve the single-slot queue; types without a matching progress protocol keep relying
+	// on the per-step hard timeout instead.
+	watchTypes := map[string]bool{
+		store.TaskBacktestCandidate: true, store.TaskBacktestNightly: true,
+		store.TaskBacktestStrategy: true, // library 回放 emit 回测进度；optimize 经 sweep 输出"参数优化进度"
+		store.TaskDiscoverFactors:  true, store.TaskDiscoverPatterns: true,
+	}
+	stallSecs := 30 * 60
+	if tk.Priority != "high" {
+		// low 夜间任务：以单步硬超时的 2/3 为停滞阈值。
+		// §质控全量回放：TaskBacktestStrategy 单步已放宽至 6h，停滞阈值随其 2/3
+		// （4h）联动，不再硬编码 120min——全市场质控池回放合法耗时可达数小时，
+		// 硬编码会误杀仍在产出"回测进度 xx%"的健康长任务。
+		// English: low-priority stall threshold rides 2/3 of the (6h, for replays) step timeout,
+		// so legitimate multi-hour full-market replays aren't killed while emitting progress.
+		if timeout > 0 {
+			stallSecs = int(timeout.Seconds() * 2 / 3)
+		} else {
+			stallSecs = 60 * 60
+		}
+	}
+	if watchTypes[tk.Type] {
+		watchStop := make(chan struct{})
+		go func() {
+			t := time.NewTicker(time.Minute)
+			defer t.Stop()
+			for {
+				select {
+				case <-watchStop:
+					return
+				case <-runCtx.Done():
+					return
+				case <-t.C:
+					s.mu.Lock()
+					stalled := !s.paused && !s.cancelReq && !s.preemptReq &&
+						time.Now().Unix()-s.lastProgress > int64(stallSecs)
+					s.mu.Unlock()
+					if stalled {
+						log.Printf("[scheduler] 任务 #%d 进度停滞>%dm，看门狗终止（腾出队列槽位）", tk.ID, stallSecs/60)
+						killProcessGroup(cmd)
+						return
+					}
+				}
+			}
+		}()
+		defer close(watchStop)
+	}
+
+	waitErr := cmd.Wait()
+	close(tailStop)
+	<-tailDone
+	cancel() // 唤醒可能阻塞在 select 的控制轮询 goroutine
+
+	rs.mu.Lock()
+	progress := rs.progress
+	fullOut := rs.out.String()
+	rs.mu.Unlock()
+	if progress == "" {
+		progress = "100%"
+	}
+
+	// 终态判定（优先级：抢占 > 用户取消 > 单步超时 > 运行错误 > 成功）
+	// §失败重排队：超时/运行错误不再落 error 终态——统一回队尾重试（异因不设上限），
+	// error 列记最后一次失败原因；仅用户取消保持终态。
+	// §M14 同因连败达阈值时 RequeueFailedTask 不再回队，改挂起 failed_needs_attention+告警。
+	status := store.TaskDone
+	errMsg := ""
+	var resultNum float64
+	resultText := ""
+	s.mu.Lock()
+	preempted, cancelled := s.preemptReq, s.cancelReq
+	s.mu.Unlock()
+	switch {
+	case preempted:
+		status = store.TaskPreempted
+		errMsg = "被抢占或会话终止，断点缓存有效（盘后自动回队续跑）"
+	case cancelled:
+		status = store.TaskCancelled
+		errMsg = "用户取消"
+	case runCtx.Err() == context.DeadlineExceeded && base.Err() == nil:
+		status = store.TaskFailedRetry
+		errMsg = fmt.Sprintf("单步超时(%v)，已回队尾重试", timeout)
+	case base.Err() != nil:
+		// §停机语义修正：调度器 ctx 取消（SIGTERM/restart）→ preempted，断点续跑
+		status = store.TaskPreempted
+		errMsg = "调度器停止，断点缓存有效（下次启动自动回队续跑）"
+	case waitErr != nil:
+		// §RFIX-5 确定性崩溃 fail-fast：子进程输出带 panic/fatal error 特征时，同输入
+		// 必然复现，回队重试只会整晚重复烧 CPU（生产实录：backtest_strategy 每晚 5 次
+		// ×40 分钟重试全损 + 单夜 ~90MB goroutine 栈日志）——直接落终态 error，
+		// error 列截存崩溃首行供排障；网络/数据类失败维持回队语义不变。
+		if crash := crashMarkerLine(fullOut); crash != "" {
+			status = store.TaskError
+			errMsg = "确定性崩溃，未回队: " + crash
+		} else {
+			status = store.TaskFailedRetry
+			// §M14 失败原因带上子进程最后一行输出：exit status 本身分不出「参数非法/数据必缺/
+			// 瞬断」，而 error 列正是同因连败熔断的指纹来源——不带原因，异因会被误判同因误伤。
+			errMsg = fmt.Sprintf("运行失败(%v)%s，已回队尾重试", waitErr, failReasonOf(fullOut))
+		}
+	}
+	if status == store.TaskDone {
+		switch tk.Type {
+		case store.TaskBacktestCandidate, store.TaskBacktestNightly:
+			if m := avgExcessRe.FindStringSubmatch(fullOut); len(m) == 2 {
+				resultNum, _ = strconv.ParseFloat(m[1], 64)
+			}
+			// §RFIX-4 空转步显性化：夜间配对回测无待验候选时秒完（started==finished），
+			// 旧行为 result_text 空白、观感同任务丢失——补明确文案（仅文案，无逻辑变化）。
+			if tk.Type == store.TaskBacktestNightly && strings.Contains(fullOut, "无可回测的因子候选") {
+				resultText = "无待验候选，跳过"
+			}
+		case store.TaskBacktestStrategy:
+			if strings.Contains(fullOut, "SWEEP_JSON:") {
+				// §P2 扫参任务：SWEEP_JSON 解析后 TOP-N 落 optimization_results，
+				// 并把冠军参数与核心结论整理进 result_text（替代原先仅截取前 100 字符的占位日志）。
+				resultText = buildOptimizeSummary(fullOut)
+				s.saveSweepResults(db, tk.ID, fullOut)
+			} else {
+				log.Printf("[scheduler] 任务 #%d 未检测到 SWEEP_JSON（fullOut len=%d, 前100=%q）",
+					tk.ID, len(fullOut), fullOut[:min(len(fullOut), 100)])
+				resultText = parseBtSummary(fullOut)
+			}
+		}
+	}
+	// 先落运行终态，再做状态翻转（顺序不可换：Requeue* 的 WHERE 依赖前置状态，
+	// 且翻转后不得再被 Update 覆盖回去——否则盘后门控会把 preempted 无限重启）。
+	if status != store.TaskFailedRetry {
+		if err := db.UpdateTaskRunState(tk.ID, status, progress, resultNum, resultText, errMsg); err != nil {
+			log.Printf("[scheduler] 任务 #%d 终态落库失败: %v", tk.ID, err)
+		}
+	}
+	if status == store.TaskPreempted {
+		_ = db.RequeueTask(tk.ID) // preempted → queued（队首优先级由出队排序保证）
+	}
+	if status == store.TaskFailedRetry {
+		// §失败重排队：回队尾（updated_at 沉底），error 列留最后失败原因，冷却后重试。
+		// 状态落库交给 RequeueFailedTask 一步完成（避免中间态被 peek 到）。
+		// §M14：该步内 store 同步做同因连败计数，达阈值直接挂起不再回队——
+		// 回队落库后立即检测挂起态并告警留痕。
+		if err := db.RequeueFailedTask(tk.ID, errMsg); err != nil {
+			log.Printf("[scheduler] 任务 #%d 失败回队落库失败: %v", tk.ID, err)
+			_ = db.UpdateTaskRunState(tk.ID, store.TaskError, "", 0, "", errMsg)
+		}
+		s.noteFailure(tk.ID)
+	} else if status == store.TaskDone || status == store.TaskCancelled {
+		s.clearFailure(tk.ID) // 成功/取消清除冷却记录
+	}
+	log.Printf("[scheduler] 任务 #%d(%s) -> %s%s", tk.ID, tk.Type, status, tailOf(errMsg))
+	opslog.Logf("research", "任务 #%d(%s) 终态=%s%s", tk.ID, tk.Type, status, tailOf(errMsg))
+	s.finishTask(db, cfg, &tk, status, errMsg)
+	if status == store.TaskFailedRetry {
+		// §M14 熔断挂起检测：置于链收尾之后——挂起时把展示态覆盖为 needs_attention 并高优告警一次。
+		s.notifySameCauseBreaker(db, &tk, errMsg)
+	}
+}
+
+// failRetryCooldown §失败重排队防自旋冷却窗：刚失败回队的任务在此窗口内不出队。
+// English: cooldown window before a requeued failed task may start again (anti busy-spin).
+const failRetryCooldown = 5 * time.Minute
+
+// noteFailure 记录任务失败时间（冷却起点）。
+func (s *Scheduler) noteFailure(taskID int64) {
+	s.mu.Lock()
+	if s.failCool == nil {
+		s.failCool = make(map[int64]time.Time)
+	}
+	s.failCool[taskID] = s.nowTime()
+	s.mu.Unlock()
+}
+
+// clearFailure 成功/取消后清除冷却记录（并防 map 慢性增长）。
+func (s *Scheduler) clearFailure(taskID int64) {
+	s.mu.Lock()
+	delete(s.failCool, taskID)
+	s.mu.Unlock()
+}
+
+// notifySameCauseBreaker §M14（2026-09-22）同因连败熔断挂起处理：每次失败回队落库后重读
+// 任务行，若 store 侧已按「同指纹连败达阈值」将其挂为 failed_needs_attention（不再回队），则：
+//   - opslog/日志双留痕（error 列本身含「同因连败熔断」标记，挂起可审计）；
+//   - 清除冷却表占位（挂起终态不会再被出队，留着只占内存）；
+//   - state 文件记 needs_attention（前端 /api/research/progress 可见）；
+//   - 经 SetAlertFunc 注入的推送通道高优告警一次——挂起是瞬时跃迁（queued→挂起只发生
+//     在触阈值那一次 RequeueFailedTask），天然去重，不会每轮重复告警。
+//
+// English: M14 — after each failed-requeue write, detect the same-cause breaker trip
+// (failed_needs_attention) and leave an audit trail + fire the one-shot ops alert.
+func (s *Scheduler) notifySameCauseBreaker(db *store.DB, tk *store.ResearchTask, errMsg string) {
+	cur, err := db.GetResearchTask(tk.ID)
+	if err != nil || cur == nil || cur.Status != store.TaskNeedsAttention {
+		return // 常态：任务已回队尾重试，无需熔断处理
+	}
+	log.Printf("[scheduler] §M14 任务 #%d(%s) 同因 %d 连败→熔断挂起（failed_needs_attention，不再重排队，待人工 Requeue）",
+		tk.ID, tk.Type, cur.FailStreak)
+	opslog.Logf("research", "§M14 任务 #%d(%s) 同因连败熔断挂起（%d 连败，高优告警已发）: %s",
+		tk.ID, tk.Type, cur.FailStreak, cur.Error)
+	s.clearFailure(tk.ID)
+	s.recordStepState(tk.Type, "needs_attention", cur.Error)
+	s.mu.Lock()
+	fn := s.alertFn
+	s.mu.Unlock()
+	if fn != nil {
+		fn("研究任务同因连败熔断", fmt.Sprintf("任务 #%d(%s) 连续 %d 次同因失败已挂起，不再重排队（原因：%s）。请排查后经 RequeueTask 人工复活。",
+			tk.ID, tk.Type, cur.FailStreak, tailOf(errMsg)))
+	}
+}
+
+// failReasonOf §M14 取子进程输出最后一行非空文本作为失败原因后缀（形如「：xxx」，
+// 按 rune 截 200 字符防超长堆栈洗指纹）。error 列是同因连败熔断的指纹来源，必须能
+// 区分「参数非法 / 数据必缺 / 网络瞬断」等可观察原因，而不是只剩 exit status。
+func failReasonOf(out string) string {
+	lines := strings.Split(out, "\n")
+	for i := len(lines) - 1; i >= 0; i-- {
+		ln := strings.TrimSpace(lines[i])
+		if ln == "" {
+			continue
+		}
+		if r := []rune(ln); len(r) > 200 {
+			ln = string(r[:200])
+		}
+		return "：" + ln
+	}
+	return ""
+}
+
+// stackTrace 当前 goroutine 堆栈（panic 日志用）。
+func stackTrace() string {
+	return string(debug.Stack())
+}
+
+// finishTask 任务收尾：展示状态上报 + 链治理（AbortOnError 取消同链剩余；链排空置 Done）。
+func (s *Scheduler) finishTask(db *store.DB, cfg config.SchedulerConfig, tk *store.ResearchTask, status, errMsg string) {
+	// 展示兼容映射：preempted/cancelled 对外沿用旧语义 "interrupted"。
+	disp := status
+	switch status {
+	case store.TaskPreempted, store.TaskCancelled:
+		disp = "interrupted"
+	case store.TaskPaused:
+		disp = "paused"
+	case store.TaskFailedRetry:
+		disp = "retrying" // §失败重排队：对外展示重试中（任务仍在队列）
+	}
+	s.recordStepState(tk.Type, disp, errMsg)
+
+	if tk.ChainDay == "" {
+		return
+	}
+	// §失败重排队：链步骤失败同样触发 AbortOnError——失败步骤回队尾重试直至成功，
+	// 后续步骤取消（避免用残缺数据继续跑；次日链自动重建）。
+	if (status == store.TaskError || status == store.TaskFailedRetry) && cfg.Nightly.AbortOnError {
+		if n, err := db.CancelChainTasks(tk.ChainDay); err == nil && n > 0 {
+			log.Printf("[scheduler] AbortOnError：取消同链 %s 剩余 %d 个任务", tk.ChainDay, n)
+		}
+	}
+	active, err := db.ActiveResearchTasks()
+	if err != nil {
+		return
+	}
+	for _, t := range active {
+		if t.ChainDay == tk.ChainDay {
+			return // 链尚未排空
+		}
+	}
+	s.mu.Lock()
+	if s.state.Day == tk.ChainDay {
+		s.state.Done = true
+	}
+	s.mu.Unlock()
+	s.saveState()
+	log.Printf("[scheduler] 夜间链 %s 已全部完成", tk.ChainDay)
+	opslog.Logf("research", "夜间链 %s 全部完成", tk.ChainDay)
+}
+
+// recordStepState 把任务结果写入状态文件（前端 /api/research/progress 可见，排障用）。
+// §M14 测试缝：stepStateObserver 非 nil 时同步收到本次留痕（生产为 nil，零开销）。
+func (s *Scheduler) recordStepState(step, status, errMsg string) {
+	s.mu.Lock()
+	s.state.LastStep = step
+	s.state.LastStatus = status
+	s.state.LastError = errMsg
+	s.state.LastAt = time.Now().Format("2006-01-02 15:04:05")
+	obs := s.stepStateObserver
+	s.mu.Unlock()
+	if obs != nil {
+		obs(step, status, errMsg)
+	}
+	s.saveState()
+}
+
+// tailOf 日志拼接用：错误信息非空时包一层全角括号，空串原样返回。
+func tailOf(msg string) string {
+	if msg == "" {
+		return ""
+	}
+	return "（" + msg + "）"
+}
+
+// crashMarkerLine §RFIX-5 确定性崩溃特征提取：在子进程合并输出中寻找 Go 运行时崩溃
+// 首行（`panic: runtime error:` / `fatal error:`），返回「首行 + 首个仓库栈帧」的短摘要
+// （≤300 字节）；无特征返回空串（普通非零退出仍按可重试失败回队）。
+// 说明：任务日志行带 `[task#id:type]` 前缀，特征匹配按行扫描不受前缀影响。
+func crashMarkerLine(out string) string {
+	lines := strings.Split(out, "\n")
+	for i, ln := range lines {
+		idx := strings.Index(ln, "panic: runtime error:")
+		if idx < 0 {
+			idx = strings.Index(ln, "fatal error:")
+		}
+		if idx < 0 {
+			continue
+		}
+		head := strings.TrimSpace(ln[idx:])
+		// 附带首个仓库栈帧行（下一非空且含 .go: 的行），定位崩溃点免翻日志。
+		frame := ""
+		for j := i + 1; j < len(lines) && j <= i+6; j++ {
+			if s := strings.TrimSpace(lines[j]); strings.Contains(s, ".go:") {
+				frame = s
+				break
+			}
+		}
+		msg := head // head 自带 "panic: runtime error:"/"fatal error:" 前缀，不再叠加级别标签
+		if frame != "" {
+			msg += " @ " + frame
+		}
+		if len(msg) > 300 {
+			msg = msg[:300]
+		}
+		return msg
+	}
+	return ""
+}
+
+// execDataload 交易时段增量下载直连通道（不入研究队列；只下载绝不研究）。
+// English: intraday incremental dataload lane — direct execution, never queued with research.
+func (s *Scheduler) execDataload(ctx context.Context, cfg config.SchedulerConfig, now time.Time) error {
+	tk := &store.ResearchTask{Type: store.TaskDataload}
+	bin, args, err := s.taskCommand(cfg, tk)
+	if err != nil {
+		return err
+	}
+	timeout := time.Duration(cfg.StepTimeoutMin) * time.Minute
+	if timeout <= 0 {
+		timeout = 90 * time.Minute
+	}
+	stepCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	cmd := exec.CommandContext(stepCtx, bin, args...)
+	cmd.Dir = dirOfDB(cfg)
+	logger := &lineLogger{prefix: "[dataload] "}
+	cmd.Stdout = logger
+	cmd.Stderr = logger
+	log.Printf("[dataload] 交易时段增量下载启动")
+	if err := cmd.Start(); err != nil {
+		return fmt.Errorf("启动 dataload: %w", err)
+	}
+	if err := cmd.Wait(); err != nil {
+		logger.flush()
+		if stepCtx.Err() == context.DeadlineExceeded && ctx.Err() == nil {
+			return fmt.Errorf("dataload 单步超时(%v): %w", timeout, err)
+		}
+		return err
+	}
+	logger.flush()
+	return nil
+}
