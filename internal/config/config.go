@@ -80,6 +80,9 @@ type Rules struct {
 	Paper PaperConfig `json:"paper"`
 	// 东莞证券 MiniQMT 实盘交易配置
 	QMT QMTConfig `json:"qmt"`
+	// §BINANCE-P1 rules.binance 段：币安双市场（stock=美股/spot=加密货币）配置。
+	// 出厂缺省 enabled=false（发布闸：新市场缺省不接通），QMT 链零影响。
+	Binance BinanceConfig `json:"binance,omitempty"`
 	// AppRelease §APPVER 2026-09-22 C批：APK 服务端驱动强制更新发布单（公开端点
 	// GET /api/app/version 的唯一数据源）。零值=未发布（min=0 时客户端不拦，行为与无此
 	// 配置完全一致）；强制更新自 versionCode≥2 的 APK 起生效（v1 包不发版本头、无法自报
@@ -2063,6 +2066,9 @@ func (m *Manager) Load() {
 	}
 	if wrapper.Rules != nil {
 		m.Rules = wrapper.Rules
+		// §BINANCE-P1：老文件没有 binance 段时整段零值——只回填 Binance 子段缺省，
+		// 不动其他段（QMT 零值语义原样，CN 链零回归）。
+		NormalizeBinance(&m.Rules.Binance)
 	}
 	if wrapper.D1 != nil {
 		m.D1 = wrapper.D1
@@ -2478,7 +2484,9 @@ var DefaultRules = &Rules{
 	Scheduler: DefaultSchedulerConfig(),
 	Paper:     PaperConfig{Enabled: false, FixedAmount: 10000, MaxPositions: 10, InitialCapital: 100000, Discipline: DefaultDisciplineConfig()},
 	QMT:       DefaultQMTConfig(),
-	Runtime:   RuntimeConfig{TrimAfterHours: true, TrimIntervalMin: 15, ReviewMaxStocks: 24},
+	// §BINANCE-P1 出厂缺省：总开关关（发布闸），字段形状齐备（老 config.json 无 binance 段时行为一致）。
+	Binance: DefaultBinanceConfig(),
+	Runtime: RuntimeConfig{TrimAfterHours: true, TrimIntervalMin: 15, ReviewMaxStocks: 24},
 }
 
 // DefaultDisciplineConfig 统一止盈止损纪律的出厂默认（可后台配置覆盖）：

@@ -85,7 +85,7 @@ func TestUnifiedSellViewsT1Downgrade(t *testing.T) {
 			Disposal: &signalctl.SellDisposal{Code: "600519.SH", Action: signalctl.SellActionClose, Line: signalctl.SellLineStopLoss, Reason: "深破"},
 		}},
 	}
-	sellable := map[string]int{"600000.SH": 0, "600519.SH": 200}
+	sellable := map[string]float64{"600000.SH": 0, "600519.SH": 200}
 	views := e.unifiedSellViews(positions, verdicts, sellable)
 	if len(views) != 2 {
 		t.Fatalf("应投影 2 条，得 %d", len(views))

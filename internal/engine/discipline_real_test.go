@@ -145,12 +145,12 @@ func TestRealSoldOrOpenQtyInflight(t *testing.T) {
 		t.Fatal(err)
 	}
 	if got := e.realSoldOrOpenQtyToday(db, userID, "600000.SH"); got != 500 {
-		t.Fatalf("在途止损 500 应全额占额度, got %d", got)
+		t.Fatalf("在途止损 500 应全额占额度, got %v", got)
 	}
 	// 场景 B：终态（废单）与「发送失败」占位行不占额度（各用独立幂等键，signal_id 唯一约束）
 	for i, st := range []struct {
 		status, class string
-		qty           int
+		qty           float64
 	}{{"废单", "m8", 300}, {"发送失败", "止盈", 400}} {
 		o := store.RealOrder{
 			OrderID: fmt.Sprintf("GW-T%d", i), SignalID: realSellSignalID("600000.SH", st.class),
@@ -162,7 +162,7 @@ func TestRealSoldOrOpenQtyInflight(t *testing.T) {
 		}
 	}
 	if got := e.realSoldOrOpenQtyToday(db, userID, "600000.SH"); got != 500 {
-		t.Fatalf("终态/发送失败不得占额度（仍应=500）, got %d", got)
+		t.Fatalf("终态/发送失败不得占额度（仍应=500）, got %v", got)
 	}
 	// 场景 C：止盈类已成交量计入（§P0-3 fullCloseClasses 补止盈）
 	if err := db.ApplyRealFill(store.RealFill{OrderID: "GW-TP", Code: "600000.SH", Side: "卖出",
@@ -171,7 +171,7 @@ func TestRealSoldOrOpenQtyInflight(t *testing.T) {
 		t.Fatal(err)
 	}
 	if got := e.realSoldOrOpenQtyToday(db, userID, "600000.SH"); got != 600 {
-		t.Fatalf("止盈已成交 100 必须并入全平类扣减（500在途+100已成）, got %d", got)
+		t.Fatalf("止盈已成交 100 必须并入全平类扣减（500在途+100已成）, got %v", got)
 	}
 }
 

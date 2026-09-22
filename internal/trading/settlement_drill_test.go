@@ -87,7 +87,7 @@ func TestSettleSyncFillsDrillRealGateway(t *testing.T) {
 		}
 	}
 	if pos, _ := db.RealPositionByCodeForUser("u_drill", "600519.SH"); pos.Qty != 100 {
-		t.Fatalf("重放后持仓仍须恰为 100（双倍入账回归）, got %d", pos.Qty)
+		t.Fatalf("重放后持仓仍须恰为 100（双倍入账回归）, got %v", pos.Qty)
 	}
 	fills, err := db.ListFillsByDay("u_drill", "2026-09-08")
 	if err != nil {
@@ -105,7 +105,7 @@ func TestSettleSyncFillsDrillRealGateway(t *testing.T) {
 		t.Fatalf("重放补记应幂等成功: %v", err)
 	}
 	if pos, _ := db.RealPositionByCodeForUser("u_drill", "600519.SH"); pos.Qty != 100 {
-		t.Fatalf("重放补记不得二次累加持仓, got %d", pos.Qty)
+		t.Fatalf("重放补记不得二次累加持仓, got %v", pos.Qty)
 	}
 	if f2, _ := db.ListFillsByDay("u_drill", "2026-09-08"); len(f2) != 2 {
 		t.Fatalf("重放补记不得重复入流水, got %d", len(f2))

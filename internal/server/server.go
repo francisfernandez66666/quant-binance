@@ -632,6 +632,11 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("GET /api/config/qmt", s.adminMiddleware(s.handleGetQMTConfig))
 	s.mux.HandleFunc("POST /api/config/qmt", s.adminMiddleware(s.handleSetQMTConfig))
 
+	// §BINANCE-P1 币安双市场配置（PLAN §6 端点表）：运营数据归属管理员，读写鉴权同 /api/config/qmt 口径；
+	// 凭证脱敏回显，持久化走独立 per-user 键 binance_config_json_v1。
+	s.mux.HandleFunc("GET /api/config/binance", s.adminMiddleware(s.handleGetBinanceConfig))
+	s.mux.HandleFunc("POST /api/config/binance", s.adminMiddleware(s.handleSetBinanceConfig))
+
 	// 模拟盘（纸面交易）：运营数据统一归属管理员（系统级共享），仅管理员可读写；
 	// 子账号不操作模拟盘，后端鉴权，前端只负责展示与交互。
 	// （Paper trading is operator-owned: admin-only read+write.）

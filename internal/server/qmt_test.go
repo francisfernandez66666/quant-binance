@@ -523,7 +523,7 @@ func TestHandleQMTReportPositionsClearGuard(t *testing.T) {
 		t.Fatalf("非空快照应 200, got %d: %s", rr.Code, rr.Body.String())
 	}
 	// ③ 本地已无仓（清到空后）→ 空快照放行
-	if _, err := db.ReconcilePositionsForUser("", nil); err != nil {
+	if _, err := db.ReconcilePositionsForUser("", "CN", nil); err != nil {
 		t.Fatalf("flatten: %v", err)
 	}
 	rr = httptest.NewRecorder()

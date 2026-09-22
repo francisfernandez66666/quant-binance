@@ -411,7 +411,7 @@ func (s *Server) handleExecuteAction(w http.ResponseWriter, r *http.Request) {
 	if side == trading.SideSell {
 		if db := s.realDB(); db != nil {
 			// 只在能查到持仓且持仓 >0 时校验（DB 不可用/无持仓行时放行给引擎/网关裁决）。
-			if p, err := db.RealPositionByCodeForUser(uid, normalizeTsCode(req.Code)); err == nil && p.Qty > 0 && qty > p.Qty {
+			if p, err := db.RealPositionByCodeForUser(uid, normalizeTsCode(req.Code)); err == nil && p.Qty > 0 && float64(qty) > p.Qty {
 				writeError(w, 400, "sell qty exceeds holding")
 				return
 			}
@@ -456,7 +456,7 @@ func (s *Server) handleExecuteAction(w http.ResponseWriter, r *http.Request) {
 		Side:      side,
 		PriceType: ctrl.Config().PriceType,
 		Price:     req.Price,
-		Qty:       qty,
+		Qty:       float64(qty), // §P1-d 手动委托入口暂留 int（CN 整手语义）
 		Amount:    float64(qty) * req.Price,
 		CreatedAt: time.Now().Format(time.RFC3339),
 	}
@@ -521,6 +521,19 @@ func normalizeReportSide(raw string) (string, error) {
 	return "", fmt.Errorf("未知回报方向(side=%q)", raw)
 }
 
+// normalizeReportMarket §BINANCE-P1c（PLAN §5.2 报告契约）：回报市场串归一。
+// 存量 qmt_gateway 不发 market 字段（解码为空）→ CN；未知市场串大写原样保留，
+// 合法性由 store 侧 validTsCode(market, code) 兜底（不认识的市场按 CN 口径校验即拒收）。
+// English: normalizeReportMarket — legacy gateways omit `market` (decoded empty) → CN;
+// code legality stays enforced store-side by validTsCode per market.
+func normalizeReportMarket(raw string) string {
+	m := strings.ToUpper(strings.TrimSpace(raw))
+	if m == "" {
+		return "CN"
+	}
+	return m
+}
+
 // qmtReportEvent 网关回报（POST /api/qmt/report）的载荷结构。
 // §F2（2026-09-22 修复批）：由 handleQMTReport 内匿名结构升级为具名类型——回报字段面是
 // Go↔网关的对外契约，golden 回归测（report_contract_test.go ↔ qmt_gateway/contract/
@@ -542,7 +555,7 @@ type qmtReportEvent struct {
 	Side     string  `json:"side"`
 	Status   string  `json:"status"`
 	Price    float64 `json:"price"`
-	Qty      int     `json:"qty"`
+	Qty      float64 `json:"qty"` // §P1-d int→float64：JSON int 照常解析，CN 网关零改动
 	Amount   float64 `json:"amount"`
 	TradedAt string  `json:"traded_at"`
 	// CreatedAt §M4：order 回报的委托创建时间。网关 on_stock_order 一直同时发 at 与
@@ -557,6 +570,12 @@ type qmtReportEvent struct {
 	StampTax  float64              `json:"stamp_tax"` // 印花税（卖方单边，缺=0）
 	Positions []store.RealPosition `json:"positions"`
 	Asset     map[string]float64   `json:"asset"` // §可用资金：账户资产（cash/frozen_cash/total_asset/market_value）
+	// Market §BINANCE-P1c（PLAN §5.2 报告契约）：本条回报的归属市场 CN|US|CRYPTO。
+	// 存量 qmt_gateway 不发该字段 → 解码为零值 → 服务端归一为 CN，兼容零改动；
+	// 币安通道回报自带 market，positions 全量对账/成交/委托落库都按此盖章并做市场隔离删除。
+	// English: §BINANCE-P1c — market of this report; legacy QMT gateways omit it and the
+	// server normalizes the zero value to CN (byte-compatible), Binance channels send it explicitly.
+	Market    string               `json:"market"`
 	At        string               `json:"at"`
 	UserID    string               `json:"user_id"` // §GAP1.10 网关配置的归属账号
 	Broker    string               `json:"broker"`  // §QMT-DUAL 通道切换事件：目标通道
@@ -598,6 +617,15 @@ func (s *Server) handleQMTReport(w http.ResponseWriter, r *http.Request) {
 		// 忽略 body 携带的 user_id——防止持有 A 账号网关 token 者借 ev.UserID 越权写入/清空任意账号持仓。
 		// 此前"网关 user_id > token uid"的优先级是越权写面。
 		owner := uid
+		// §BINANCE-P1c：本条回报的市场（存量 QMT 网关不带该字段 → 归一 CN，零改动兼容）。
+		// positions 的空快照守卫与全量对账都限定在这一市场内：币安快照清空不得波及
+		// CN 持仓行（反之亦然），409 守卫的"本地有仓"判定同样只看同市场行。
+		// English: P1c — market of this report (legacy gateways normalize to CN); the empty-snapshot
+		// guard and the reconciliation delete-scope are both market-scoped.
+		market := strings.ToUpper(strings.TrimSpace(ev.Market))
+		if market == "" {
+			market = "CN"
+		}
 		// §AUDIT-PM 2026-09-15 空快照纵深守卫（第三层）：positions 语义是全量替换，而 broker.py
 		// 在通道断连时同样返回空列表——若仅靠 网关token(第一层)+网关 clear_guard(第二层)，
 		// Go 侧一个畸形/伪造的空数组仍会清空本账号持仓。规则：本地该账号仍有持仓而快照为空 →
@@ -606,23 +634,32 @@ func (s *Server) handleQMTReport(w http.ResponseWriter, r *http.Request) {
 		// 注意守卫只对"空快照"生效——非空快照仍按全量 reconcile 正常落账。
 		if len(ev.Positions) == 0 {
 			// 先查本地该账号当前持仓：仍有持仓却收到空快照 → 判定不可信。
-			if held, herr := db.RealPositionsForUser(owner); herr == nil && len(held) > 0 {
-				// 三路告警：服务端日志 + 运维日志 + 定向前端 SSE（positions_clear_guard 事件）。
-				log.Printf("[trading] ⚠ positions 空快照但本地仍有 %d 持仓(用户=%s)——判定不可信，拒绝全清", len(held), owner)
-				opslog.Logf("quant", "持仓全清守卫触发 用户=%s 本地持仓=%d 空快照被拒（若为真实全平请走成交回报/对账通道）", owner, len(held))
-				if s.sse != nil {
-					s.sse.BroadcastTo(owner, map[string]interface{}{
-						"type": "positions_clear_guard", "held": len(held),
-						"time": time.Now().Format("15:04:05"),
-					})
+			// §P1c：只统计与本回报同市场的行——另一市场的持仓不再阻断本市场的合法全平。
+			if held, herr := db.RealPositionsForUser(owner); herr == nil {
+				heldSame := 0
+				for _, h := range held {
+					if normalizeReportMarket(h.Market) == market {
+						heldSame++
+					}
 				}
-				writeError(w, 409, "positions 空快照但本地有持仓，拒绝全清（防断连空列表误清账；合法清仓走成交回报）")
-				return
+				if heldSame > 0 {
+					// 三路告警：服务端日志 + 运维日志 + 定向前端 SSE（positions_clear_guard 事件）。
+					log.Printf("[trading] ⚠ positions 空快照但本地仍有 %d 持仓(用户=%s market=%s)——判定不可信，拒绝全清", heldSame, owner, market)
+					opslog.Logf("quant", "持仓全清守卫触发 用户=%s 本地持仓=%d 空快照被拒（若为真实全平请走成交回报/对账通道）", owner, heldSame)
+					if s.sse != nil {
+						s.sse.BroadcastTo(owner, map[string]interface{}{
+							"type": "positions_clear_guard", "held": heldSame,
+							"time": time.Now().Format("15:04:05"),
+						})
+					}
+					writeError(w, 409, "positions 空快照但本地有持仓，拒绝全清（防断连空列表误清账；合法清仓走成交回报）")
+					return
+				}
 			}
 		}
 		// 守卫通过（空快照且本地确实无持仓，或非空快照）：按用户范围全量对账落库。
-		// ReconcilePositionsForUser 以本账号为界做 upsert+删除，绝不触碰其它账号数据。
-		if n, err := db.ReconcilePositionsForUser(owner, ev.Positions); err != nil {
+		// ReconcilePositionsForUser 以本账号+本市场为界做 upsert+删除，绝不触碰其它账号/其它市场数据。
+		if n, err := db.ReconcilePositionsForUser(owner, market, ev.Positions); err != nil {
 			// §F2（2026-09-22 修复批）：store 入口的字段级校验失败（任一行 ts_code 空/非法格式）
 			// → 整批拒收 400（留痕已在 store 侧 opslog 完成）。4xx 会被网关 outbox 按永久拒绝
 			// 移入死信表，不会无限重推刷屏；其余落库错误仍回 500 触发重推。
@@ -695,6 +732,8 @@ func (s *Server) handleQMTReport(w http.ResponseWriter, r *http.Request) {
 				Side: orderSide, Status: ev.Status, Price: ev.Price, Qty: ev.Qty,
 				CreatedAt: created,
 				UserID:    uid, // §W2-10 委托行打归属账号
+				// §BINANCE-P1c 委托行打市场章（存量回报缺省 CN，QMT 链零改动）。
+				Market: normalizeReportMarket(ev.Market),
 			})
 			if err != nil {
 				// §M4：状态腿落库失败绝不再吞错回 ok——500 让网关 outbox 重推（成交腿同口径）。
@@ -716,8 +755,8 @@ func (s *Server) handleQMTReport(w http.ResponseWriter, r *http.Request) {
 						return ""
 					}())
 				// §DAILY_OPSLOG 状态推进是委托生命周期的核心节点（已成/已撤/废单…）
-				opslog.Logf("quant", "委托状态推进 %s %s %s qty=%d status=%s order=%s%s",
-					orderSignalID, orderSide, ev.Code, ev.Qty, ev.Status, ev.OrderID,
+				opslog.Logf("quant", "委托状态推进 %s %s %s qty=%s status=%s order=%s%s",
+					orderSignalID, orderSide, ev.Code, store.QtyString(ev.Qty), ev.Status, ev.OrderID,
 					func() string {
 						if ev.Reason != "" {
 							return " 拒因=" + ev.Reason
@@ -752,14 +791,16 @@ func (s *Server) handleQMTReport(w http.ResponseWriter, r *http.Request) {
 			UserID: uid, // §W2-10 成交流水打归属账号（幂等键冲突时整体回滚，持仓不重复累加）
 			// §P2-FEE 20260918：成交费用腿透传入本地 fills（网关回报缺省时为 0，与旧口径一致）。
 			Fee: ev.Fee, StampTax: ev.StampTax,
+			// §BINANCE-P1c 成交打市场章（持仓定位/清仓谓词随之市场隔离；存量回报=CN）。
+			Market: normalizeReportMarket(ev.Market),
 		}); err != nil {
 			writeError(w, 500, "apply fill: "+err.Error())
 			return
 		}
-		log.Printf("[trading] 成交回报 %s %s qty=%d price=%.2f trade_id=%s", ev.Side, ev.Code, ev.Qty, ev.Price, ev.TradeID)
+		log.Printf("[trading] 成交回报 %s %s qty=%s price=%.2f trade_id=%s", ev.Side, ev.Code, store.QtyString(ev.Qty), ev.Price, ev.TradeID)
 		// §DAILY_OPSLOG 成交是每日核心记录的第一等事件（信号归因一并落档）
-		opslog.Logf("quant", "成交 %s %s qty=%d price=%.2f 金额=%.2f signal=%s order=%s",
-			tradeSide, ev.Code, ev.Qty, ev.Price, ev.Amount, ev.SignalID, ev.OrderID)
+		opslog.Logf("quant", "成交 %s %s qty=%s price=%.2f 金额=%.2f signal=%s order=%s",
+			tradeSide, ev.Code, store.QtyString(ev.Qty), ev.Price, ev.Amount, ev.SignalID, ev.OrderID)
 	case "disconnect":
 		// 断线回报 → 熔断暂停下单并告警
 		if ctrl != nil {
@@ -1471,7 +1512,7 @@ func (s *Server) handleQMTTrades(w http.ResponseWriter, r *http.Request) {
 
 	// posState 持仓累计状态：数量 + 成本 + 归属战法。
 	type posState struct {
-		qty      int
+		qty      float64 // §P1-d 重放量随 fills 转 float64
 		cost     float64
 		strategy string
 	}

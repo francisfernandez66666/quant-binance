@@ -16,10 +16,12 @@ type ShadowOrder struct {
 	StrategyID string  `json:"strategy_id,omitempty"`
 	Side       string  `json:"side"`
 	Price      float64 `json:"price"`
-	Qty        int     `json:"qty"`
+	Qty        float64 `json:"qty"`
 	Amount     float64 `json:"amount"`
 	UserID     string  `json:"user_id,omitempty"`
 	CreatedAt  string  `json:"created_at"`
+	// Market §BINANCE-P1c：影子决策归属市场（空=CN，缺省回填与存量行同口径）。
+	Market string `json:"market,omitempty"`
 }
 
 // InsertShadowOrder 写入影子下单（signal_id 幂等：已存在返回 existed=true，不重复计）。
@@ -28,11 +30,13 @@ func (d *DB) InsertShadowOrder(o ShadowOrder) (existed bool, err error) {
 	if o.CreatedAt == "" {
 		o.CreatedAt = time.Now().Format("2006-01-02 15:04:05")
 	}
+	// §P1c：market 归一（空=CN）后随列写入。
+	o.Market = normalizeMarket(o.Market)
 	res, err := d.db.Exec(`INSERT OR IGNORE INTO shadow_orders
-		(user_id, signal_id, code, name, strategy, strategy_id, side, price, qty, amount, created_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		(user_id, signal_id, code, name, strategy, strategy_id, side, price, qty, amount, created_at, market)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		o.UserID, o.SignalID, o.Code, o.Name, o.Strategy, o.StrategyID,
-		o.Side, o.Price, o.Qty, o.Amount, o.CreatedAt)
+		o.Side, o.Price, o.Qty, o.Amount, o.CreatedAt, o.Market)
 	if err != nil {
 		return false, err
 	}
@@ -41,13 +45,14 @@ func (d *DB) InsertShadowOrder(o ShadowOrder) (existed bool, err error) {
 }
 
 // ShadowOrdersForDay 返回某用户某日的影子下单明细（最新在前，limit 上限）。
+// §P1c：带出 market（COALESCE 兜底 ALTER 前的历史 NULL）。
 // English: returns a user's shadow orders for a day, newest first, capped by limit.
 func (d *DB) ShadowOrdersForDay(userID, day string, limit int) ([]ShadowOrder, error) {
 	if limit <= 0 || limit > 1000 {
 		limit = 500
 	}
 	rows, err := d.db.Query(`SELECT signal_id, code, name, strategy, COALESCE(strategy_id,''), side,
-		price, qty, amount, COALESCE(user_id,''), created_at
+		price, qty, amount, COALESCE(user_id,''), created_at, COALESCE(market,'CN')
 		FROM shadow_orders
 		WHERE (user_id = ? OR user_id = '') AND created_at LIKE ?
 		ORDER BY id DESC LIMIT ?`, userID, day+"%", limit)
@@ -59,7 +64,7 @@ func (d *DB) ShadowOrdersForDay(userID, day string, limit int) ([]ShadowOrder, e
 	for rows.Next() {
 		var o ShadowOrder
 		if err := rows.Scan(&o.SignalID, &o.Code, &o.Name, &o.Strategy, &o.StrategyID,
-			&o.Side, &o.Price, &o.Qty, &o.Amount, &o.UserID, &o.CreatedAt); err != nil {
+			&o.Side, &o.Price, &o.Qty, &o.Amount, &o.UserID, &o.CreatedAt, &o.Market); err != nil {
 			return nil, err
 		}
 		out = append(out, o)

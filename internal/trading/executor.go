@@ -35,7 +35,7 @@ type OrderRequest struct {
 	Side         string  `json:"side"`       // 买入/卖出
 	PriceType    string  `json:"price_type"` // market=对手价 / limit=限价
 	Price        float64 `json:"price"`      // 参考价（limit 时按此限价）
-	Qty          int     `json:"qty"`        // 股数（整手）
+	Qty          float64 `json:"qty"`        // 数量（§P1-d int→float64：CN 整手/US 碎股/CRYPTO stepSize，按市场取整后传入）
 	Amount       float64 `json:"amount"`     // 金额（元）
 	CreatedAt    string  `json:"created_at"` // 创建时间（RFC3339）
 	// StalenessMs §WS-C 行情快照陈旧度（毫秒；-1=未提供，StaleQuoteGuard 跳过）。由调用方（引擎）
@@ -48,6 +48,9 @@ type OrderRequest struct {
 	// (concentration gate).
 	PrevClose    float64 `json:"prev_close,omitempty"`
 	CurrentPrice float64 `json:"current_price,omitempty"`
+	// Market §P1-e 订单所属市场（""/CN=存量 QMT 链——omitempty 使 /order 报文逐字节不变，
+	// 网关契约零改动；US/CRYPTO 由 Phase 2 BrokerRouter 按此键分发到 BinanceExecutor）。
+	Market string `json:"market,omitempty"`
 }
 
 // OrderResult 下单返回（网关 → 首尔）。

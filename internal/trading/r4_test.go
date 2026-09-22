@@ -97,6 +97,17 @@ func TestSweepOrdersStaleCancel(t *testing.T) {
 
 	old := time.Now().Add(-10 * time.Minute).Format(time.RFC3339)
 	fresh := time.Now().Format(time.RFC3339)
+	// §P1-E 跨午夜锚点修复：old/fresh 一律锚定「北京当日 14:00」——§C1b 跨日清扫按
+	// created_at 日期 < 北京今日判僵尸，旧的「当前时间−10分钟」口径在午夜后 10 分钟内跑
+	// 会把种子划成前日买单被 C1b 抢先降级废单（2026-09-23 00:01 全量回归实录红点），
+	// 撤单闭环自然捞不到东西。锚定当日内时刻后日期恒等，与运行时墙钟解耦。
+	anchorDay := cntime.In(time.Now()).Format("2006-01-02")
+	anchor, aerr := time.ParseInLocation("2006-01-02 15:04:05", anchorDay+" 14:00:00", cntime.Loc)
+	if aerr != nil {
+		t.Fatalf("锚点解析: %v", aerr)
+	}
+	old = anchor.Add(-10 * time.Minute).Format(time.RFC3339)
+	fresh = anchor.Format(time.RFC3339)
 	seed := []store.RealOrder{
 		{OrderID: "GW-1", SignalID: "SIG-SW-A", Code: "600000.SH", Side: SideBuy, Status: "已报", Price: 10, Qty: 100, CreatedAt: old, UserID: "u_g"},
 		{OrderID: "GW-2", SignalID: "SIG-SW-B", Code: "600000.SH", Side: SideBuy, Status: "已报", Price: 10, Qty: 100, CreatedAt: fresh, UserID: "u_g"},
@@ -108,7 +119,7 @@ func TestSweepOrdersStaleCancel(t *testing.T) {
 			t.Fatalf("seed: %v", err)
 		}
 	}
-	res := ctrl.SweepOrders(time.Now())
+	res := ctrl.SweepOrders(anchor) // §P1-E 与锚点同基：滞留时长以 anchor 为「现在」计，脱离墙钟午夜抖动
 	if res == nil {
 		t.Fatal("SweepOrders 应执行")
 	}

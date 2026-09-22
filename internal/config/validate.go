@@ -22,6 +22,10 @@ func Validate(cfg *Rules) error {
 	if err := validateQMT(&cfg.QMT); err != nil {
 		return err
 	}
+	// §BINANCE-P1 rules.binance 段校验（缺省关=不阻断；启用一致性/枚举/数值域见 binance.go）。
+	if err := validateBinance(&cfg.Binance); err != nil {
+		return err
+	}
 	if err := validateRiskCtrl(&cfg.RiskCtrl); err != nil {
 		return err
 	}

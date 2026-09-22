@@ -816,11 +816,11 @@ var fullCloseClasses = []string{"止损", "止盈", "m8"}
 // remaining = held − Σsold so no cross-class double-sell) plus Σopen sell qty (non-terminal tickets;
 // a same-round M8 liquidation + stop-loss advice can no longer both fire full-qty sells before fills
 // are reported — the first order holds the budget, the second sees remaining=0 and skips).
-func (e *Engine) realSoldOrOpenQtyToday(realStore *store.DB, userID, tsCode string) int {
+func (e *Engine) realSoldOrOpenQtyToday(realStore *store.DB, userID, tsCode string) float64 {
 	if realStore == nil {
 		return 0
 	}
-	total := 0
+	total := 0.0
 	for _, c := range fullCloseClasses {
 		total += realStore.SumFilledQty(userID, realSellSignalID(tsCode, c))
 	}
@@ -850,7 +850,7 @@ func pureTsCode(tsCode string) string {
 // English: §P1-4 — sell orders now carry CurrentPrice/PrevClose so the limit-up/down risk gate
 // (which fail-opens on PrevClose<=0) actually sees market context; without quotes the gate stays
 // fail-open (positions remain exitable) instead of blocking protective sells.
-func (e *Engine) sellRealPosition(ctrl *trading.Controller, p store.RealPosition, qty int, signalID string, price float64, class, reason string) error {
+func (e *Engine) sellRealPosition(ctrl *trading.Controller, p store.RealPosition, qty float64, signalID string, price float64, class, reason string) error {
 	cfg := ctrl.Config()
 	if qty <= 0 || price <= 0 {
 		return nil
@@ -903,8 +903,8 @@ func (e *Engine) sellRealPosition(ctrl *trading.Controller, p store.RealPosition
 		log.Printf("[qmt] 自动卖出 %s(%s) 被网关拒单: %s", p.TsCode, p.Name, reject)
 		return fmt.Errorf("sell %s rejected: %s", p.TsCode, reject)
 	}
-	log.Printf("[qmt] 自动卖出 %s(%s) %d股 @%.2f 类别=%s 原因=%s → %+v",
-		p.TsCode, p.Name, qty, price, class, reason, res)
+	log.Printf("[qmt] 自动卖出 %s(%s) %s股 @%.2f 类别=%s 原因=%s → %+v",
+		p.TsCode, p.Name, store.QtyString(qty), price, class, reason, res)
 	return nil
 }
 
@@ -984,7 +984,7 @@ func (e *Engine) autoExecuteRealSellsRound(userID string, ctrl *trading.Controll
 		// the source gate above already restricts to unified disposals only); TP/trim only auto-execute
 		// from the discipline engine or the unified sell adjudicator.
 		var class string
-		var qty int
+		var qty float64 // §P1-d 剩余/减仓量随持仓转 float64
 		executableSellSource := a.Source == "discipline" || a.Source == trading.UnifiedSellSourceAction
 		switch a.Action {
 		case "止损":
@@ -1039,15 +1039,15 @@ func (e *Engine) autoExecuteRealSellsRound(userID string, ctrl *trading.Controll
 			// 1500 股减成卖 750（非整手非全平）→ 柜台废单，既没减成还烧一次委托；paper 侧同逻辑
 			// 早有 /2/100*100 取整（paper.go），实盘路径补齐同款。取整后为 0（持仓<200 股）降级为
 			// 通知（syncLiveAdviceAlerts 已统一推送），不强凑全平。
-			qty = remaining / 2 / 100 * 100
+			qty = roundQty("CN", remaining/2) // §P1-d 整手取整走 roundQty（CN 口径与旧 int 除法逐字节等价）
 			if qty <= 0 {
-				log.Printf("[qmt] %s(%s) 减仓半平取整后为 0（持仓 %d 股<2 手），降级为提醒", p.TsCode, p.Name, remaining)
+				log.Printf("[qmt] %s(%s) 减仓半平取整后为 0（持仓 %s 股<2 手），降级为提醒", p.TsCode, p.Name, store.QtyString(remaining))
 				continue
 			}
 		} else {
 			qty = remaining
 		}
-		sid := fmt.Sprintf("%s:r%d", base, qty)
+		sid := fmt.Sprintf("%s:r%s", base, store.QtyString(qty)) // §P1-d CN 整数值串与旧 %d 逐字节同（幂等桶键零漂移）
 		// §H4（2026-09-22 修复批）错误不再吞：卖单失败即 log + opslog 留档（5s 轮高频，opslog 按
 		// 码+类别 1 分钟节流），幂等槽不烧，纪律状态机下一轮重放同键补卖（占位行已降级"发送失败"可重试）。
 		if serr := e.sellRealPosition(ctrl, p, qty, sid, a.RefPrice, class, a.Reason); serr != nil {
@@ -1074,9 +1074,9 @@ func (e *Engine) autoExecuteRealSellsRound(userID string, ctrl *trading.Controll
 // 与下单 T+1 硬闸 §WS-A 同源）。日期用北京时日历日（cntime 统一时区，防首尔时钟跨天错位）。
 // English: §PROD-T1 — builds per-position sellable qty (held minus today's bought fills) for the
 // T+1 advice gate, using the same ledger helper as the order guard; Beijing-time day boundary.
-func sellableQtyByCode(db *store.DB, userID string, positions []store.RealPosition) map[string]int {
+func sellableQtyByCode(db *store.DB, userID string, positions []store.RealPosition) map[string]float64 {
 	day := cntime.In(time.Now()).Format("2006-01-02")
-	out := make(map[string]int, len(positions))
+	out := make(map[string]float64, len(positions)) // §P1-d 可卖量随 BuyableQtyForUserSell 转 float64
 	for _, p := range positions {
 		out[p.TsCode] = db.BuyableQtyForUserSell(userID, p.TsCode, day)
 	}
@@ -1162,7 +1162,7 @@ func (e *Engine) checkM8RealDrawdown(ctrl *trading.Controller, realStore *store.
 		filled := e.realSoldOrOpenQtyToday(realStore, userID, p.TsCode)
 		remaining := p.Qty - filled
 		if remaining > 0 {
-			sid := fmt.Sprintf("%s:r%d", base, remaining)
+			sid := fmt.Sprintf("%s:r%s", base, store.QtyString(remaining))
 			// §H4（2026-09-22 修复批）同批止吞错：M8 清仓失败不再 `_ =` 静默——占位行已降级
 			// "发送失败"，下一轮 M8 仍触发时同键可重试；这里补一条显式失败日志留证。
 			if serr := e.sellRealPosition(ctrl, p, remaining, sid, price, "m8", verdict.Reason+"兜底清仓"); serr != nil {

@@ -141,9 +141,9 @@ class TestReportFieldsContractIntact(unittest.TestCase):
         self.assertEqual(
             sorted(c["report_event_fields"]),
             sorted(["amount", "asset", "at", "broker", "code", "created_at", "fee", "from",
-                    "name", "order_id", "positions", "price", "qty", "reason", "side",
+                    "market", "name", "order_id", "positions", "price", "qty", "reason", "side",
                     "signal_id", "stamp_tax", "status", "trade_id", "traded_at", "type",
-                    "user_id"]))
+                    "user_id"]))  # §BINANCE-P1c：market 为有意并入的可选信封字段（缺省=CN，存量网关零改动）
         self.assertIn("order_id", c["consumed_by_event"]["trade"])  # 身份锚语义保持
 
 

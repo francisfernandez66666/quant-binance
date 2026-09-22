@@ -355,12 +355,19 @@ func (d *DB) migrate() error {
 		)`,
 		// 实盘持仓（AUTO_TRADING_PLAN 真实账本主源）：由国内 QMT 网关全量对账/成交回报驱动，
 		// 与纸面 report.Report 完全独立（双账本并存）。ts_code 为持仓唯一键，signal_id 关联开仓信号。
-		// English: real book positions (AUTO_TRADING_PLAN live ledger source) — driven by the domestic QMT
-		// gateway's reconciliation/fill reports, fully independent of the paper report.Report (dual ledgers).
+		// §BINANCE-P1c（PLAN §5.2）：加 market/currency 维度，PK 扩为 (market,ts_code,user_id)
+		// ——同一 6 位码在 CN、美股代号、加密交易对分属不同市场，ts_code 单键跨市场会互踩；
+		// qty 由 INTEGER 放宽为 REAL（加密货币数量可为小数；CN 成交仍为整数，存量行为不变）。
+		// 旧库经 ALTER+migrateRealPositionsMarketPK 两步重建落到本形状，存量行回填 CN/CNY。
+		// English: §BINANCE-P1c — market/currency columns added, PK widened to
+		// (market, ts_code, user_id), qty relaxed INTEGER→REAL (crypto qty can be fractional;
+		// CN fills stay integral). Legacy DBs land in this exact shape via ALTER + rebuild.
 		`CREATE TABLE IF NOT EXISTS real_positions (
+			market TEXT NOT NULL DEFAULT 'CN',
+			currency TEXT NOT NULL DEFAULT 'CNY',
 			ts_code TEXT NOT NULL,
 			name TEXT DEFAULT '',
-			qty INTEGER NOT NULL DEFAULT 0,
+			qty REAL NOT NULL DEFAULT 0,
 			cost_price REAL NOT NULL DEFAULT 0,
 			amount REAL NOT NULL DEFAULT 0,
 			highest_price REAL NOT NULL DEFAULT 0,
@@ -368,10 +375,13 @@ func (d *DB) migrate() error {
 			signal_id TEXT DEFAULT '',
 			updated_at TEXT NOT NULL,
 			user_id TEXT DEFAULT '',
-			PRIMARY KEY (ts_code, user_id)
+			buy_date TEXT DEFAULT '',
+			PRIMARY KEY (market, ts_code, user_id)
 		)`,
 		// 实盘委托单：order_id 为网关返回的单号，signal_id 唯一（幂等，防重复下单）。
-		// English: real order tickets — order_id from the gateway, signal_id unique (idempotency key).
+		// §BINANCE-P1c：加 market/currency 列（存量回填 CN/CNY）；§P1-d：qty INTEGER→REAL
+		// （Go 侧 Qty 同批转 float64，碎股/加密小数可落库）——历史库由 migrateQtyReal 重建。
+		// English: §P1c market/currency legs; §P1-d qty REAL (legacy DBs rebuilt by migrateQtyReal).
 		`CREATE TABLE IF NOT EXISTS orders (
 			order_id TEXT PRIMARY KEY,
 			signal_id TEXT NOT NULL,
@@ -379,21 +389,24 @@ func (d *DB) migrate() error {
 			side TEXT NOT NULL,
 			status TEXT NOT NULL,
 			price REAL,
-			qty INTEGER NOT NULL,
+			qty REAL NOT NULL,
 			created_at TEXT NOT NULL,
 			user_id TEXT DEFAULT '',
+			market TEXT NOT NULL DEFAULT 'CN',
+			currency TEXT NOT NULL DEFAULT 'CNY',
 			UNIQUE (user_id, signal_id)
 		)`,
 
 		// 实盘成交回报：网关成交事件逐条落库（对账/研究用）。
-		// English: real fill reports — one row per gateway trade event (reconciliation/research).
+		// §BINANCE-P1c：market/currency 列；§P1-d：qty INTEGER→REAL（碎股/加密小数，历史库由 migrateQtyReal 重建）。
+		// English: §P1c market/quote-currency legs; §P1-d qty becomes REAL (legacy DBs rebuilt by migrateQtyReal).
 		`CREATE TABLE IF NOT EXISTS fills (
 			id INTEGER PRIMARY KEY AUTOINCREMENT,
 			order_id TEXT NOT NULL,
 			code TEXT NOT NULL,
 			side TEXT NOT NULL,
 			price REAL NOT NULL,
-			qty INTEGER NOT NULL,
+			qty REAL NOT NULL,
 			amount REAL NOT NULL,
 			traded_at TEXT NOT NULL,
 			signal_id TEXT DEFAULT '',
@@ -405,7 +418,9 @@ func (d *DB) migrate() error {
 			-- → 字段被静默丢弃，本地 fills 只剩 (order_id,traded_at,price,qty) 复合键这一把身份锚。
 			-- English: broker trade number — the gateway always sent it, the old Go envelope had no
 			-- tag, so it was silently dropped and fills had no exact identity anchor.
-			trade_id TEXT DEFAULT ''
+			trade_id TEXT DEFAULT '',
+			market TEXT NOT NULL DEFAULT 'CN',
+			currency TEXT NOT NULL DEFAULT 'CNY'
 		)`,
 		// §W3-b 成交回报幂等唯一键：同一委托+同一回报时间戳+同价同量只入账一次，
 		// 根除 outbox 重试遇响应丢失时的双倍记账（首尔侧此前零幂等）。
@@ -442,6 +457,7 @@ func (d *DB) migrate() error {
 		)`,
 		`CREATE INDEX IF NOT EXISTS idx_risk_gates_day ON risk_gates(trade_date)`,
 		// §WS-G Shadow 执行器落账：staging 影子引擎只记录决策不真下（signal_id 幂等，同键去重）。
+		// §BINANCE-P1c：market 列（影子决策跨市场回放时的归属维度；缺省 CN=存量语义）。
 		`CREATE TABLE IF NOT EXISTS shadow_orders (
 			id INTEGER PRIMARY KEY AUTOINCREMENT,
 			user_id TEXT DEFAULT '',
@@ -452,9 +468,10 @@ func (d *DB) migrate() error {
 			strategy_id TEXT DEFAULT '',
 			side TEXT DEFAULT '',
 			price REAL DEFAULT 0,
-			qty INTEGER DEFAULT 0,
+			qty REAL DEFAULT 0, -- §P1-d int→float64 配套（历史库由 migrateQtyReal 重建）
 			amount REAL DEFAULT 0,
 			created_at TEXT DEFAULT '',
+			market TEXT NOT NULL DEFAULT 'CN',
 			UNIQUE(signal_id)
 		)`,
 		`CREATE INDEX IF NOT EXISTS idx_shadow_day ON shadow_orders(created_at)`,
@@ -611,6 +628,18 @@ func (d *DB) migrate() error {
 		{"real_positions", "buy_date", "ALTER TABLE real_positions ADD COLUMN buy_date TEXT DEFAULT ''"},
 		// §M4 券商成交编号列（成交回报最精确的身份锚；旧库回填为空串=未知）
 		{"fills", "trade_id", "ALTER TABLE fills ADD COLUMN trade_id TEXT DEFAULT ''"},
+		// §BINANCE-P1c（PLAN §5.2）市场/货币维度：存量行全部回填 CN/CNY（DEFAULT 子句即回填值），
+		// QMT 链此后与 'CN' 字面量等价、零行为变化。real_positions 的 PK 重建见
+		// migrateRealPositionsMarketPK（必须先有列后重建，故 ALTER 在前）。
+		// English: §BINANCE-P1c — market/currency legs; DEFAULT backfills every legacy row with
+		// CN/CNY so the QMT chain keeps byte-identical semantics. The PK rebuild runs after ALTERs.
+		{"real_positions", "market", "ALTER TABLE real_positions ADD COLUMN market TEXT NOT NULL DEFAULT 'CN'"},
+		{"real_positions", "currency", "ALTER TABLE real_positions ADD COLUMN currency TEXT NOT NULL DEFAULT 'CNY'"},
+		{"orders", "market", "ALTER TABLE orders ADD COLUMN market TEXT NOT NULL DEFAULT 'CN'"},
+		{"orders", "currency", "ALTER TABLE orders ADD COLUMN currency TEXT NOT NULL DEFAULT 'CNY'"},
+		{"fills", "market", "ALTER TABLE fills ADD COLUMN market TEXT NOT NULL DEFAULT 'CN'"},
+		{"fills", "currency", "ALTER TABLE fills ADD COLUMN currency TEXT NOT NULL DEFAULT 'CNY'"},
+		{"shadow_orders", "market", "ALTER TABLE shadow_orders ADD COLUMN market TEXT NOT NULL DEFAULT 'CN'"},
 	} {
 		has, err := d.hasColumn(mig.table, mig.column)
 		if err != nil {
@@ -663,10 +692,28 @@ func (d *DB) migrate() error {
 	if err := d.migrateRealPositionsPK(); err != nil {
 		return fmt.Errorf("store migrate real_positions pk: %w", err)
 	}
+	// §BINANCE-P1c 主键再扩市场维：(ts_code,user_id) -> (market,ts_code,user_id) + qty REAL。
+	// 必须排在 P0-1 之后（史前单主键库先升到 2 列再接力 3 列）、ALTER 之后（重建搬运要用 market 列）。
+	// English: P1c widens the PK to (market,ts_code,user_id); ordered after both the ALTER loop
+	// (the rebuild reads market/currency columns) and the P0-1 rebuild (single-PK DBs chain through).
+	if err := d.migrateRealPositionsMarketPK(); err != nil {
+		return fmt.Errorf("store migrate real_positions market pk: %w", err)
+	}
 	// §P0-2 orders.signal_id 唯一约束迁移为 (user_id, signal_id)：旧库单唯一索引重建。
 	// English: P0-2 migrate orders signal_id uniqueness to (user_id, signal_id).
 	if err := d.migrateOrdersSignalUnique(); err != nil {
 		return fmt.Errorf("store migrate orders signal unique: %w", err)
+	}
+	// §P1-d（PLAN §5.2-3）orders/fills/shadow_orders 的 qty 列 INTEGER→REAL 重建（Go 侧 Qty 已
+	// float64）。必须排在 §M4 fills 索引块之前：重建 DROP 表会连带删除随行索引，M4 的
+	// idx_fills_trade/idx_fills_idem_notid 与尾部的 idx_fills_market/idx_orders_market 都会在
+	// 重建后的新表上重新 CREATE；仅 idx_fills_traded_at/idx_shadow_day 定义在 schema 块（更早），
+	// 由本函数自带 fixup 重建。
+	// English: §P1-d rebuilds qty to REAL for the three ledgers; ordered before the M4 index block
+	// so the dependent indexes are (re)created on the rebuilt tables (only the two schema-block
+	// indexes need explicit fixup here).
+	if err := d.migrateQtyReal(); err != nil {
+		return fmt.Errorf("store migrate qty real: %w", err)
 	}
 	// §M4（2026-09-22 PM 批）fills 判重键升级：成交编号优先、无编号退回复合键。
 	// 旧复合唯一索引 (order_id,traded_at,price,qty) 把"同委托同秒同价同量的两笔真实部成"
@@ -688,6 +735,18 @@ func (d *DB) migrate() error {
 			if _, err := d.db.Exec(s); err != nil {
 				return fmt.Errorf("store migrate fills trade_id index: %w\n%s", err, s)
 			}
+		}
+	}
+	// §BINANCE-P1c 市场维度查询索引：委托/成交按 (market,user_id,…) 过滤是 Phase 2 币安
+	// 委托簿/成交页的第一查询路径。必须排在 ALTER 循环之后——旧库此时才刚有 market 列。
+	// English: market-scoped indexes for the Phase-2 order/trade pages; placed after the ALTER
+	// loop because legacy DBs only just gained the market column.
+	for _, s := range []string{
+		`CREATE INDEX IF NOT EXISTS idx_orders_market ON orders(market, user_id, status)`,
+		`CREATE INDEX IF NOT EXISTS idx_fills_market ON fills(market, user_id, traded_at)`,
+	} {
+		if _, err := d.db.Exec(s); err != nil {
+			return fmt.Errorf("store migrate market index: %w\n%s", err, s)
 		}
 	}
 	return nil
@@ -882,6 +941,12 @@ func (d *DB) migrateRealPositionsPK() error {
 	if len(cols) == 1 && cols[0] == "ts_code" {
 		log.Printf("[store] migrate real_positions PK: (ts_code) -> (ts_code, user_id)")
 		// 重建表：旧数据整体搬运（user_id 缺省补空串），主键升级为 (ts_code, user_id)。
+		// §BINANCE-P1c 修正：列清单补齐 buy_date/market/currency——这三列由前置 ALTER 循环
+		// 加到旧表上，旧版重建语句用显式列清单搬运会把它们从新表 schema 里抹掉（列丢失），
+		// 后续 migrateRealPositionsMarketPK 引用即报错。本函数只在史前单主键库上触发，
+		// 已部署的 (ts_code,user_id) 库直接跳过、零影响。
+		// English: the explicit column list now carries buy_date/market/currency too — the old
+		// list silently dropped columns previously added via ALTER.
 		_, err := d.db.Exec(`
 			CREATE TABLE real_positions_new (
 				ts_code TEXT NOT NULL,
@@ -894,11 +959,15 @@ func (d *DB) migrateRealPositionsPK() error {
 				signal_id TEXT DEFAULT '',
 				updated_at TEXT NOT NULL,
 				user_id TEXT DEFAULT '',
+				buy_date TEXT DEFAULT '',
+				market TEXT NOT NULL DEFAULT 'CN',
+				currency TEXT NOT NULL DEFAULT 'CNY',
 				PRIMARY KEY (ts_code, user_id)
 			);
 			INSERT OR REPLACE INTO real_positions_new
-				(ts_code, name, qty, cost_price, amount, highest_price, strategy, signal_id, updated_at, user_id)
-			SELECT ts_code, name, qty, cost_price, amount, highest_price, strategy, signal_id, updated_at, COALESCE(user_id, '')
+				(ts_code, name, qty, cost_price, amount, highest_price, strategy, signal_id, updated_at, user_id, buy_date, market, currency)
+			SELECT ts_code, name, qty, cost_price, amount, highest_price, strategy, signal_id, updated_at, COALESCE(user_id, ''),
+				COALESCE(buy_date, ''), COALESCE(market, 'CN'), COALESCE(currency, 'CNY')
 			FROM real_positions;
 			DROP TABLE real_positions;
 			ALTER TABLE real_positions_new RENAME TO real_positions;
@@ -906,6 +975,58 @@ func (d *DB) migrateRealPositionsPK() error {
 		return err
 	}
 	return nil
+}
+
+// migrateRealPositionsMarketPK §BINANCE-P1c（PLAN §5.2）：把 real_positions 主键从
+// (ts_code, user_id) 重建为 (market, ts_code, user_id)，qty 同步 INTEGER→REAL。
+// SQLite 不能改主键/列类型 → 标准三步重建（建新表→搬运→改名）。幂等：
+//   - 新库：建表 DDL 已是目标形状，检测 3 列 PK 直接跳过；
+//   - 存量 QMT 库：2 列 PK → 重建一次，全部存量行 market='CN'、currency='CNY'（ALTER 回填值原样搬运）；
+//   - 史前单主键库：先经 migrateRealPositionsPK 升到 2 列，再由本函数接力升到 3 列。
+//
+// qty REAL 安全性：§P1-d 起 Go 侧 Qty 已是 float64，碎股/加密小数可无损落库；
+// CN 存量整数值在 REAL 亲和列原样往返（100→"100" 序列化口径不变）。
+// English: rebuilds the PK to (market, ts_code, user_id) and widens qty to REAL. Idempotent:
+// fresh DBs already carry the 3-column PK and skip; legacy QMT DBs rebuild once with every row
+// stamped CN/CNY. Since P1-d the Go side is float64, so fractional quantities are first-class.
+func (d *DB) migrateRealPositionsMarketPK() error {
+	cols, err := d.tableHasPKColumns("real_positions")
+	if err != nil {
+		return err
+	}
+	if len(cols) == 3 && cols[0] == "market" && cols[1] == "ts_code" && cols[2] == "user_id" {
+		return nil // 已是目标形状（新库 DDL 或已重建过）
+	}
+	if len(cols) != 2 || cols[0] != "ts_code" || cols[1] != "user_id" {
+		return nil // 未知形状不动手（单主键形态由 migrateRealPositionsPK 先行接力）
+	}
+	log.Printf("[store] §BINANCE-P1c migrate real_positions PK: (ts_code,user_id) -> (market,ts_code,user_id), qty INTEGER->REAL")
+	_, err = d.db.Exec(`
+		CREATE TABLE real_positions_market_new (
+			market TEXT NOT NULL DEFAULT 'CN',
+			currency TEXT NOT NULL DEFAULT 'CNY',
+			ts_code TEXT NOT NULL,
+			name TEXT DEFAULT '',
+			qty REAL NOT NULL DEFAULT 0,
+			cost_price REAL NOT NULL DEFAULT 0,
+			amount REAL NOT NULL DEFAULT 0,
+			highest_price REAL NOT NULL DEFAULT 0,
+			strategy TEXT DEFAULT '',
+			signal_id TEXT DEFAULT '',
+			updated_at TEXT NOT NULL,
+			user_id TEXT DEFAULT '',
+			buy_date TEXT DEFAULT '',
+			PRIMARY KEY (market, ts_code, user_id)
+		);
+		INSERT OR REPLACE INTO real_positions_market_new
+			(market, currency, ts_code, name, qty, cost_price, amount, highest_price, strategy, signal_id, updated_at, user_id, buy_date)
+		SELECT COALESCE(market, 'CN'), COALESCE(currency, 'CNY'), ts_code, name, qty, cost_price, amount, highest_price,
+			strategy, signal_id, updated_at, COALESCE(user_id, ''), COALESCE(buy_date, '')
+		FROM real_positions;
+		DROP TABLE real_positions;
+		ALTER TABLE real_positions_market_new RENAME TO real_positions;
+	`)
+	return err
 }
 
 // migrateOrdersSignalUnique 把 orders.signal_id 单唯一索引重建为 (user_id, signal_id)。
@@ -966,6 +1087,12 @@ func (d *DB) migrateOrdersSignalUnique() error {
 	}
 	log.Printf("[store] migrate orders unique: signal_id -> (user_id, signal_id)")
 	// 重建 orders 表：旧数据整体搬运，唯一键升级为 (user_id, signal_id)。
+	// §BINANCE-P1c 重建带列教训（与 migrateRealPositionsPK 同族）：ALTER 补列每次启动都跑，
+	// 而本重建对历史库触发——orders_new 若不含 market/currency，改名后已 ALTER 补上的两列即被
+	// 销毁（TestSchemaMigrationP01P02 复现：建 idx_orders_market 时 no such column: market）。
+	// 必须显式携列 + COALESCE 搬运。
+	// qty 直出 REAL：§P1-d Go 侧 Qty 已 int→float64，本重建顺带完成列型升级，
+	// 让 migrateQtyReal 对「唯一键+列型都欠账」的史前库只重建一次（避免同库二连重建）。
 	_, err = d.db.Exec(`
 		CREATE TABLE orders_new (
 			order_id TEXT PRIMARY KEY,
@@ -974,19 +1101,164 @@ func (d *DB) migrateOrdersSignalUnique() error {
 			side TEXT NOT NULL,
 			status TEXT NOT NULL,
 			price REAL,
-			qty INTEGER NOT NULL,
+			qty REAL NOT NULL,
 			created_at TEXT NOT NULL,
 			user_id TEXT DEFAULT '',
+			market TEXT NOT NULL DEFAULT 'CN',
+			currency TEXT NOT NULL DEFAULT 'CNY',
 			UNIQUE (user_id, signal_id)
 		);
 		INSERT OR REPLACE INTO orders_new
-			(order_id, signal_id, code, side, status, price, qty, created_at, user_id)
-		SELECT order_id, signal_id, code, side, status, price, qty, created_at, COALESCE(user_id, '')
+			(order_id, signal_id, code, side, status, price, qty, created_at, user_id, market, currency)
+		SELECT order_id, signal_id, code, side, status, price, qty, created_at, COALESCE(user_id, ''),
+			COALESCE(market, 'CN'), COALESCE(currency, 'CNY')
 		FROM orders;
 		DROP TABLE orders;
 		ALTER TABLE orders_new RENAME TO orders;
 	`)
 	return err
+}
+
+// columnType 返回某列在 PRAGMA table_info 中登记的声明类型（列/表不存在返回空串）。
+// English: returns the declared type of a column via PRAGMA table_info ("" when absent).
+func (d *DB) columnType(table, column string) (string, error) {
+	rows, err := d.db.Query("PRAGMA table_info(" + table + ")")
+	if err != nil {
+		return "", err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var cid int
+		var name, ctype string
+		var notnull, pk int
+		var dflt any
+		if err := rows.Scan(&cid, &name, &ctype, &notnull, &dflt, &pk); err != nil {
+			return "", err
+		}
+		if name == column {
+			return ctype, nil
+		}
+	}
+	return "", rows.Err()
+}
+
+// migrateQtyReal §P1-d（PLAN §5.2-3）：orders/fills/shadow_orders 的 qty 列由 INTEGER 重建为
+// REAL（Go 侧 Qty int→float64 的落库配套；real_positions 已在 P1c 双列重建时直接落 REAL）。
+// 幂等：qty 已是 REAL 即跳过（新建库走最终 DDL，天然跳过）。
+// 重建遵循「携列教训」：INSERT SELECT 显式列全量搬运（含 ALTER 后补的 market/currency/trade_id
+// 等），绝不裸奔 `SELECT *`；fills 的自增 id 显式搬运保序列连续（AUTOINCREMENT 表插入显式 id
+// 会同步抬高 sqlite_sequence）。随行索引在 DROP 时消失：orders 的 (user_id,signal_id) 内联
+// UNIQUE 随新表重建，idx_orders_market/idx_fills_trade/idx_fills_idem_notid/idx_fills_market 由
+// 其后各迁移块重新 CREATE，唯二定义在 schema 块（更早执行）的 idx_fills_traded_at/idx_shadow_day
+// 放进 fixup 就地补建。
+// English: §P1-d rebuilds qty INTEGER→REAL for the three ledgers (positions landed REAL earlier).
+// Idempotent via declared-type check; carries every column explicitly through the copy (the
+// drop-columns trap), preserves fills autoincrement ids, and re-creates the two schema-block
+// indexes whose definitions ran before this rebuild.
+func (d *DB) migrateQtyReal() error {
+	type spec struct {
+		table  string
+		ddl    string   // 目标全量结构（qty REAL），表名 <table>_qty_new
+		carry  string   // INSERT 列清单（全列显式）
+		sel    string   // SELECT 搬运式（COALESCE 兜底）
+		fixups []string // 改名后必须就地补建的索引（schema 块早于本迁移执行）
+	}
+	specs := []spec{
+		{
+			table: "orders",
+			ddl: `CREATE TABLE orders_qty_new (
+				order_id TEXT PRIMARY KEY,
+				signal_id TEXT NOT NULL,
+				code TEXT NOT NULL,
+				side TEXT NOT NULL,
+				status TEXT NOT NULL,
+				price REAL,
+				qty REAL NOT NULL,
+				created_at TEXT NOT NULL,
+				user_id TEXT DEFAULT '',
+				market TEXT NOT NULL DEFAULT 'CN',
+				currency TEXT NOT NULL DEFAULT 'CNY',
+				UNIQUE (user_id, signal_id)
+			)`,
+			carry: "order_id, signal_id, code, side, status, price, qty, created_at, user_id, market, currency",
+			sel: "order_id, signal_id, code, side, status, price, qty, created_at, COALESCE(user_id,''), " +
+				"COALESCE(market,'CN'), COALESCE(currency,'CNY')",
+		},
+		{
+			table: "fills",
+			ddl: `CREATE TABLE fills_qty_new (
+				id INTEGER PRIMARY KEY AUTOINCREMENT,
+				order_id TEXT NOT NULL,
+				code TEXT NOT NULL,
+				side TEXT NOT NULL,
+				price REAL NOT NULL,
+				qty REAL NOT NULL,
+				amount REAL NOT NULL,
+				traded_at TEXT NOT NULL,
+				signal_id TEXT DEFAULT '',
+				user_id TEXT DEFAULT '',
+				fee REAL DEFAULT 0,
+				stamp_tax REAL DEFAULT 0,
+				serial TEXT DEFAULT '',
+				trade_id TEXT DEFAULT '',
+				market TEXT NOT NULL DEFAULT 'CN',
+				currency TEXT NOT NULL DEFAULT 'CNY'
+			)`,
+			carry: "id, order_id, code, side, price, qty, amount, traded_at, signal_id, user_id, fee, stamp_tax, serial, trade_id, market, currency",
+			sel: "id, order_id, code, side, price, qty, amount, traded_at, COALESCE(signal_id,''), COALESCE(user_id,''), " +
+				"COALESCE(fee,0), COALESCE(stamp_tax,0), COALESCE(serial,''), COALESCE(trade_id,''), COALESCE(market,'CN'), COALESCE(currency,'CNY')",
+			fixups: []string{
+				`CREATE INDEX IF NOT EXISTS idx_fills_traded_at ON fills(traded_at)`,
+			},
+		},
+		{
+			table: "shadow_orders",
+			ddl: `CREATE TABLE shadow_orders_qty_new (
+				id INTEGER PRIMARY KEY AUTOINCREMENT,
+				user_id TEXT DEFAULT '',
+				signal_id TEXT NOT NULL,
+				code TEXT DEFAULT '',
+				name TEXT DEFAULT '',
+				strategy TEXT DEFAULT '',
+				strategy_id TEXT DEFAULT '',
+				side TEXT DEFAULT '',
+				price REAL DEFAULT 0,
+				qty REAL DEFAULT 0,
+				amount REAL DEFAULT 0,
+				created_at TEXT DEFAULT '',
+				market TEXT NOT NULL DEFAULT 'CN',
+				UNIQUE(signal_id)
+			)`,
+			carry: "id, user_id, signal_id, code, name, strategy, strategy_id, side, price, qty, amount, created_at, market",
+			sel: "id, COALESCE(user_id,''), signal_id, COALESCE(code,''), COALESCE(name,''), COALESCE(strategy,''), " +
+				"COALESCE(strategy_id,''), COALESCE(side,''), COALESCE(price,0), qty, COALESCE(amount,0), COALESCE(created_at,''), COALESCE(market,'CN')",
+			fixups: []string{
+				`CREATE INDEX IF NOT EXISTS idx_shadow_day ON shadow_orders(created_at)`,
+			},
+		},
+	}
+	for _, sp := range specs {
+		t, err := d.columnType(sp.table, "qty")
+		if err != nil {
+			return fmt.Errorf("columnType %s: %w", sp.table, err)
+		}
+		if t != "INTEGER" {
+			continue // 已是 REAL（新建库/已迁移库）或表未建，跳过
+		}
+		log.Printf("[store] §P1-d qty 列重建 %s: INTEGER -> REAL", sp.table)
+		stmt := fmt.Sprintf(
+			"%s;\n\t\tINSERT OR REPLACE INTO %s_qty_new (%s)\n\t\tSELECT %s FROM %s;\n\t\tDROP TABLE %s;\n\t\tALTER TABLE %s_qty_new RENAME TO %s;",
+			sp.ddl, sp.table, sp.carry, sp.sel, sp.table, sp.table, sp.table, sp.table)
+		if _, err := d.db.Exec(stmt); err != nil {
+			return fmt.Errorf("rebuild %s qty: %w", sp.table, err)
+		}
+		for _, fx := range sp.fixups {
+			if _, err := d.db.Exec(fx); err != nil {
+				return fmt.Errorf("rebuild %s fixup index: %w\n%s", sp.table, err, fx)
+			}
+		}
+	}
+	return nil
 }
 
 // QueryRows 执行只读查询，返回 列名→值 的行切片（TEXT 以 string 返回，其余按驱动原生类型）。

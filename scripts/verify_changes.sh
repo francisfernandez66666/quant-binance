@@ -16,6 +16,7 @@
 #     + §H9/§M16 outbox 错位/网关 inflight 收割（见 34）+ §F2/§M4/§F5/§M5/§F3 回报接入段（见 35）+ §M14/§M15 同因熔断/夜链自愈（见 36）+ §H8/§F6 探针同源/构建指纹（见 37）
 #     + 二波（2026-09-22 当日续）：§M1 golden 源契约单源（见 38）+ §M2/§M3 降级报成功族（见 39）+ §M6/§TZ/§REJECT 数据管道 py 批（见 40）+ §M8 推送三通道内聚/EXPVAR 收权（见 41）+ §M9/§M10/M11 快照与落盘批（见 42）+ §M7 部署清单收编（见 43）+ §M12/§M13 前端与移动壳一致性 + researchd 冒烟（见 44）
 #     + C批（2026-09-22 晚间，owner 裁决清单四件套）：§XCHECK 价格复核闸接线/CrossCheckPrice 收编（见 45）+ §NATIVEAUTH 登录 token 迁原生加密存储（见 46）+ §ROOTQMT 根级死键防回潮 + §APPVER APK 服务端驱动强制更新（见 47））
+#   + 2026-09-22 §BINANCE Phase 1 多市场地基（PLAN_BINANCE_MULTI_ASSET：BrokerConfig/rules.binance/store 市场迁移/Qty float64/时段+风控 14 闸×3 市场矩阵，见 57）
 # ...
 # §全链路 UAT 修复批（2026-09-18 §UAT_FULLCHAIN_VERIFY）专项（见 11/11）：
 #   费用腿       ：成交回报 fee/stamp_tax 五路径透传（xt 回调/桥行/网关装配/mock/Go 落库），
@@ -1195,6 +1196,45 @@ for f in Dashboard Signals Positions; do
 	grep -q 'isStale(' "web/src/pages/$f.jsx" || { echo "--- FAIL: §M-10 $f 页只建守卫不用（begin/isStale 半接线）"; exit 1; }
 done
 echo "ok - §清扫批 专项守卫通过（行为锁 5 组 + 静态锁 12 道 + 负锁 4 道）"
+
+echo "==> 57 §BINANCE Phase 1 多市场地基：发布闸 + store 市场迁移 + Qty float64 + 时段/风控 14 闸×3 市场矩阵（2026-09-22 PLAN_BINANCE_MULTI_ASSET）..."
+# 背景：quant-binance Phase 1（加市场不换市场）——CN/QMT 链字节级不动，CRYPTO/US 以
+# market 列/键分层落库；本段把「发布闸缺省关、qty REAL 全量、市场短路矩阵、契约三点锁」
+# 钉成静态+行为双守卫，Phase 2 接线时任何回退（如 DDL 又写 INTEGER、闸漏市场短路）即红。
+# ---- 行为锁（新测试组 + 存量 CN 回归组各跑一遍）----
+go test -count=1 ./internal/config/ -run 'Binance|Broker' 2>&1 | grep -E '^(--- FAIL|FAIL|ok)'
+go test -count=1 ./internal/server/ -run 'TestBinanceConfig' 2>&1 | grep -E '^(--- FAIL|FAIL|ok)'
+go test -count=1 ./internal/store/ -run 'P1C|P1D' 2>&1 | grep -E '^(--- FAIL|FAIL|ok)'
+go test -count=1 ./internal/data/ -run 'TestSession|TestNormalizeMarketKey' 2>&1 | grep -E '^(--- FAIL|FAIL|ok)'
+go test -count=1 ./internal/risk/ -run 'TestGate' 2>&1 | grep -E '^(--- FAIL|FAIL|ok)'
+go test -count=1 ./internal/trading/ -run 'TestOrderContractGolden|TestSweepOrdersStaleCancel' 2>&1 | grep -E '^(--- FAIL|FAIL|ok)'
+py_tests qmt_gateway/tests/test_order_gates.py
+py_tests qmt_gateway/tests/test_trade_identity_reject.py
+# ---- 静态锁 ----
+# 发布闸：rules.binance 出厂总开关必须 false（一键推送配置即唤醒币安链路是最高危回退）。
+grep -q 'Enabled:          false,' internal/config/binance.go || { echo "--- FAIL: §BINANCE 发布闸漂移（DefaultBinanceConfig 顶层 Enabled 非 false）"; exit 1; }
+# store：orders/fills/shadow_orders 三表 DDL 全量 qty REAL（正锁 ≥3 处）；INTEGER 形态收窄到 2 处豁免（下方等值锁）。
+NQ=$(grep -c 'qty REAL NOT NULL' internal/store/store.go)
+[ "$NQ" -ge 3 ] || { echo "--- FAIL: §BINANCE qty REAL 覆盖不足（store.go 仅 $NQ 处，三表 DDL+重建路应有 ≥3）"; exit 1; }
+# qty INTEGER 等值锁：全文件仅允许 2 处合法豁免——
+# ① paper_trades（CN 模拟盘簿，整数手数，不在 PLAN §5.2-3 P1-d 迁移范围）；
+# ② migrateRealPositionsPK 史前单主键库的过渡建表 DDL（随后 migrateRealPositionsMarketPK
+#    以 qty REAL 接力重建，链式顺序由 store.go Open 内注释钉死，过渡态不对外暴露）。
+# 第 3 处出现即 §P1-d 回潮（CRYPTO 碎量被截成 0）；新增豁免必须连同本锁计数一起改。
+QI=$(grep -c 'qty INTEGER NOT NULL' internal/store/store.go)
+[ "$QI" -eq 2 ] || { echo "--- FAIL: §BINANCE qty INTEGER 计数=${QI}≠2（豁免面=模拟盘簿+史前迁移过渡态，回潮或扩豁免都需显式对齐本锁）"; exit 1; }
+# 时段：Session(market) 三市场分发在位，且 CN 分支必须委托旧谓词而非另写一份（双口径漂移源）。
+grep -q 'func Session(market string) SessionRule' internal/data/market_session.go || { echo "--- FAIL: §BINANCE Session(market) 入口丢失"; exit 1; }
+grep -q 'return IsActiveSession(t)' internal/data/market_session.go || { echo "--- FAIL: §BINANCE CN 时段分支不再委托 IsActiveSession（复制口径，双源漂移）"; exit 1; }
+# 风控矩阵：CN 专属四闸（st/t1/limit_up_down/price_cross_check）市场短路等值锁——
+# `o.Market != "CN"` 恰好 4 处；增删 CN 专属闸必须同步过矩阵测试后改本锁（防无声加减）。
+NM=$(grep -c 'o.Market != "CN"' internal/risk/gate.go)
+[ "$NM" -eq 4 ] || { echo "--- FAIL: §BINANCE CN 市场短路计数=${NM}≠4（矩阵 §9 的 CN 专属闸增减需显式对齐 PLAN）"; exit 1; }
+grep -q 'func (g \*Gate) checkMinNotional' internal/risk/gate.go || { echo "--- FAIL: §BINANCE min_notional 闸丢失"; exit 1; }
+grep -q 'func (g \*Gate) checkLotPrecision' internal/risk/gate.go || { echo "--- FAIL: §BINANCE lot_precision 闸丢失"; exit 1; }
+# 契约三点锁的 Go 可见面：market 必须留在网关 ignored 声明（漏声明会被 §A2 双红，这里先给中文归因）。
+grep -q '"market"' qmt_gateway/contract/order_fields.json || { echo "--- FAIL: §BINANCE order_fields.json 缺 market 键声明"; exit 1; }
+echo "ok - §BINANCE Phase 1 专项守卫通过（行为锁 8 组 + 静态锁 9 道〔等值锁 2：qty INTEGER=2 豁免 / CN 短路=4 闸，余为正锁+定点锁〕）"
 
 echo ""
 echo "==> 全部通过"

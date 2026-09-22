@@ -77,6 +77,6 @@ func TestSettlementBackfillIdempotent(t *testing.T) {
 	}
 	p, _ := db.RealPositionByCodeForUser("u1", "600000.SH")
 	if p.Qty != 100 {
-		t.Fatalf("持仓应 100, got %d", p.Qty)
+		t.Fatalf("持仓应 100, got %v", p.Qty)
 	}
 }

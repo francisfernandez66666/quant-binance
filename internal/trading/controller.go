@@ -534,6 +534,7 @@ func (c *Controller) placeOrder(req OrderRequest) (*OrderResult, error) {
 		StalenessMs:  req.StalenessMs,
 		CurrentPrice: req.CurrentPrice,
 		PrevClose:    req.PrevClose,
+		Market:       req.Market, // §P1-e 市场启停主键（空=CN，风控闸入口归一化）
 	}
 	if v := c.gate.CheckLiveOrder(cfg, lo); !v.Pass {
 		return nil, fmt.Errorf("%s", v.Reason)
@@ -594,7 +595,7 @@ func (c *Controller) placeOrder(req OrderRequest) (*OrderResult, error) {
 		if merr := c.store.MarkRealOrderSendFailed(c.userID, req.SignalID); merr != nil {
 			log.Printf("[trading] mark send-failed %s: %v", req.SignalID, merr)
 		}
-		opslog.Logf("quant", "下单发送失败(降级可重试) %s %s %s qty=%d: %v", req.SignalID, req.Side, req.Code, req.Qty, err)
+		opslog.Logf("quant", "下单发送失败(降级可重试) %s %s %s qty=%s: %v", req.SignalID, req.Side, req.Code, store.QtyString(req.Qty), err)
 		return nil, err
 	}
 	// §R3-1 P0-A 业务拒单兜底：网关返回 200+ok:false（券商侧拒绝：资金不足/废单等）时
@@ -610,8 +611,8 @@ func (c *Controller) placeOrder(req OrderRequest) (*OrderResult, error) {
 			log.Printf("[trading] mark send-failed (business reject) %s: %v", req.SignalID, merr)
 		}
 		log.Printf("[trading] %s 网关业务拒单: %s（占位行已降级发送失败，可重试）", req.SignalID, res.Err)
-		opslog.Logf("quant", "网关业务拒单 %s %s %s qty=%d price=%.2f: %s",
-			req.SignalID, req.Side, req.Code, req.Qty, req.Price, res.Err)
+		opslog.Logf("quant", "网关业务拒单 %s %s %s qty=%s price=%.2f: %s",
+			req.SignalID, req.Side, req.Code, store.QtyString(req.Qty), req.Price, res.Err)
 		return res, nil
 	}
 	// 回填网关委托单号并更新状态（占位行按 signal_id 定位）
@@ -621,8 +622,8 @@ func (c *Controller) placeOrder(req OrderRequest) (*OrderResult, error) {
 		}
 	}
 	// §DAILY_OPSLOG 下单受理（网关已收单）——含策略归因与金额口径
-	opslog.Logf("quant", "下单受理 %s %s %s qty=%d price=%.2f amount=%.0f 策略=%s/%s order=%s",
-		req.SignalID, req.Side, req.Code, req.Qty, req.Price, req.Amount, req.StrategyID, req.Strategy, res.OrderID)
+	opslog.Logf("quant", "下单受理 %s %s %s qty=%s price=%.2f amount=%.0f 策略=%s/%s order=%s",
+		req.SignalID, req.Side, req.Code, store.QtyString(req.Qty), req.Price, req.Amount, req.StrategyID, req.Strategy, res.OrderID)
 	return res, nil
 }
 
@@ -649,7 +650,9 @@ func (c *Controller) Reconcile() error {
 		log.Printf("[trading] 对账跳过: 网关未连接且持仓快照为空（不可信，禁止清账）")
 		return nil
 	}
-	if _, err := c.store.ReconcilePositionsForUser(c.userID, st.Positions); err != nil {
+	// §BINANCE-P1c：本 Controller 现阶段唯一实例化来源是 QMT 网关（CN 市场），/state 快照
+	// 的市场章固定 CN；Phase 2 的币安 Controller 将以自己的 market 走同一函数。
+	if _, err := c.store.ReconcilePositionsForUser(c.userID, "CN", st.Positions); err != nil {
 		return err
 	}
 	// 委托流水对账（此前 State 拉回即丢）：仅记日志差异告警，自动纠偏仍留给回报线程。
@@ -882,8 +885,8 @@ func (c *Controller) SweepOrders(now time.Time) *SweepResult {
 			res.Errors++
 			// 典型失败：交易所委托号尚未回报（网关暂不可撤）/ 已成交（撤单被拒）——
 			// 不强试，交由回报线程推进真实状态，下轮再评估
-			log.Printf("[trading] 自动撤单被拒 %s(%s %s qty=%d, 滞留%s): %v",
-				o.OrderID, o.Code, o.Side, o.Qty, age.Round(time.Second), err)
+			log.Printf("[trading] 自动撤单被拒 %s(%s %s qty=%s, 滞留%s): %v",
+				o.OrderID, o.Code, o.Side, store.QtyString(o.Qty), age.Round(time.Second), err)
 			continue
 		}
 		if ok, err := c.store.UpdateRealOrderStatusMonotonic(c.userID, o.OrderID, "已撤"); err != nil || !ok {
@@ -892,8 +895,8 @@ func (c *Controller) SweepOrders(now time.Time) *SweepResult {
 		}
 		res.Cancelled++
 		metrics.OrdersCancelled() // §R4-9 撤单计数
-		log.Printf("[trading] 自动撤单成功 %s %s %s qty=%d (滞留%s, 收盘清单=%v)",
-			o.OrderID, o.Code, o.Side, o.Qty, age.Round(time.Second), closeSweep)
+		log.Printf("[trading] 自动撤单成功 %s %s %s qty=%s (滞留%s, 收盘清单=%v)",
+			o.OrderID, o.Code, o.Side, store.QtyString(o.Qty), age.Round(time.Second), closeSweep)
 	}
 	if res.Cancelled+res.Demoted > 0 || closeSweep {
 		log.Printf("[trading] 撤单闭环本轮: 撤销=%d 占位降级=%d 失败=%d 跳过=%d 收盘清单=%v",

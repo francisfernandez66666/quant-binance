@@ -52,7 +52,7 @@ func buyReq(id string, amount float64) OrderRequest {
 	return OrderRequest{
 		SignalID: id, Code: "600000.SH", Name: "浦发", Strategy: "龙头",
 		Side: SideBuy, PriceType: "market", Price: 10,
-		Qty:       int(amount / 10),
+		Qty:       amount / 10, // §P1-d OrderRequest.Qty 已 float64
 		Amount:    amount,
 		CreatedAt: time.Now().Format(time.RFC3339),
 	}
@@ -561,9 +561,9 @@ func TestGuardT1SellLocked(t *testing.T) {
 		t.Fatalf("open: %v", err)
 	}
 
-	sell := func(qty int) error {
+	sell := func(qty float64) error {
 		_, err := ctrl.PlaceOrder(OrderRequest{SignalID: "T1-SELL", Code: "600000.SH", Name: "浦发",
-			Side: SideSell, Price: 10, Qty: qty, Amount: float64(qty) * 10,
+			Side: SideSell, Price: 10, Qty: qty, Amount: qty * 10,
 			CreatedAt: time.Now().Format(time.RFC3339)})
 		return err
 	}

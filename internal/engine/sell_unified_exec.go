@@ -20,7 +20,7 @@ import (
 
 // unifiedSellViews 把本轮裁决视图投影为 trading 层的统一卖出卡输入（mode=on 专用）。
 // sellable=T+1 可卖量（键=ts_code；缺 key=未知不锁定，与 §PROD-T1 放行口径一致）。
-func (e *Engine) unifiedSellViews(positions []store.RealPosition, verdicts []sellRoundVerdict, sellable map[string]int) []trading.UnifiedSellView {
+func (e *Engine) unifiedSellViews(positions []store.RealPosition, verdicts []sellRoundVerdict, sellable map[string]float64) []trading.UnifiedSellView {
 	if len(verdicts) == 0 {
 		return nil
 	}
@@ -90,7 +90,7 @@ func projectSellView(v *sellRoundVerdict) *trading.UnifiedSellView {
 }
 
 // t1LockedCodes §PROD-T1 口径：可卖量已知且 ≤0 的持仓代码集合（当日买入全锁）。
-func t1LockedCodes(positions []store.RealPosition, sellable map[string]int) map[string]bool {
+func t1LockedCodes(positions []store.RealPosition, sellable map[string]float64) map[string]bool {
 	out := map[string]bool{}
 	if len(sellable) == 0 {
 		return out

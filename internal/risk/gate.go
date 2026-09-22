@@ -17,6 +17,9 @@ package risk
 
 import (
 	"fmt"
+	"math"
+	"strconv"
+	"strings"
 	"time"
 
 	"quant-trading-v2/internal/cntime"
@@ -46,6 +49,9 @@ const (
 //   - Side         买卖方向（SideBuy/SideSell）；§N-4（2026-09-22 修复批）：**方向不做 fail-open**——
 //     非这两值的订单在 CheckLiveOrder 入口即拒（fail-close），理由见该函数注释；
 //   - Price        参考委托价；Qty 股数；Amount 委托金额（元；缺失时按 Qty×Price 回退估算）。
+//   - Market       §P1-e（2026-09-22）订单所属市场（""/未知=CN，CheckLiveOrder 入口归一化）：
+//     市场专属闸的启停主键（st/limit_up_down/price_cross_check/t1_sellable 仅 CN；
+//     min_notional 仅 CRYPTO；lot_precision 仅 CRYPTO+US），并决定按日账查询的记账时区。
 type LiveOrder struct {
 	SignalID     string
 	Code         string
@@ -55,8 +61,9 @@ type LiveOrder struct {
 	StrategyType string
 	Side         string
 	Price        float64
-	Qty          int
+	Qty          float64
 	Amount       float64
+	Market       string
 
 	// StalenessMs 行情快照陈旧度（毫秒；-1=未提供，StaleQuoteGuard 跳过）。
 	// CurrentPrice 现价（集中度闸用；0=未提供）。PrevClose 昨收（涨跌停闸用；0=未提供）。
@@ -99,6 +106,28 @@ type Gate struct {
 	// English: §XCHECK independent cross-check price source (nil = gate skipped), wired from the
 	// data coordinator so the reference price is verified against a different multi-source chain.
 	crossPrice func(code string) (float64, error)
+	// symbolRules §P1-e 交易所交易规则源（symbol→SymbolRules，可空=新两道闸 min_notional/
+	// lot_precision 保持跳过）。P1 只落闸逻辑与矩阵锁；数据接线（BinanceExecutor 的
+	// exchangeInfo 缓存：启动拉取+定期刷新+按 symbol 缓存）在 Phase 2/3 装配时注入本入口。
+	// English: §P1-e per-symbol exchange rules source (nil keeps the two new gates inert); the
+	// exchangeInfo cache is wired by the Binance executor in later phases.
+	symbolRules func(symbol string) (SymbolRules, error)
+}
+
+// SymbolRules §P1-e 单 symbol 交易所规则快照（min_notional/lot_precision 两道新闸的数据契约）。
+// 零值字段=数据未接入/未知，对应闸 fail-open 跳过——与全部数据类闸一致姿势。
+// English: per-symbol exchange rules; zero fields mean unknown and the gate fails open.
+type SymbolRules struct {
+	MinNotional float64 // 最小名义额（币安 MIN_NOTIONAL/NOTIONAL，USDT 计；0=未知→跳过）
+	StepSize    float64 // 数量步长（LOT_SIZE.stepSize；0=未知→跳过）
+	TickSize    float64 // 价格步长（预留：P1 的 US 小数位闸不依赖它，Phase 3 精配可启用）
+}
+
+// SetSymbolRulesSource §P1-e 注入交易规则源（setter 惯例同 SetCrossPriceSource：规则缓存在
+// 装配尾段才就绪，旧调用方无需感知）。可空=两道新闸保持跳过（零配置零行为变化）。
+// English: injects the per-symbol rules source (nil keeps both new gates skipped).
+func (g *Gate) SetSymbolRulesSource(fn func(symbol string) (SymbolRules, error)) {
+	g.symbolRules = fn
 }
 
 // NewGate 创建风控闸。onGate 可空（命中时告警回调；新闸默认高优告警，存量守卫不告警）。
@@ -121,6 +150,11 @@ func (g *Gate) SetCrossPriceSource(fn func(code string) (float64, error)) {
 // English: single entry for all live-order pre-checks — runs every gate in order and returns the first
 // blocking verdict (later gates are not evaluated, matching the existing short-circuit semantics).
 func (g *Gate) CheckLiveOrder(cfg config.QMTConfig, o LiveOrder) *Verdict {
+	// §P1-e（2026-09-22）市场归一化一次性收口：""/未知一律 CN（存量链路不带 Market 时行为不变），
+	// 下游各闸直接读 o.Market 做市场专属闸的启停；记账时区同源（marketToday）。
+	// English: §P1-e normalize the market once at the entry; empty/unknown → CN (legacy paths
+	// unchanged); gates read o.Market for per-market on/off, and day-keys share marketToday.
+	o.Market = data.NormalizeMarketKey(o.Market)
 	// §N-4（2026-09-22 修复批，M-1 升级项之一）方向白名单前置 fail-close：未知方向直接拒单。
 	// 缺陷原文：本文件多数闸按 `o.Side == SideBuy` / `o.Side != SideSell` 精确匹配来区分方向
 	// （checkST:184、checkBlacklist:198、checkT1Sellable:218、checkLimitPrice:277/284、
@@ -139,36 +173,43 @@ func (g *Gate) CheckLiveOrder(cfg config.QMTConfig, o LiveOrder) *Verdict {
 	// direction must never collect the skip dividend of directional gates, so we reject once here
 	// instead of letting each gate abstain on its own.
 	if o.Side != SideBuy && o.Side != SideSell {
-		return g.verdict("side_unknown", fmt.Sprintf(
+		return g.verdict(o.Market, "side_unknown", fmt.Sprintf(
 			"非法下单方向(side=%q)：只接受 %s/%s（不做任何归一/缺省），未知方向一律拒单（fail-close，防止方向性风控闸被静默跳过）",
 			o.Side, SideBuy, SideSell), true)
 	}
 	// 闸口清单：按序评估，gate=留痕标识，alert=命中是否触发高优告警（新机构级闸为 true），
-	// run 返回非空字符串即视为命中并携带原因。共 12 道闸（§XCHECK 2026-09-22 C批 新增第 12 道
-	// price_cross_check）：其中 st/blacklist/t1_sellable/buy_discipline/whitelist/max_positions
+	// run 返回非空字符串即视为命中并携带原因。共 14 道闸（§XCHECK 2026-09-22 C批 新增第 12 道
+	// price_cross_check；§P1-e 2026-09-22 新增第 13/14 道 min_notional/lot_precision）：
+	// 其中 st/blacklist/t1_sellable/buy_discipline/whitelist/max_positions
 	// 为存量守卫（不告警），其余为新增机构闸（命中高优告警）。
+	// 市场启停矩阵（PLAN §9，14 闸 × CN/CRYPTO/US）：st/t1_sellable/limit_up_down/price_cross_check
+	// 仅 CN（各自入口短路）；min_notional 仅 CRYPTO；lot_precision 仅 CRYPTO+US；其余闸三市场全开。
+	// English: 14 gates; market matrix per PLAN §9 — st/t1/limit/cross CN-only, min_notional
+	// CRYPTO-only, lot_precision CRYPTO+US, the rest active on all three markets.
 	checks := []struct {
 		gate  string
 		alert bool
 		run   func() string
 	}{
-		{"st", false, func() string { return g.checkST(o) }},                               // ST/退市股禁买
+		{"st", false, func() string { return g.checkST(o) }},                               // ST/退市股禁买（仅 CN）
 		{"blacklist", false, func() string { return g.checkBlacklist(cfg, o) }},            // 个股黑名单禁买
 		{"max_order_amount", true, func() string { return g.checkMaxOrderAmount(cfg, o) }}, // 单笔金额绝对帽
-		{"t1_sellable", false, func() string { return g.checkT1Sellable(cfg, o) }},         // T+1 可卖量（含在途卖单）
-		{"limit_up_down", true, func() string { return g.checkLimitPrice(cfg, o) }},        // 涨停不可追买/跌停不可追卖
+		{"t1_sellable", false, func() string { return g.checkT1Sellable(cfg, o) }},         // T+1 可卖量（含在途卖单，仅 CN）
+		{"limit_up_down", true, func() string { return g.checkLimitPrice(cfg, o) }},        // 涨停不可追买/跌停不可追卖（仅 CN）
 		{"stale_quote", true, func() string { return g.checkStaleQuote(cfg, o) }},          // 行情新鲜度硬闸
-		{"price_cross_check", true, func() string { return g.checkPriceCross(cfg, o) }},    // §XCHECK 价格复核闸（数据类闸与上闸聚拢）
+		{"price_cross_check", true, func() string { return g.checkPriceCross(cfg, o) }},    // §XCHECK 价格复核闸（仅 CN，A 股复核链）
 		{"day_loss", true, func() string { return g.checkDayLoss(cfg, o) }},                // 日内已实现亏损熔断
 		{"concentration", true, func() string { return g.checkConcentration(cfg, o) }},     // 单票市值集中度
 		{"buy_discipline", false, func() string { return g.checkBuyDiscipline(cfg, o) }},   // 买入纪律（已成交笔数/预算/可用资金）
 		{"whitelist", false, func() string { return g.checkWhitelist(cfg, o) }},            // 战法白名单
 		{"max_positions", false, func() string { return g.checkMaxPositions(cfg, o) }},     // 持仓数上限
+		{"min_notional", true, func() string { return g.checkMinNotional(o) }},             // §P1-e CRYPTO 最小名义额（仅 CRYPTO）
+		{"lot_precision", true, func() string { return g.checkLotPrecision(o) }},           // §P1-e 数量步长/价格小数位（CRYPTO+US）
 	}
 	// 短路语义：首个命中即返回阻断裁定，后续闸不再评估（与原 controller 行为一致）。
 	for _, c := range checks {
 		if reason := c.run(); reason != "" {
-			return g.verdict(c.gate, reason, c.alert)
+			return g.verdict(o.Market, c.gate, reason, c.alert)
 		}
 	}
 	// 全部闸口通过 → 放行。
@@ -181,12 +222,14 @@ func (g *Gate) CheckPortfolio(cfg *config.Rules, currentTotal, peakTotal float64
 	return M8CheckWith(cfg, currentTotal, peakTotal)
 }
 
-// verdict 记录命中（risk_gates 表）并按需触发高优告警。
-// English: verdict records the hit (risk_gates table) and optionally fires a high-priority alert.
-func (g *Gate) verdict(gate, reason string, alert bool) *Verdict {
+// verdict 记录命中（risk_gates 表）并按需触发高优告警。留痕日期按订单市场的记账时区
+// （§P1-e：CRYPTO=UTC、US=纽约，CN=北京与旧口径逐字节一致）。
+// English: verdict records the hit (risk_gates, day key per the order's market timezone) and
+// optionally fires a high-priority alert.
+func (g *Gate) verdict(market, gate, reason string, alert bool) *Verdict {
 	// 留痕：命中写入 risk_gates 表（账号+交易日+闸口+原因）；账本缺失时静默跳过。
 	if g.st != nil {
-		_ = g.st.RecordRiskGate(g.userID, g.today(), gate, reason)
+		_ = g.st.RecordRiskGate(g.userID, g.marketToday(market), gate, reason)
 	}
 	// 高优告警：仅 alert=true 的新机构级闸命中时触发（存量守卫保持静默，不打扰）。
 	if alert && g.onGate != nil {
@@ -196,13 +239,25 @@ func (g *Gate) verdict(gate, reason string, alert bool) *Verdict {
 }
 
 // today 交易日的本地日期（北京时）。English: today's date in Beijing time.
+// 仅 CN 专属闸使用；市场无关处一律走 marketToday（CN 下两者逐字节一致）。
 func (g *Gate) today() string {
 	return cntime.In(g.now()).Format("2006-01-02")
+}
+
+// marketToday §P1-e 按市场记账时区的当日日期：CN=北京（与 today 恒等）、CRYPTO=UTC、
+// US=America/New_York（PLAN §10——按日账查询与 risk_gates 留痕的日期键随市场取时）。
+// English: §P1-e the day key in the order's market timezone (CN identical to today()).
+func (g *Gate) marketToday(market string) string {
+	return g.now().In(data.Session(market).Loc()).Format("2006-01-02")
 }
 
 // checkST §GAP1.6 ST/退市风险股拒绝买入（仅买方向；卖出放行——已存在的风险敞口必须可退出）。
 // English: ST/delisting-risk stocks rejected on BUY only; sells stay open so existing exposure can exit.
 func (g *Gate) checkST(o LiveOrder) string {
+	// §P1-e 市场矩阵：ST/退市是 A 股特有风险标记，CRYPTO/US 短路跳过（非 CN 直接放行）。
+	if o.Market != "CN" {
+		return ""
+	}
 	// 仅买方向生效；卖出放行（已持有敞口必须保留退出通道）。
 	if o.Side != SideBuy {
 		return ""
@@ -237,6 +292,11 @@ func (g *Gate) checkBlacklist(cfg config.QMTConfig, o LiveOrder) string {
 // English: §UAT-D4 — sellable now also deducts today's still-open (non-terminal) sell tickets, so
 // concurrent same-second sells can no longer both pass on identical settled-only inputs.
 func (g *Gate) checkT1Sellable(cfg config.QMTConfig, o LiveOrder) string {
+	// §P1-e 市场矩阵：T+1 是 A 股交收规则（币安现货 T+0、美股允许当日买卖），非 CN 短路跳过。
+	// Phase 2 Controller 泛型化后本短路并入 cfg.BrokerEnforceT1()（Binance 视图恒 false），双重保险。
+	if o.Market != "CN" {
+		return ""
+	}
 	// 仅卖出方向且开关启用且账本可用时才检查；其余情况跳过。
 	if o.Side != SideSell || !cfg.EnforceT1Enabled() || g.st == nil {
 		return ""
@@ -253,8 +313,8 @@ func (g *Gate) checkT1Sellable(cfg config.QMTConfig, o LiveOrder) string {
 		}
 		// 请求量超过可卖量 → 拒单（先到者占额度，后到者在网关侧被拦）。
 		if o.Qty > sellable {
-			return fmt.Sprintf("T+1 不可卖: 当日买入/在途卖单锁定, 可卖 %d < 请求 %d（持仓 %d, 当日买入 %d, 在途卖 %d）",
-				sellable, o.Qty, p.Qty, bought, openSell)
+			return fmt.Sprintf("T+1 不可卖: 当日买入/在途卖单锁定, 可卖 %s < 请求 %s（持仓 %s, 当日买入 %s, 在途卖 %s）",
+				store.QtyString(sellable), store.QtyString(o.Qty), store.QtyString(p.Qty), store.QtyString(bought), store.QtyString(openSell))
 		}
 	}
 	return ""
@@ -275,12 +335,12 @@ func (g *Gate) checkMaxOrderAmount(cfg config.QMTConfig, o LiveOrder) string {
 	// 优先用装配好的委托金额；缺失（≤0）时回退 qty×参考价估算。
 	amt := o.Amount
 	if amt <= 0 {
-		amt = o.Price * float64(o.Qty)
+		amt = o.Price * o.Qty // §P1-d Qty 已是 float64，去除陈旧转换
 	}
 	// 买卖双向校验：超帽即拒（手动入口胖手误的最后防线）。
 	if amt > cfg.RiskGate.MaxOrderAmount {
-		return fmt.Sprintf("单笔金额超限: %.0f > 绝对帽 %.0f（%s %s %d股，请核对数量与价格）",
-			amt, cfg.RiskGate.MaxOrderAmount, o.Side, o.Code, o.Qty)
+		return fmt.Sprintf("单笔金额超限: %.0f > 绝对帽 %.0f（%s %s %s股，请核对数量与价格）",
+			amt, cfg.RiskGate.MaxOrderAmount, o.Side, o.Code, store.QtyString(o.Qty))
 	}
 	return ""
 }
@@ -290,6 +350,10 @@ func (g *Gate) checkMaxOrderAmount(cfg config.QMTConfig, o LiveOrder) string {
 // English: block chasing a limit-up buy / limit-down sell (off by default). Board-aware threshold from
 // the canonical data.LimitUpPct; fails open when PrevClose is unknown.
 func (g *Gate) checkLimitPrice(cfg config.QMTConfig, o LiveOrder) string {
+	// §P1-e 市场矩阵：币安无涨跌停；美股 LULD 走 tradingStatus 证据闸（Phase 3），本闸仅 CN。
+	if o.Market != "CN" {
+		return ""
+	}
 	// 无昨收或参考价（≤0）时 fail-open：数据缺口不误拦，交由柜台判定。
 	if o.PrevClose <= 0 || o.Price <= 0 {
 		return ""
@@ -344,6 +408,10 @@ func (g *Gate) checkStaleQuote(cfg config.QMTConfig, o LiveOrder) string {
 // price against an independent quote chain; fails open on any data gap; shadow hits record-and-pass
 // ([shadow] prefix in risk_gates), enforced hits (cross_check_shadow=false) reject + alert.
 func (g *Gate) checkPriceCross(cfg config.QMTConfig, o LiveOrder) string {
+	// §P1-e 市场矩阵：复核链是新浪/腾讯/东财 A 股源，仅 CN 有意义（币安双端点对价换源留 P2）。
+	if o.Market != "CN" {
+		return ""
+	}
 	// 关闭 / 未注入复核源 / 无参考价 → 跳过（零配置零行为变化）。
 	pct := cfg.RiskGate.CrossCheckPct
 	if pct <= 0 || g.crossPrice == nil || o.Price <= 0 {
@@ -389,7 +457,8 @@ func (g *Gate) checkDayLoss(cfg config.QMTConfig, o LiveOrder) string {
 		return ""
 	}
 	// 已实现盈亏取本地账本口径；查询失败或今日为盈利（≥0）时直接放行。
-	pnl, err := g.st.TodayRealizedPnl(g.userID, g.today())
+	// §P1-e 日键按订单市场记账时区（CN 与旧口径恒等）。
+	pnl, err := g.st.TodayRealizedPnl(g.userID, g.marketToday(o.Market))
 	if err != nil || pnl >= 0 {
 		return ""
 	}
@@ -521,7 +590,8 @@ func (g *Gate) checkBuyDiscipline(cfg config.QMTConfig, o LiveOrder) string {
 	if amount <= 0 {
 		amount = o.Price * float64(o.Qty)
 	}
-	today := g.today()
+	// §P1-e 日键按订单市场记账时区（CN 与旧口径恒等；CRYPTO=UTC、US=纽约）。
+	today := g.marketToday(o.Market)
 	// 冻结账三本账各取一次：已成交买入金额（fills）、在途冻结（orders 状态派生）、卖出回款（fills）。
 	// filledAmt 是「真花掉的钱」，frozen 是「报出去还没成交、仍占着的钱」——撤单即消失；
 	// sellProceeds 是「卖出去收回的钱」——实时对冲占用，让两道金额闸都随卖出动态回血。
@@ -666,4 +736,74 @@ func (g *Gate) checkBuyDiscipline(cfg config.QMTConfig, o LiveOrder) string {
 		}
 	}
 	return ""
+}
+
+// checkMinNotional §P1-e 第 13 道闸（PLAN §9，仅 CRYPTO）：名义额低于交易所
+// MIN_NOTIONAL/NOTIONAL 过滤器的订单必然被柜台拒（-4005/486xxx 族），前置闸拦下留痕+告警，
+// 免得在真实交易所刷废单记录。数据源 symbolRules 未注入/查询失败/MinNotional≤0 一律
+// fail-open 跳过——与其他数据类闸同姿势。买卖双向同视（碎股卖出同样过不了过滤器，
+// 拦下是提示去合并余额，不是夺走退出通道）。
+// English: §P1-e gate 13 (CRYPTO only) — orders below the exchange MIN_NOTIONAL filter are
+// guaranteed exchange rejects; pre-blocking records and alerts. Fails open without rules data.
+func (g *Gate) checkMinNotional(o LiveOrder) string {
+	if o.Market != "CRYPTO" || g.symbolRules == nil {
+		return ""
+	}
+	rules, err := g.symbolRules(o.Code)
+	if err != nil || rules.MinNotional <= 0 {
+		return ""
+	}
+	amt := o.Amount
+	if amt <= 0 {
+		amt = o.Price * o.Qty
+	}
+	if amt < rules.MinNotional {
+		return fmt.Sprintf("低于交易所最小名义额: 本单 %.4f < MIN_NOTIONAL %.2f（%s %s 数量 %s），柜台必拒，请先合并或加大委托",
+			amt, rules.MinNotional, o.Side, o.Code, store.QtyString(o.Qty))
+	}
+	return ""
+}
+
+// checkLotPrecision §P1-e 第 14 道闸（PLAN §9，CRYPTO+US）：
+//   - CRYPTO：qty 非 LOT_SIZE.stepSize 整数倍 → 拒（交易所 LOT_SIZE 过滤器必拒 -1013 族）；
+//   - US：限价小数位 >2（美元美分粒度）→ 拒（486xxx 价格精度族）。市价单 Price≤0 跳过本项。
+//
+// CN 短路（➖）：A 股整手由 roundQty/下单侧保证，闸不重复设卡。
+// 浮点判定姿势：CRYPTO 用比值偏离整数 ±1e-6 容差（stepSize 量级 0.001~10，合法量比值恒近整数）；
+// US 用 strconv 最短往返十进制的小数位数（>2 位即该浮点值无法落在美分网格上，无误判面）。
+// English: §P1-e gate 14 (CRYPTO+US) — stepSize alignment for crypto, ≤2 decimal places for US
+// limit prices; CN short-circuits; both fail open without data.
+func (g *Gate) checkLotPrecision(o LiveOrder) string {
+	switch o.Market {
+	case "CRYPTO":
+		if g.symbolRules == nil || o.Qty <= 0 {
+			return ""
+		}
+		rules, err := g.symbolRules(o.Code)
+		if err != nil || rules.StepSize <= 0 {
+			return ""
+		}
+		ratio := o.Qty / rules.StepSize
+		if d := ratio - math.Round(ratio); d > 1e-6 || d < -1e-6 {
+			return fmt.Sprintf("数量未对齐交易步长: %s 非 stepSize %s 的整数倍（LOT_SIZE 过滤器必拒）",
+				store.QtyString(o.Qty), strconv.FormatFloat(rules.StepSize, 'f', -1, 64))
+		}
+	case "US":
+		if o.Price > 0 && decimalPlaces(o.Price) > 2 {
+			return fmt.Sprintf("美股限价小数位超限: %s 超过 2 位小数（美元报价粒度，价格精度过滤器必拒）",
+				strconv.FormatFloat(o.Price, 'f', -1, 64))
+		}
+	}
+	return ""
+}
+
+// decimalPlaces 最短往返十进制表示的小数位数（180.5→1、180.55→2、180.555→3）。
+// English: decimal digits of the shortest round-trip decimal representation.
+func decimalPlaces(v float64) int {
+	s := strconv.FormatFloat(v, 'f', -1, 64)
+	i := strings.IndexByte(s, '.')
+	if i < 0 {
+		return 0
+	}
+	return len(s) - i - 1
 }

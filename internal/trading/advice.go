@@ -30,7 +30,7 @@ type PositionAdvice struct {
 	Code         string    `json:"code"`          // 股票代码（纯数字，无后缀）
 	TsCode       string    `json:"ts_code"`       // 股票代码（带后缀，如 600000.SH）
 	Name         string    `json:"name"`          // 股票名称
-	Qty          int       `json:"qty"`           // 当前持仓股数
+	Qty          float64   `json:"qty"`           // 当前持仓数量（§P1-d int→float64；CN 整数值序列化串不变）
 	Action       string    `json:"action"`        // 加仓/减仓/止盈/止损/格局/持有
 	Level        string    `json:"level"`         // 高/中/低（建议强度）
 	Reason       string    `json:"reason"`        // 建议理由
@@ -100,7 +100,7 @@ type AdviceInput struct {
 	// English: §PROD-T1 — per-code sellable qty (held minus today's bought fills). Positions with zero
 	// sellable skip all sell-side advice (T+1 locked — a sell reminder the user cannot act on is
 	// misleading), while add/hold rules still run. Missing key = unknown = not locked.
-	SellableQty map[string]int
+	SellableQty map[string]float64 // §P1-d int→float64
 	// SellUnifiedOn §REFACTOR_UNIFIED_SELL P2（sell_unified_mode=on）：统一卖出裁决层已切闸，
 	// 五路卖出拼装（战法退出/纪律探针/卖点评估/情绪退潮/利空归因）全部跳过，卖出结论只允许来自
 	// SellProjection（裁决层三态的展示投影）。false=影子/关闭期，旧五路照常拼装（零行为变化）。

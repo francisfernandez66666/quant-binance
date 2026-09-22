@@ -327,7 +327,7 @@ func TestAdviseT1LockedSkipsSellSide(t *testing.T) {
 		t.Fatalf("基线应产出 2 条卖出级建议（超期），got %v", codes)
 	}
 	// 注入 000001 全锁：其卖出建议必须消失，600000 保留
-	in.SellableQty = map[string]int{"600000.SH": 100, "000001.SZ": 0}
+	in.SellableQty = map[string]float64{"600000.SH": 100, "000001.SZ": 0}
 	out := Advise(in)
 	var sellCodes []string
 	for _, a := range out {

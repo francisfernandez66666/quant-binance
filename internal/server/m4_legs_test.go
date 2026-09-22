@@ -44,7 +44,7 @@ func TestReportTradeNameLegPersists(t *testing.T) {
 	}
 
 	// 同一持仓随后到达的券商对账快照不带名称 → 旧名必须保留（不得被空串洗掉）。
-	if _, err := db.ReconcilePositionsForUser("", []store.RealPosition{
+	if _, err := db.ReconcilePositionsForUser("", "CN", []store.RealPosition{
 		{TsCode: "600519.SH", Name: "", Qty: 100, CostPrice: 10, Amount: 1000, HighestPrice: 10},
 	}); err != nil {
 		t.Fatalf("reconcile: %v", err)
@@ -54,7 +54,7 @@ func TestReportTradeNameLegPersists(t *testing.T) {
 		t.Fatalf("① 空名对账快照把持仓名称抹空了：got %q", pos.Name)
 	}
 	// 快照带非空名称时仍以快照为准（券商改名要能生效）。
-	if _, err := db.ReconcilePositionsForUser("", []store.RealPosition{
+	if _, err := db.ReconcilePositionsForUser("", "CN", []store.RealPosition{
 		{TsCode: "600519.SH", Name: "贵州茅台A", Qty: 100, CostPrice: 10, Amount: 1000, HighestPrice: 10},
 	}); err != nil {
 		t.Fatalf("reconcile 2: %v", err)
@@ -93,7 +93,7 @@ func TestReportTradeIDAnchorsPartialFills(t *testing.T) {
 		t.Fatalf("read position: %v", err)
 	}
 	if pos.Qty != 200 {
-		t.Fatalf("② 持仓量应为两笔部成合计 200（重放不得累加）：got %d", pos.Qty)
+		t.Fatalf("② 持仓量应为两笔部成合计 200（重放不得累加）：got %v", pos.Qty)
 	}
 	fills, err := db.RealFills()
 	if err != nil {

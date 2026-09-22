@@ -1284,6 +1284,25 @@ func (e *Engine) IgnoreSignal(code, strategy string) int {
 	return n
 }
 
+// roundQty §P1-d（PLAN §6.3）按市场数量取整：委托量进契约层前必须过本函数——
+//   - CN（含缺省）：向下取整到 100 股整手，与旧 `int(x/100)*100` 对正数逐字节等价（零回归）；
+//   - US：2 位小数向下截断（碎股原样允许）；
+//   - CRYPTO：原样透传——stepSize 对齐需 symbol filter 精度表，Phase 2 接入交易对元数据后
+//     在本函数内按 profile 收口（故调用方必须传市场串，禁止绕过）。
+//
+// English: per-market quantity rounding — CN floors to 100-share lots (byte-identical to the old
+// int math), US floors to 2 decimals, CRYPTO passes through until stepSize tables land in Phase 2.
+func roundQty(market string, q float64) float64 {
+	switch market {
+	case "CRYPTO":
+		return q
+	case "US":
+		return math.Floor(q*100) / 100
+	default: // CN 及存量缺省
+		return math.Floor(q/100) * 100
+	}
+}
+
 // autoPlace AUTO_TRADING_PLAN M1：qmt.enabled + mode=auto 时把做多买入信号直连网关下单。
 // 幂等：signal_id 唯一键（Orders 表 UNIQUE），熔断中跳过；现价缺省时用信号触发价。
 // 金额按 fixed_amount（受 max_positions 预检约束）；code 补后缀便于网关识别交易所。
@@ -1386,7 +1405,9 @@ func (e *Engine) autoPlace(sig combat_agent.Signal, live map[string]*data.StockI
 			}
 		}
 	}
-	qty := int(amount/price/100) * 100
+	// §P1-d（PLAN §6.3）整手 100 硬编码收编进按市场取整函数：CN 口径逐字节等价
+	// （floor(qty/100)*100 与旧 int(x/100)*100 对正数同结果），CRYPTO/US 分支留给币安通道。
+	qty := roundQty("CN", amount/price)
 	// §R0.7 修复：高价股不足一手时不再强凑 1 手（旧逻辑 qty=100 导致订单金额超预算数倍）
 	if qty <= 0 {
 		log.Printf("[qmt] %s 金额不足以买一手，跳过下单", sig.Code)
@@ -1416,7 +1437,7 @@ func (e *Engine) autoPlace(sig combat_agent.Signal, live map[string]*data.StockI
 	}
 	{
 		// 预留 0.6% 佣金/过户费余量，避免贴着可用资金下单被柜台以"资金不足"废单
-		affordable := int(cash*0.994/price/100) * 100
+		affordable := roundQty("CN", cash*0.994/price)
 		if affordable < qty {
 			if affordable <= 0 {
 				log.Printf("[qmt] %s 可用资金 %.0f 不足以买一手(现价 %.2f)，跳过下单", sig.Code, cash, price)
@@ -1425,9 +1446,9 @@ func (e *Engine) autoPlace(sig combat_agent.Signal, live map[string]*data.StockI
 				})
 				return
 			}
-			log.Printf("[qmt] %s 可用资金 %.0f 不足按预算 %d 股买入，自动降档为 %d 股(约 %.0f 元)",
-				sig.Code, cash, qty, affordable, float64(affordable)*price)
-			opslog.Logf("quant", "资金降档 %s 预算=%d股→%d股 可用=%.0f 现价=%.2f", sig.Code, qty, affordable, cash, price)
+			log.Printf("[qmt] %s 可用资金 %.0f 不足按预算 %s 股买入，自动降档为 %s 股(约 %.0f 元)",
+				sig.Code, cash, store.QtyString(qty), store.QtyString(affordable), affordable*price)
+			opslog.Logf("quant", "资金降档 %s 预算=%s股→%s股 可用=%.0f 现价=%.2f", sig.Code, store.QtyString(qty), store.QtyString(affordable), cash, price)
 			qty = affordable
 		}
 	}
@@ -1510,14 +1531,14 @@ func (e *Engine) autoPlace(sig combat_agent.Signal, live map[string]*data.StockI
 			// 自愈依赖战法当日重新翻转，重启后条件变化即不再翻转发单；排队单现随停机排空落盘
 			// （见 buy_queue_persist.go），下单侧幂等仍由 orders 表 signal_id 唯一键兜底。
 			metrics.SetGauge("buy_queue_depth", int64(len(buyCh)))
-			log.Printf("[trading] auto order queued %s(%s) qty=%d price=%.2f (async)", sig.Code, sig.Name, qty, price)
+			log.Printf("[trading] auto order queued %s(%s) qty=%s price=%.2f (async)", sig.Code, sig.Name, store.QtyString(qty), price)
 		default:
-			log.Printf("[trading] auto order QUEUE FULL → 同步下单兜底 %s(%s) qty=%d price=%.2f", sig.Code, sig.Name, qty, price)
-			opslog.Logf("quant", "auto 买单队列满回落同步 %s(%s) qty=%d price=%.2f", sig.Code, sig.Name, qty, price)
+			log.Printf("[trading] auto order QUEUE FULL → 同步下单兜底 %s(%s) qty=%s price=%.2f", sig.Code, sig.Name, store.QtyString(qty), price)
+			opslog.Logf("quant", "auto 买单队列满回落同步 %s(%s) qty=%s price=%.2f", sig.Code, sig.Name, store.QtyString(qty), price)
 			if res, err := ctrl.PlaceOrder(req); err != nil {
 				log.Printf("[trading] auto order(同步兜底) %s(%s): %v", sig.Code, sig.Name, err)
 			} else {
-				log.Printf("[trading] auto order(同步兜底) %s(%s) qty=%d price=%.2f → %+v", sig.Code, sig.Name, qty, price, res)
+				log.Printf("[trading] auto order(同步兜底) %s(%s) qty=%s price=%.2f → %+v", sig.Code, sig.Name, store.QtyString(qty), price, res)
 			}
 		}
 	} else {
@@ -1526,7 +1547,7 @@ func (e *Engine) autoPlace(sig combat_agent.Signal, live map[string]*data.StockI
 			log.Printf("[trading] auto order %s(%s): %v", sig.Code, sig.Name, err)
 			return
 		}
-		log.Printf("[trading] auto order %s(%s) qty=%d price=%.2f → %+v", sig.Code, sig.Name, qty, price, res)
+		log.Printf("[trading] auto order %s(%s) qty=%s price=%.2f → %+v", sig.Code, sig.Name, store.QtyString(qty), price, res)
 	}
 }
 
@@ -1640,10 +1661,10 @@ func (e *Engine) placeOrderNow(req trading.OrderRequest, sig combat_agent.Signal
 		log.Printf("[trading] auto order %s(%s): %v", sig.Code, sig.Name, err)
 		return
 	}
-	log.Printf("[trading] auto order %s(%s) qty=%d price=%.2f → %+v", sig.Code, sig.Name, req.Qty, req.Price, res)
+	log.Printf("[trading] auto order %s(%s) qty=%s price=%.2f → %+v", sig.Code, sig.Name, store.QtyString(req.Qty), req.Price, res)
 	// §DAILY_OPSLOG auto 实际下单结果（受理/业务拒单由 controller 侧另记，此处补策略上下文）
-	opslog.Logf("quant", "auto 下单 %s(%s) 策略=%s/%s qty=%d price=%.2f → ok=%v order=%s err=%s",
-		sig.Code, sig.Name, req.StrategyID, req.Strategy, req.Qty, req.Price, res.OK, res.OrderID, res.Err)
+	opslog.Logf("quant", "auto 下单 %s(%s) 策略=%s/%s qty=%s price=%.2f → ok=%v order=%s err=%s",
+		sig.Code, sig.Name, req.StrategyID, req.Strategy, store.QtyString(req.Qty), req.Price, res.OK, res.OrderID, res.Err)
 }
 
 // SetScoringInterval §A+B 设置近实时打分循环间隔（0 → 回退 5s）。

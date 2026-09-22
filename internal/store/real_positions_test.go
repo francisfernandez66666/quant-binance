@@ -104,13 +104,13 @@ func TestSumFilledQtyPrefix(t *testing.T) {
 	// 另一账号同码同键 999 不得串入
 	ins("U2", base, 999)
 	if got := db.SumFilledQty("U1", base); got != 700 {
-		t.Fatalf("SumFilledQty(U1, base) 应 700，got %d", got)
+		t.Fatalf("SumFilledQty(U1, base) 应 700，got %v", got)
 	}
 	if got := db.SumFilledQty("U1", base+":r700"); got != 400 {
-		t.Fatalf("SumFilledQty(U1, base:r700) 应 400，got %d", got)
+		t.Fatalf("SumFilledQty(U1, base:r700) 应 400，got %v", got)
 	}
 	if got := db.SumFilledQty("U2", base); got != 999 {
-		t.Fatalf("SumFilledQty(U2, base) 应 999，got %d", got)
+		t.Fatalf("SumFilledQty(U2, base) 应 999，got %v", got)
 	}
 }
 
@@ -219,7 +219,7 @@ func TestReconcileLegacyRowPrunedWhenNotInSnapshot(t *testing.T) {
 		t.Fatal(err)
 	}
 	// 用户 B 做全量对账：快照只有 600000（自身），不含 600519 也不含 600519 的归属声明
-	if n, err := db.ReconcilePositionsForUser("u_b", []RealPosition{
+	if n, err := db.ReconcilePositionsForUser("u_b", "CN", []RealPosition{
 		{TsCode: "600000.SH", Name: "浦发", Qty: 300},
 	}); err != nil {
 		t.Fatal(err)
@@ -247,7 +247,7 @@ func TestApplyRealFillIdempotent(t *testing.T) {
 	}
 	p, _ := db.RealPositionByCode("600519.SH")
 	if p.Qty != 100 {
-		t.Fatalf("首笔后持仓应 100, got %d", p.Qty)
+		t.Fatalf("首笔后持仓应 100, got %v", p.Qty)
 	}
 	// 同一笔重放：唯一键冲突 → 幂等成功（err==nil）且持仓不变
 	if err := db.ApplyRealFill(f); err != nil {
@@ -255,7 +255,7 @@ func TestApplyRealFillIdempotent(t *testing.T) {
 	}
 	p, _ = db.RealPositionByCode("600519.SH")
 	if p.Qty != 100 {
-		t.Fatalf("重放后持仓仍应 100, got %d", p.Qty)
+		t.Fatalf("重放后持仓仍应 100, got %v", p.Qty)
 	}
 	// 真正的新成交（不同回报时间戳）正常累加
 	f2 := f
@@ -264,7 +264,7 @@ func TestApplyRealFillIdempotent(t *testing.T) {
 		t.Fatalf("second distinct fill: %v", err)
 	}
 	if p, _ = db.RealPositionByCode("600519.SH"); p.Qty != 200 {
-		t.Fatalf("新成交应累加到 200, got %d", p.Qty)
+		t.Fatalf("新成交应累加到 200, got %v", p.Qty)
 	}
 }
 
@@ -461,7 +461,7 @@ func TestApplyRealFillIdempotentDuplicate(t *testing.T) {
 	}
 	p, _ := db.RealPositionByCode("600000.SH")
 	if p.Qty != 100 {
-		t.Fatalf("重复投递后持仓应仍为 100, got %d", p.Qty)
+		t.Fatalf("重复投递后持仓应仍为 100, got %v", p.Qty)
 	}
 	fills, _ := db.RealFills()
 	if len(fills) != 1 {
@@ -474,7 +474,7 @@ func TestApplyRealFillIdempotentDuplicate(t *testing.T) {
 	}
 	p, _ = db.RealPositionByCode("600000.SH")
 	if p.Qty != 200 {
-		t.Fatalf("部分成交第二笔应累加至 200, got %d", p.Qty)
+		t.Fatalf("部分成交第二笔应累加至 200, got %v", p.Qty)
 	}
 }
 
@@ -492,15 +492,15 @@ func TestBuyDateAndT1Sellable(t *testing.T) {
 		t.Fatalf("open overnight: %v", err)
 	}
 	if got := db.TodayBoughtQty("u1", "600000.SH", "2026-09-08"); got != 100 {
-		t.Fatalf("今日买入应 100, got %d", got)
+		t.Fatalf("今日买入应 100, got %v", got)
 	}
 	// 可卖 = 150 − 100 = 50（当日买入的 100 股 T+1 锁定）
 	if got := db.BuyableQtyForUserSell("u1", "600000.SH", "2026-09-08"); got != 50 {
-		t.Fatalf("可卖应 50, got %d", got)
+		t.Fatalf("可卖应 50, got %v", got)
 	}
 	// 账号隔离：u2 看不到 u1 的买入
 	if got := db.TodayBoughtQty("u2", "600000.SH", "2026-09-08"); got != 0 {
-		t.Fatalf("u2 今日买入应 0, got %d", got)
+		t.Fatalf("u2 今日买入应 0, got %v", got)
 	}
 }
 
@@ -540,7 +540,7 @@ func TestScopedDeleteAfterClose(t *testing.T) {
 func TestRealPositionsBuyDateRoundTrip(t *testing.T) {
 	db := testDB(t)
 	// 券商快照对账先行：全量语义会删除快照外持仓，故先建"无 buy_date 的历史行"再走成交建仓
-	if _, err := db.ReconcilePositionsForUser("u_boss", []RealPosition{{TsCode: "600000.SH", Name: "浦发", Qty: 300, CostPrice: 10}}); err != nil {
+	if _, err := db.ReconcilePositionsForUser("u_boss", "CN", []RealPosition{{TsCode: "600000.SH", Name: "浦发", Qty: 300, CostPrice: 10}}); err != nil {
 		t.Fatalf("reconcile: %v", err)
 	}
 	if err := db.ApplyRealFill(RealFill{OrderID: "A7O1", Code: "603468.SH", Name: "津富士达", Side: "买入", Price: 22.61, Qty: 100, Amount: 2261, TradedAt: "2026-09-18 09:40:00", UserID: "u_boss", SignalID: "SIG-A7-1"}); err != nil {
@@ -711,7 +711,7 @@ func TestApplyRealFillBuyCostIncludesFee(t *testing.T) {
 		t.Fatalf("sell: %v", err)
 	}
 	if p, _ = db.RealPositionByCode("600519.SH"); p.Qty != 100 || p.CostPrice != 11.055 {
-		t.Fatalf("卖出不改写每股成本, got qty=%d cost=%v", p.Qty, p.CostPrice)
+		t.Fatalf("卖出不改写每股成本, got qty=%v cost=%v", p.Qty, p.CostPrice)
 	}
 	// RealFills 读回必须带 fee/stamp_tax/user_id 腿（旧 SELECT 丢列——重放拿不到费用）
 	fills, err := db.RealFills()
@@ -748,7 +748,7 @@ func TestReconcileRejectsInvalidTsCode(t *testing.T) {
 		{TsCode: "", Name: "垃圾行", Qty: 100, CostPrice: 1},
 		{TsCode: "600519", Name: "缺后缀", Qty: 100, CostPrice: 1},
 	}
-	if _, err := db.ReconcilePositionsForUser("u_f2", bad); err == nil {
+	if _, err := db.ReconcilePositionsForUser("u_f2", "CN", bad); err == nil {
 		t.Fatal("混入非法 ts_code 的快照应整批拒收")
 	} else if !errors.Is(err, ErrInvalidPositionReport) {
 		t.Fatalf("拒收错误应包装 ErrInvalidPositionReport, got %v", err)
@@ -766,10 +766,10 @@ func TestReconcileRejectsInvalidTsCode(t *testing.T) {
 		{TsCode: "920001.BJ", Name: "北交所", Qty: 100, CostPrice: 10},
 		{TsCode: "000001.SZ", Name: "平安", Qty: 100, CostPrice: 12},
 	}
-	if n, err := db.ReconcilePositionsForUser("u_f2", ok); err != nil || n != 2 {
+	if n, err := db.ReconcilePositionsForUser("u_f2", "CN", ok); err != nil || n != 2 {
 		t.Fatalf("合法快照应正常对账, n=%d err=%v", n, err)
 	}
-	if _, err := db.ReconcilePositionsForUser("u_f2", nil); err != nil {
+	if _, err := db.ReconcilePositionsForUser("u_f2", "CN", nil); err != nil {
 		t.Fatalf("空快照（合法全平语义）不应被校验拒收: %v", err)
 	}
 }
@@ -788,7 +788,7 @@ func TestReconcileDoesNotWashStrategyAttribution(t *testing.T) {
 		t.Fatalf("seed: %v", err)
 	}
 	// 快照不带 strategy/signal_id（券商口径），仅数量变化
-	if _, err := db.ReconcilePositionsForUser("", []RealPosition{
+	if _, err := db.ReconcilePositionsForUser("", "CN", []RealPosition{
 		{TsCode: "600000.SH", Name: "浦发", Qty: 120, CostPrice: 10},
 	}); err != nil {
 		t.Fatalf("reconcile: %v", err)
@@ -798,13 +798,13 @@ func TestReconcileDoesNotWashStrategyAttribution(t *testing.T) {
 		t.Fatalf("read: %v", err)
 	}
 	if p.Qty != 120 {
-		t.Fatalf("数量应被快照刷新为 120, got %d", p.Qty)
+		t.Fatalf("数量应被快照刷新为 120, got %v", p.Qty)
 	}
 	if p.Strategy != "N字反包" || p.SignalID != "buy:600000" {
 		t.Fatalf("§M5 空快照归因被洗白: strategy=%q signal_id=%q", p.Strategy, p.SignalID)
 	}
 	// 快照携带非空 strategy/signal_id → 新值覆盖（归因修正通道不被守卫误锁）
-	if _, err := db.ReconcilePositionsForUser("", []RealPosition{
+	if _, err := db.ReconcilePositionsForUser("", "CN", []RealPosition{
 		{TsCode: "600000.SH", Name: "浦发", Qty: 120, CostPrice: 10, Strategy: "龙头首阴", SignalID: "manual-fix"},
 	}); err != nil {
 		t.Fatalf("reconcile2: %v", err)

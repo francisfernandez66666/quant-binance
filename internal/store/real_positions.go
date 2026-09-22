@@ -2,9 +2,14 @@
 // real_positions.go：实盘账本（AUTO_TRADING_PLAN M1）的真实持仓/委托/成交存取。
 // 数据源为国内 QMT 网关回报（全量对账 positions 事件 + 增量 trade/order 事件），
 // 与纸面账本（report.Report JSON）完全独立（双账本并存）。
+// §BINANCE-P1c（PLAN §5）：本文件的持仓/委托/成交三表全面接入 market/currency 维度——
+// PK 扩 (market,ts_code,user_id)、代码校验按市场三正则分治、写入路径逐条盖市场章、
+// 删除/claim 谓词市场隔离；CN 链行为与改造前逐字节等价（空 market 一律归一为 CN）。
 // English: real-book persistence for AUTO_TRADING_PLAN M1 — real positions/orders/fills written from
 // the domestic QMT gateway reports (full reconciliation + incremental trade/order events), fully
 // independent of the paper book (report.Report JSON). Dual ledgers coexist.
+// §BINANCE-P1c: market/currency dimension across all three ledgers; CN behavior stays identical
+// (an empty market always normalizes to CN).
 package store
 
 import (
@@ -23,9 +28,16 @@ import (
 // RealPosition 实盘持仓行。
 // （RealPosition is one row of the live book.）
 type RealPosition struct {
+	// Market/Currency §BINANCE-P1c（PLAN §5.2/§6.6）：市场维度 CN|US|CRYPTO 与计价币。
+	// 复合主键升级为 (market,ts_code,user_id)——同一代号在不同市场分属不同持仓；
+	// 空串按 CN 归一（存量网关回报零改动兼容）。json tag 进入回报契约 golden 反射面。
+	// English: §BINANCE-P1c — market/quote-currency legs; empty market normalizes to CN so
+	// existing QMT payloads are accepted unchanged. Both tags join the report contract golden.
+	Market       string  `json:"market"`
+	Currency     string  `json:"currency"`
 	TsCode       string  `json:"ts_code"`       // TS代码
 	Name         string  `json:"name"`          // 名称
-	Qty          int     `json:"qty"`           // 数量
+	Qty          float64 `json:"qty"`           // 数量（§P1-d int→float64，支持加密小数）
 	CostPrice    float64 `json:"cost_price"`    // 成本价
 	Amount       float64 `json:"amount"`        // 成交额
 	HighestPrice float64 `json:"highest_price"` // 持仓以来最高价（加仓/格局判定用）
@@ -56,9 +68,12 @@ type RealOrder struct {
 	Side      string  `json:"side"`              // 方向
 	Status    string  `json:"status"`            // 状态
 	Price     float64 `json:"price"`             // 价格
-	Qty       int     `json:"qty"`               // 数量
+	Qty       float64 `json:"qty"`               // 数量（§P1-d int→float64）
 	CreatedAt string  `json:"created_at"`        // 创建时间
 	UserID    string  `json:"user_id,omitempty"` // §W2-10 归属账号（空=遗留全局行）
+	// Market/Currency §BINANCE-P1c：委托归属市场与计价币，空串按 CN 归一（QMT 链零改动）。
+	Market   string `json:"market,omitempty"`
+	Currency string `json:"currency,omitempty"`
 }
 
 // RealFill 实盘成交回报行。
@@ -70,7 +85,7 @@ type RealFill struct {
 	Name     string  `json:"name"`      // 名称（成交回报携带，建仓回填）
 	Side     string  `json:"side"`      // 方向
 	Price    float64 `json:"price"`     // 价格
-	Qty      int     `json:"qty"`       // 数量
+	Qty      float64 `json:"qty"`       // 数量（§P1-d int→float64）
 	Amount   float64 `json:"amount"`    // 成交额
 	TradedAt string  `json:"traded_at"` // 成交时间
 	SignalID string  `json:"signal_id"` // 信号ID
@@ -84,12 +99,95 @@ type RealFill struct {
 	Fee      float64 `json:"fee,omitempty"`       // §WS-B 手续费（交割单回灌）
 	StampTax float64 `json:"stamp_tax,omitempty"` // §WS-B 印花税（交割单回灌）
 	Serial   string  `json:"serial,omitempty"`    // §WS-B 券商交割流水号（三方对账关联键）
+	// Market/Currency §BINANCE-P1c：成交归属市场与计价币，空串按 CN 归一（QMT 链零改动）。
+	// English: §BINANCE-P1c — fill's market/quote-currency legs; empty normalizes to CN.
+	Market   string `json:"market,omitempty"`
+	Currency string `json:"currency,omitempty"`
 }
 
-// realTsCodeRe §F2（2026-09-22 修复批）：持仓对账行 ts_code 的合法格式——
-// 6位数字 + .SH/.SZ/.BJ 交易所后缀（与 data.ExchangeSuffix 产出口径一致）。
-// English: §F2 — the only accepted ts_code shape on reconcile rows: 6 digits + .SH/.SZ/.BJ.
-var realTsCodeRe = regexp.MustCompile(`^[0-9]{6}\.(SH|SZ|BJ)$`)
+// §BINANCE-P1c（PLAN §5.3）代码合法性按市场分治——原 §F2 单正则（realTsCodeRe）只认
+// A股 6 位码+.SH/.SZ/.BJ，币安通道的 BTCUSDT/AAPL 会被整批拒收。三正则各管一个市场，
+// CN 正则与原 realTsCodeRe 逐字节同式（QMT 链零回归）。
+// English: §BINANCE-P1c — per-market ts_code validation; the CN regex is byte-identical to
+// the old realTsCodeRe so the QMT chain keeps exactly the same accept/reject behavior.
+var (
+	cnTsCodeRe     = regexp.MustCompile(`^[0-9]{6}\.(SH|SZ|BJ)$`) // 600519.SH / 000001.SZ / 830799.BJ
+	cryptoTsCodeRe = regexp.MustCompile(`^[A-Z0-9]{2,20}$`)       // BTCUSDT / ETHUSDC（交易对=基币+计价币大写连写）
+	usTsCodeRe     = regexp.MustCompile(`^[A-Z][A-Z0-9.]{0,9}$`)  // AAPL / BRK.B / SPY
+)
+
+// validTsCode 按市场判定代码合法形态（唯一权威）。market 缺省（含空串）一律走 CN 口径。
+// English: validTsCode is the single source of truth for per-market code shapes; anything
+// unspecified (empty string included) falls back to the CN rule, matching legacy behavior.
+func validTsCode(market, code string) bool {
+	switch market {
+	case "CRYPTO":
+		return cryptoTsCodeRe.MatchString(code)
+	case "US":
+		return usTsCodeRe.MatchString(code)
+	default: // CN 及存量缺省
+		return cnTsCodeRe.MatchString(code)
+	}
+}
+
+// normalizeMarket §BINANCE-P1c：市场串归一（空/未知大小写 → 大写；空串缺省 CN）。
+// 回报体不带 market 即存量 QMT 网关，落 CN 与迁移回填值同口径。
+// English: normalizeMarket upper-cases the market token and defaults an empty one to CN —
+// the shape legacy QMT payloads arrive in.
+func normalizeMarket(market string) string {
+	m := strings.ToUpper(strings.TrimSpace(market))
+	if m == "" {
+		return "CN"
+	}
+	return m
+}
+
+// defaultCurrency §BINANCE-P1c：按市场给计价币缺省（CN→CNY、US→USD、CRYPTO→USDT）。
+// 加密货币的实际计价币以行自带 currency 为准（ETHUSDC 行由写入方打 USDC），
+// 这里只兜底"写入方未指定"的场合。
+// English: per-market fallback quote currency; writers stamp the real quote (USDC etc.)
+// explicitly and this only covers rows that arrive without one.
+func defaultCurrency(market string) string {
+	switch market {
+	case "US":
+		return "USD"
+	case "CRYPTO":
+		return "USDT"
+	default: // CN 及未知市场：与存量回填值同口径
+		return "CNY"
+	}
+}
+
+// stampPositionMarket §BINANCE-P1c：给持仓行归一并回写 market/currency（快照级 market 作缺省，
+// 行自带值优先——同一函数服务混合快照与单市场快照）。
+func stampPositionMarket(p *RealPosition, snapshotMarket string) {
+	m := snapshotMarket
+	if p.Market != "" {
+		m = p.Market
+	}
+	p.Market = normalizeMarket(m)
+	if p.Currency == "" {
+		p.Currency = defaultCurrency(p.Market)
+	}
+}
+
+// anySlice §BINANCE-P1c：字符串切片转 SQL 参数切片（逐市场 NOT IN 删除的参数拼装用）。
+func anySlice(ss []string) []any {
+	out := make([]any, len(ss))
+	for i, s := range ss {
+		out[i] = s
+	}
+	return out
+}
+
+// QtyString §P1-d（Qty int→float64 波及）：数量的人读/日志/对账事实键统一渲染——
+// 十进制最短形式、恒不带指数。旧 `%d` 随类型失配，`%g` 直排对 1000000 输出 "1e+06"、
+// 对 0.00001 输出 "1e-05"，既污染 CN 存量日志口径（回归按字面比对）又在券商对账文案里
+// 不可读；本函数保证整数值与旧 %d 逐字节同串（100→"100"），小数值原样最短（0.5→"0.5"）。
+// English: QtyString renders quantities in shortest decimal WITHOUT exponent notation — integral
+// values stay byte-identical to legacy %d (CN zero-regression gate); %g's 1e+06/1e-05 forms are
+// avoided in logs, ops messages and reconciliation fact keys.
+func QtyString(q float64) string { return strconv.FormatFloat(q, 'f', -1, 64) }
 
 // ErrInvalidPositionReport §F2：对账快照字段级校验失败的哨兵错误——任一行 ts_code 为空或
 // 非法格式即整批拒收（不落库），上层（handleQMTReport）据 errors.Is 映射为 HTTP 400。
@@ -99,16 +197,20 @@ var realTsCodeRe = regexp.MustCompile(`^[0-9]{6}\.(SH|SZ|BJ)$`)
 // the HTTP layer maps it to 400 via errors.Is.
 var ErrInvalidPositionReport = errors.New("positions 快照字段校验失败")
 
-// validateRealPositions §F2：全量对账入口校验。空快照（len==0，合法全平语义）直接放行；
-// 任一行 ts_code 空或非法格式 → 返回包装了 ErrInvalidPositionReport 的错误（含行号与原值），
-// 调用方必须整批拒收并 opslog 留痕，绝不部分落库。
-// English: §F2 entry validation for full reconciliation snapshots; empty = legit flat passes,
-// any malformed ts_code rejects the entire batch with row context.
-func validateRealPositions(pos []RealPosition) error {
+// validateRealPositions §F2+§BINANCE-P1c：全量对账入口校验。空快照（len==0，合法全平语义）直接放行；
+// 任一行 ts_code 按其市场（行自带优先，缺省用快照级 market）校验失败 → 返回包装了
+// ErrInvalidPositionReport 的错误（含行号与原值），调用方必须整批拒收并 opslog 留痕，绝不部分落库。
+// English: §F2+P1c entry validation for full reconciliation snapshots; empty = legit flat passes,
+// any ts_code invalid for its market rejects the entire batch with row context.
+func validateRealPositions(market string, pos []RealPosition) error {
 	for i := range pos {
-		if !realTsCodeRe.MatchString(pos[i].TsCode) {
-			return fmt.Errorf("%w: 第 %d 行 ts_code=%q 为空或非法格式（应为 6位数字+.SH/.SZ/.BJ）",
-				ErrInvalidPositionReport, i, pos[i].TsCode)
+		m := normalizeMarket(market)
+		if pos[i].Market != "" {
+			m = normalizeMarket(pos[i].Market)
+		}
+		if !validTsCode(m, pos[i].TsCode) {
+			return fmt.Errorf("%w: 第 %d 行 market=%s ts_code=%q 为空或非法格式（CN=6位数字+.SH/.SZ/.BJ，US=字母代号，CRYPTO=大写交易对）",
+				ErrInvalidPositionReport, i, m, pos[i].TsCode)
 		}
 	}
 	return nil
@@ -118,8 +220,8 @@ func validateRealPositions(pos []RealPosition) error {
 // 返回替换后的持仓数量。English: full-reconciliation write — upserts every gateway position and drops
 // rows absent from the push; returns the resulting position count.
 func (d *DB) UpsertRealPositions(pos []RealPosition) (int, error) {
-	// §F2（2026-09-22 修复批）：字段级校验前置——任一行 ts_code 非法即整批拒收不落库。
-	if err := validateRealPositions(pos); err != nil {
+	// §F2（2026-09-22 修复批）：字段级校验前置——任一行 ts_code 对其市场非法即整批拒收不落库。
+	if err := validateRealPositions("", pos); err != nil {
 		log.Printf("[store] §F2 持仓对账整批拒收: %v", err)
 		opslog.Logf("quant", "持仓对账整批拒收(§F2 字段校验)：%v", err)
 		return 0, err
@@ -129,20 +231,29 @@ func (d *DB) UpsertRealPositions(pos []RealPosition) (int, error) {
 		return 0, err
 	}
 	defer tx.Rollback()
+	// §BINANCE-P1c 修复：market/currency 必须就地把 pos 归一，而不是只在下面 for-范围 的副本上盖——
+	// 副本 stamp 不进原切片，导致后续按 p.Market 分组的 NOT IN 删除谓词拿到空市场串、
+	// 一行都删不掉（表现为全量对账后旧持仓残留、计数虚高）。
+	// English: stamp in place — stamping only the range-loop copy left the original rows market-less,
+	// so the per-market NOT IN delete matched nothing and stale positions survived reconciliation.
+	for i := range pos {
+		stampPositionMarket(&pos[i], "")
+	}
 	for _, p := range pos {
 		if p.UpdatedAt == "" {
 			p.UpdatedAt = time.Now().Format("2006-01-02 15:04:05")
 		}
 		// §P0-1 多租户：带归属账号的对账先声明遗留全局行，避免复合主键冲突产生重复行。
+		// §BINANCE-P1c：claim 限定同市场——跨市场同代号（防御性 PK 维度）不得互抢归属。
 		if p.UserID != "" {
-			if _, err := tx.Exec(`UPDATE real_positions SET user_id=? WHERE ts_code=? AND user_id=''`, p.UserID, p.TsCode); err != nil {
+			if _, err := tx.Exec(`UPDATE real_positions SET user_id=? WHERE market=? AND ts_code=? AND user_id=''`, p.UserID, p.Market, p.TsCode); err != nil {
 				return 0, fmt.Errorf("claim legacy position %s: %w", p.TsCode, err)
 			}
 		}
 		_, err := tx.Exec(`INSERT INTO real_positions
-			(ts_code, name, qty, cost_price, amount, highest_price, strategy, signal_id, updated_at, user_id)
-			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-			ON CONFLICT(ts_code, user_id) DO UPDATE SET
+			(market, currency, ts_code, name, qty, cost_price, amount, highest_price, strategy, signal_id, updated_at, user_id)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			ON CONFLICT(market, ts_code, user_id) DO UPDATE SET
 				-- §M4（2026-09-22 PM 批）空名快照不得抹空已有名称：券商持仓快照常不带 name，
 				-- 旧实现 excluded.name('') 直覆盖 → 实盘持仓页只剩代码。与同语句 strategy 的
 				-- §M5 保护同口径（COALESCE(NULLIF(新,''),旧)）。
@@ -156,9 +267,10 @@ func (d *DB) UpsertRealPositions(pos []RealPosition) (int, error) {
 				strategy=COALESCE(NULLIF(excluded.strategy,''), real_positions.strategy),
 				updated_at=excluded.updated_at,
 				user_id=excluded.user_id,
+				currency=excluded.currency,
 				highest_price=CASE WHEN excluded.highest_price > real_positions.highest_price
 					THEN excluded.highest_price ELSE real_positions.highest_price END`,
-			p.TsCode, p.Name, p.Qty, p.CostPrice, p.Amount, p.HighestPrice, p.Strategy, p.SignalID, p.UpdatedAt, p.UserID)
+			p.Market, p.Currency, p.TsCode, p.Name, p.Qty, p.CostPrice, p.Amount, p.HighestPrice, p.Strategy, p.SignalID, p.UpdatedAt, p.UserID)
 		if err != nil {
 			return 0, fmt.Errorf("upsert real position %s: %w", p.TsCode, err)
 		}
@@ -167,11 +279,18 @@ func (d *DB) UpsertRealPositions(pos []RealPosition) (int, error) {
 	// §修复 R9（2026-08-29）：原 len(pos)==0 分支是 `DELETE FROM real_positions` 全表删除，
 	// 多租户下任一账号推送空快照即清掉所有账号持仓（清库炸弹）。现按 user_id 作用域删除：
 	// 仅当 pos 含归属账号时才限定到这些账号行；无归属账号(旧单租户/测试)保留原行为。
+	// §BINANCE-P1c：非空快照的删除按 快照内出现的每个市场 逐市场执行，删除集只覆盖
+	// "该市场、不在该市场快照代码集"的行——币安快照永不波及 CN 持仓行（反之亦然）。
 	userSet := make(map[string]bool)
+	marketCodes := make(map[string][]string) // §P1c 逐市场代码集，供分市场 NOT IN 删除
 	for _, p := range pos {
 		if p.UserID != "" {
 			userSet[p.UserID] = true
 		}
+		if _, ok := marketCodes[p.Market]; !ok {
+			marketCodes[p.Market] = make([]string, 0, len(pos))
+		}
+		marketCodes[p.Market] = append(marketCodes[p.Market], p.TsCode)
 	}
 	if len(pos) == 0 {
 		if len(userSet) == 0 {
@@ -195,24 +314,21 @@ func (d *DB) UpsertRealPositions(pos []RealPosition) (int, error) {
 			}
 		}
 	} else {
-		codes := make([]any, 0, len(pos))
-		placeholders := ""
-		for i, p := range pos {
-			codes = append(codes, p.TsCode)
-			if i > 0 {
-				placeholders += ","
+		// 逐市场删除：本市场快照外的行清除，其它市场的行整体不在射程内。
+		for market, codes := range marketCodes {
+			placeholders := strings.TrimSuffix(strings.Repeat("?,", len(codes)), ",")
+			if len(userSet) == 0 {
+				// 旧单租户 / 测试：原整表 NOT IN 语义（§P1c 起按市场分片，单市场快照与旧行为等价）
+				args := append([]any{market}, anySlice(codes)...)
+				if _, err := tx.Exec(`DELETE FROM real_positions WHERE market=? AND ts_code NOT IN (`+placeholders+`)`, args...); err != nil {
+					return 0, err
+				}
+				continue
 			}
-			placeholders += "?"
-		}
-		if len(userSet) == 0 {
-			// 旧单租户 / 测试：原整表 NOT IN 语义
-			if _, err := tx.Exec(`DELETE FROM real_positions WHERE ts_code NOT IN (`+placeholders+`)`, codes...); err != nil {
-				return 0, err
-			}
-		} else {
 			// 多租户：仅删这些账号、且不在推送集合内的行
-			args := make([]any, 0, len(codes)+len(userSet))
+			args := make([]any, 0, len(codes)+len(userSet)+1)
 			ph := ""
+			args = append(args, market)
 			for u := range userSet {
 				if ph != "" {
 					ph += ","
@@ -220,8 +336,8 @@ func (d *DB) UpsertRealPositions(pos []RealPosition) (int, error) {
 				ph += "?"
 				args = append(args, u)
 			}
-			args = append(args, codes...)
-			if _, err := tx.Exec(`DELETE FROM real_positions WHERE user_id IN (`+ph+`) AND ts_code NOT IN (`+placeholders+`)`, args...); err != nil {
+			args = append(args, anySlice(codes)...)
+			if _, err := tx.Exec(`DELETE FROM real_positions WHERE market=? AND user_id IN (`+ph+`) AND ts_code NOT IN (`+placeholders+`)`, args...); err != nil {
 				return 0, err
 			}
 		}
@@ -236,20 +352,22 @@ func (d *DB) UpsertRealPositions(pos []RealPosition) (int, error) {
 	return n, nil
 }
 
-// ReconcilePositionsForUser §R3-8 P1-G 用户隔离的全量对账写入（Controller.Reconcile 专用）：
-//   - 每行打 UserID 归属后 upsert；
-//   - 删除范围限定在 本账号行 ∪ 遗留全局行（user_id=”）——绝不动其他账号的 scoped 行
-//     （旧 UpsertRealPositions 空集合分支是 DELETE FROM real_positions 全表，多租户下是清库炸弹）；
-//   - pos 为空 = 网关全平，调用方必须已做「通道在线」守卫（网关 /state 断连时也返回空列表，
+// ReconcilePositionsForUser §R3-8 P1-G 用户隔离的全量对账写入（Controller.Reconcile / 回报线程专用）：
+//   - 每行打 UserID 与 Market（§BINANCE-P1c：market 参数归一，空串=CN）归属后 upsert；
+//   - 删除范围限定在 本账号行 ∪ 遗留全局行（user_id=”）∩ market 参数指定市场——绝不动
+//     其他账号的 scoped 行，也绝不让币安快照误清 CN 持仓（跨市场误删闸，反之亦然）；
+//   - pos 为空 = 该市场网关全平，调用方必须已做「通道在线」守卫（网关 /state 断连时也返回空列表，
 //     不可信快照禁止清账）。
 //
-// English: R3-8 P1-G — user-scoped full reconciliation write: stamps ownership on every row,
-// deletes only this account's rows plus legacy global rows; never touches other accounts' rows.
-// An empty pos means "gateway flat" — the caller must have verified the channel is connected.
-func (d *DB) ReconcilePositionsForUser(userID string, pos []RealPosition) (int, error) {
-	// §F2（2026-09-22 修复批）：字段级校验前置——任一行 ts_code 非法即整批拒收不落库，
+// English: R3-8 P1-G + §BINANCE-P1c — user-and-market scoped full reconciliation write: stamps ownership
+// and market on every row, deletes only this account's rows plus legacy global rows *within the given
+// market*; never touches other accounts' rows nor other markets' books. An empty pos means
+// "gateway flat in this market" — the caller must have verified the channel is connected.
+func (d *DB) ReconcilePositionsForUser(userID, market string, pos []RealPosition) (int, error) {
+	market = normalizeMarket(market)
+	// §F2（2026-09-22 修复批）：字段级校验前置——任一行 ts_code 对其市场非法即整批拒收不落库，
 	// 上层据 ErrInvalidPositionReport 回 400（网关 outbox 按 4xx 永久拒绝进死信，不无限重推）。
-	if err := validateRealPositions(pos); err != nil {
+	if err := validateRealPositions(market, pos); err != nil {
 		log.Printf("[store] §F2 持仓对账整批拒收(用户=%s): %v", userID, err)
 		opslog.Logf("quant", "持仓对账整批拒收(§F2 字段校验) 用户=%s：%v", userID, err)
 		return 0, err
@@ -266,17 +384,20 @@ func (d *DB) ReconcilePositionsForUser(userID string, pos []RealPosition) (int, 
 		if userID != "" {
 			p.UserID = userID
 		}
+		// §BINANCE-P1c：行 market 缺省用快照级 market 补齐，currency 按市场缺省计价币。
+		stampPositionMarket(&p, market)
 		// §P0-1 多租户主键：同一股票先声明遗留全局行，避免复合主键冲突产生重复行。
-		// English: claim any legacy global row for this account before upserting.
+		// §P1c：claim 限定同市场，跨市场同代号互不认领。
+		// English: claim any legacy global row for this account within the same market before upserting.
 		if userID != "" {
-			if _, err := tx.Exec(`UPDATE real_positions SET user_id=? WHERE ts_code=? AND user_id=''`, userID, p.TsCode); err != nil {
+			if _, err := tx.Exec(`UPDATE real_positions SET user_id=? WHERE market=? AND ts_code=? AND user_id=''`, userID, p.Market, p.TsCode); err != nil {
 				return 0, fmt.Errorf("claim legacy position %s: %w", p.TsCode, err)
 			}
 		}
 		_, err := tx.Exec(`INSERT INTO real_positions
-			(ts_code, name, qty, cost_price, amount, highest_price, strategy, signal_id, updated_at, user_id)
-			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-			ON CONFLICT(ts_code, user_id) DO UPDATE SET
+			(market, currency, ts_code, name, qty, cost_price, amount, highest_price, strategy, signal_id, updated_at, user_id)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			ON CONFLICT(market, ts_code, user_id) DO UPDATE SET
 				-- §M4（2026-09-22 PM 批）与 UpsertRealPositions 同口径：空名快照不抹空已有名称。
 				name=COALESCE(NULLIF(excluded.name,''), real_positions.name),
 				qty=excluded.qty, cost_price=excluded.cost_price,
@@ -288,16 +409,17 @@ func (d *DB) ReconcilePositionsForUser(userID string, pos []RealPosition) (int, 
 				strategy=COALESCE(NULLIF(excluded.strategy,''), real_positions.strategy),
 				signal_id=COALESCE(NULLIF(excluded.signal_id,''), real_positions.signal_id),
 				updated_at=excluded.updated_at, user_id=excluded.user_id,
+				currency=excluded.currency,
 				highest_price=CASE WHEN excluded.highest_price > real_positions.highest_price
 					THEN excluded.highest_price ELSE real_positions.highest_price END`,
-			p.TsCode, p.Name, p.Qty, p.CostPrice, p.Amount, p.HighestPrice, p.Strategy, p.SignalID, p.UpdatedAt, p.UserID)
+			p.Market, p.Currency, p.TsCode, p.Name, p.Qty, p.CostPrice, p.Amount, p.HighestPrice, p.Strategy, p.SignalID, p.UpdatedAt, p.UserID)
 		if err != nil {
 			return 0, fmt.Errorf("reconcile real position %s: %w", p.TsCode, err)
 		}
 	}
-	// 清除本账号范围内已不在网关快照中的行。
+	// 清除本账号、本市场范围内已不在网关快照中的行（§P1c：market= 谓词是跨市场误删的闸）。
 	if len(pos) == 0 {
-		if _, err := tx.Exec(`DELETE FROM real_positions WHERE user_id = ?`, userID); err != nil {
+		if _, err := tx.Exec(`DELETE FROM real_positions WHERE user_id = ? AND market = ?`, userID, market); err != nil {
 			return 0, err
 		}
 	} else {
@@ -322,13 +444,14 @@ func (d *DB) ReconcilePositionsForUser(userID string, pos []RealPosition) (int, 
 		// re-surfacing as phantom positions after a full reconcile. Real multi-tenant scoped rows are
 		// untouched; a genuine legacy row gets converted to scoped earlier in this transaction via the
 		// claim UPDATE, so what this deletes is only ownerless stale rows.
-		if _, err := tx.Exec(`DELETE FROM real_positions WHERE (user_id = ? OR user_id = '') AND ts_code NOT IN (`+placeholders+`)`,
-			append([]any{userID}, codes...)...); err != nil {
+		// §P1c：删除谓词加 market=?——快照只声明它所在市场的持仓真空，其它市场行不在射程内。
+		if _, err := tx.Exec(`DELETE FROM real_positions WHERE market = ? AND (user_id = ? OR user_id = '') AND ts_code NOT IN (`+placeholders+`)`,
+			append([]any{market, userID}, codes...)...); err != nil {
 			return 0, err
 		}
 	}
 	var n int
-	if err := tx.QueryRow(`SELECT COUNT(*) FROM real_positions WHERE user_id = '' OR user_id = ?`, userID).Scan(&n); err != nil {
+	if err := tx.QueryRow(`SELECT COUNT(*) FROM real_positions WHERE (user_id = '' OR user_id = ?) AND market = ?`, userID, market).Scan(&n); err != nil {
 		return 0, err
 	}
 	if err := tx.Commit(); err != nil {
@@ -338,10 +461,11 @@ func (d *DB) ReconcilePositionsForUser(userID string, pos []RealPosition) (int, 
 }
 
 // RealPositions 返回全部实盘持仓（含成本/最高价），供决策层读取。
+// §P1c：带出 market/currency（COALESCE 兜底重建前的历史 NULL）。
 // （RealPositions returns every live position for the decision layer.）
 func (d *DB) RealPositions() ([]RealPosition, error) {
-	rows, err := d.db.Query(`SELECT ts_code, name, qty, cost_price, amount, highest_price,
-		strategy, signal_id, updated_at, COALESCE(user_id,'') FROM real_positions ORDER BY ts_code`)
+	rows, err := d.db.Query(`SELECT COALESCE(market,'CN'), COALESCE(currency,''), ts_code, name, qty, cost_price, amount, highest_price,
+		strategy, signal_id, updated_at, COALESCE(user_id,'') FROM real_positions ORDER BY market, ts_code`)
 	if err != nil {
 		return nil, err
 	}
@@ -349,7 +473,7 @@ func (d *DB) RealPositions() ([]RealPosition, error) {
 	var out []RealPosition
 	for rows.Next() {
 		var p RealPosition
-		if err := rows.Scan(&p.TsCode, &p.Name, &p.Qty, &p.CostPrice, &p.Amount,
+		if err := rows.Scan(&p.Market, &p.Currency, &p.TsCode, &p.Name, &p.Qty, &p.CostPrice, &p.Amount,
 			&p.HighestPrice, &p.Strategy, &p.SignalID, &p.UpdatedAt, &p.UserID); err != nil {
 			return nil, err
 		}
@@ -359,11 +483,13 @@ func (d *DB) RealPositions() ([]RealPosition, error) {
 }
 
 // RealPositionsForUser §GAP1.10 按账号过滤实盘持仓：返回 user_id 匹配或遗留全局行（user_id=”）。
-// English: §GAP1.10 — positions owned by the account plus legacy global (empty user_id) rows.
+// §P1c：跨市场全部返回（前端持仓页按 market 列区分展示）；守卫侧（409 空快照）按市场自行过滤。
+// English: §GAP1.10 — positions owned by the account plus legacy global (empty user_id) rows,
+// across all markets (P1c); callers that need one market filter on p.Market.
 func (d *DB) RealPositionsForUser(userID string) ([]RealPosition, error) {
-	rows, err := d.db.Query(`SELECT ts_code, name, qty, cost_price, amount, highest_price,
+	rows, err := d.db.Query(`SELECT COALESCE(market,'CN'), COALESCE(currency,''), ts_code, name, qty, cost_price, amount, highest_price,
 		strategy, signal_id, updated_at, COALESCE(user_id,''), COALESCE(buy_date,'') FROM real_positions
-		WHERE user_id = '' OR user_id = ? ORDER BY ts_code`, userID)
+		WHERE user_id = '' OR user_id = ? ORDER BY market, ts_code`, userID)
 	if err != nil {
 		return nil, err
 	}
@@ -371,7 +497,7 @@ func (d *DB) RealPositionsForUser(userID string) ([]RealPosition, error) {
 	var out []RealPosition
 	for rows.Next() {
 		var p RealPosition
-		if err := rows.Scan(&p.TsCode, &p.Name, &p.Qty, &p.CostPrice, &p.Amount,
+		if err := rows.Scan(&p.Market, &p.Currency, &p.TsCode, &p.Name, &p.Qty, &p.CostPrice, &p.Amount,
 			&p.HighestPrice, &p.Strategy, &p.SignalID, &p.UpdatedAt, &p.UserID, &p.BuyDate); err != nil {
 			return nil, err
 		}
@@ -382,24 +508,29 @@ func (d *DB) RealPositionsForUser(userID string) ([]RealPosition, error) {
 
 // RealPositionByCode 返回单只实盘持仓（不存在返回 sql.ErrNoRows）。
 // ⚠️ 多账号部署下应使用 RealPositionByCodeForUser；本函数保留以兼容遗留单租户调用。
+// ⚠️ §P1c 起同一 ts_code 理论上可跨市场各存一行，本函数按主键序取首行——遗留调用均为
+// CN 单账本场景，多市场路由请用带 market 语义的调用方（Phase 2 Router 按 req.Market 定位）。
 // （RealPositionByCode returns one live position, sql.ErrNoRows when absent.）
 func (d *DB) RealPositionByCode(code string) (RealPosition, error) {
 	var p RealPosition
-	err := d.db.QueryRow(`SELECT ts_code, name, qty, cost_price, amount, highest_price,
+	err := d.db.QueryRow(`SELECT COALESCE(market,'CN'), COALESCE(currency,''), ts_code, name, qty, cost_price, amount, highest_price,
 		strategy, signal_id, updated_at, COALESCE(user_id,'') FROM real_positions WHERE ts_code=?`, code).
-		Scan(&p.TsCode, &p.Name, &p.Qty, &p.CostPrice, &p.Amount,
+		Scan(&p.Market, &p.Currency, &p.TsCode, &p.Name, &p.Qty, &p.CostPrice, &p.Amount,
 			&p.HighestPrice, &p.Strategy, &p.SignalID, &p.UpdatedAt, &p.UserID)
 	return p, err
 }
 
 // RealPositionByCodeForUser §P0-3 按账号返回单只实盘持仓；遗留全局行（user_id=”）对查询账号可见。
+// §P1c 推荐口径（PLAN §6.6）：签名不加 market 参数、返回行自带 Market 由调用方过滤——
+// 少动调用方；CN 代号（6位+.SH/.SZ/.BJ）与美股/加密代号形态互斥，现网无歧义命中。
 // English: user-scoped single position lookup; legacy global rows are visible to any caller.
+// P1c keeps the signature market-free and carries Market on the row (PLAN §6.6 recommendation).
 func (d *DB) RealPositionByCodeForUser(userID, code string) (RealPosition, error) {
 	var p RealPosition
-	err := d.db.QueryRow(`SELECT ts_code, name, qty, cost_price, amount, highest_price,
+	err := d.db.QueryRow(`SELECT COALESCE(market,'CN'), COALESCE(currency,''), ts_code, name, qty, cost_price, amount, highest_price,
 		strategy, signal_id, updated_at, COALESCE(user_id,'') FROM real_positions
 		WHERE ts_code=? AND (user_id = '' OR user_id = ?)`, code, userID).
-		Scan(&p.TsCode, &p.Name, &p.Qty, &p.CostPrice, &p.Amount,
+		Scan(&p.Market, &p.Currency, &p.TsCode, &p.Name, &p.Qty, &p.CostPrice, &p.Amount,
 			&p.HighestPrice, &p.Strategy, &p.SignalID, &p.UpdatedAt, &p.UserID)
 	return p, err
 }
@@ -411,6 +542,11 @@ func (d *DB) RealPositionByCodeForUser(userID, code string) (RealPosition, error
 // 成交回报同时写 fills 表。English: applies a gateway fill to the book: buys open/add with weighted
 // average cost, sells reduce qty (cleared when qty<=0); the fill row is also persisted.
 func (d *DB) ApplyRealFill(f RealFill) error {
+	// §BINANCE-P1c：成交归属市场归一（空=CN，QMT/交割单回灌链零改动），计价币缺省按市场。
+	f.Market = normalizeMarket(f.Market)
+	if f.Currency == "" {
+		f.Currency = defaultCurrency(f.Market)
+	}
 	tx, err := d.db.Begin()
 	if err != nil {
 		return err
@@ -418,15 +554,16 @@ func (d *DB) ApplyRealFill(f RealFill) error {
 	defer tx.Rollback()
 
 	// §P0-1 多租户：成交前先声明遗留全局行，防止后续 INSERT 产生重复。
+	// §P1c：claim 限定同市场（跨市场同代号互不认领）。
 	if f.UserID != "" {
-		if _, err := tx.Exec(`UPDATE real_positions SET user_id=? WHERE ts_code=? AND user_id=''`, f.UserID, f.Code); err != nil {
+		if _, err := tx.Exec(`UPDATE real_positions SET user_id=? WHERE market=? AND ts_code=? AND user_id=''`, f.UserID, f.Market, f.Code); err != nil {
 			return fmt.Errorf("claim legacy position before fill %s: %w", f.Code, err)
 		}
 	}
 
 	var p RealPosition
 	err = tx.QueryRow(`SELECT ts_code, name, qty, cost_price, amount, highest_price,
-		strategy, signal_id, user_id FROM real_positions WHERE ts_code=? AND (user_id='' OR user_id=?)`, f.Code, f.UserID).
+		strategy, signal_id, user_id FROM real_positions WHERE market=? AND ts_code=? AND (user_id='' OR user_id=?)`, f.Market, f.Code, f.UserID).
 		Scan(&p.TsCode, &p.Name, &p.Qty, &p.CostPrice, &p.Amount, &p.HighestPrice, &p.Strategy, &p.SignalID, &p.UserID)
 	switch {
 	case err == sql.ErrNoRows:
@@ -450,9 +587,9 @@ func (d *DB) ApplyRealFill(f RealFill) error {
 				buyCostPerShare = amountWithFee / float64(f.Qty)
 			}
 			_, err = tx.Exec(`INSERT INTO real_positions
-				(ts_code, name, qty, cost_price, amount, highest_price, strategy, signal_id, updated_at, user_id, buy_date)
-				VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-				f.Code, f.Name, f.Qty, buyCostPerShare, amountWithFee, f.Price, "", f.SignalID,
+				(market, currency, ts_code, name, qty, cost_price, amount, highest_price, strategy, signal_id, updated_at, user_id, buy_date)
+				VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+				f.Market, f.Currency, f.Code, f.Name, f.Qty, buyCostPerShare, amountWithFee, f.Price, "", f.SignalID,
 				time.Now().Format("2006-01-02 15:04:05"), f.UserID, buyDate)
 		}
 	case err == nil:
@@ -476,10 +613,11 @@ func (d *DB) ApplyRealFill(f RealFill) error {
 			}
 			// §实盘账户隔离：加仓时一并回写 user_id，确保归属字段不被旧行残值覆盖。
 			// §修复 R8：加仓时若原持仓 name 为空，用本次成交的 name 回填。
+			// §P1c：定位谓词加 market=?（跨市场同代号互不串账）。
 			_, err = tx.Exec(`UPDATE real_positions SET qty=?, cost_price=?, amount=?,
 				highest_price=?, updated_at=?, user_id=?, name=CASE WHEN name='' OR name IS NULL THEN ? ELSE name END
-				WHERE ts_code=? AND (user_id='' OR user_id=?)`,
-				newQty, newCost, newCost*float64(newQty), hi, now, ownerID, f.Name, f.Code, f.UserID)
+				WHERE market=? AND ts_code=? AND (user_id='' OR user_id=?)`,
+				newQty, newCost, newCost*float64(newQty), hi, now, ownerID, f.Name, f.Market, f.Code, f.UserID)
 		} else {
 			newQty := p.Qty - f.Qty
 			if newQty < 0 {
@@ -487,21 +625,23 @@ func (d *DB) ApplyRealFill(f RealFill) error {
 			}
 			// §实盘账户隔离：减仓时同样回写 user_id（减仓不改变归属，但保持写路径一致，
 			// 防止历史上 user_id 为空的持仓在减仓后仍以全局行形态存在）。
-			_, err = tx.Exec(`UPDATE real_positions SET qty=?, amount=?, updated_at=?, user_id=? WHERE ts_code=? AND (user_id='' OR user_id=?)`,
-				newQty, float64(newQty)*p.CostPrice, now, ownerID, f.Code, f.UserID)
+			// §P1c：定位谓词加 market=?。
+			_, err = tx.Exec(`UPDATE real_positions SET qty=?, amount=?, updated_at=?, user_id=? WHERE market=? AND ts_code=? AND (user_id='' OR user_id=?)`,
+				newQty, float64(newQty)*p.CostPrice, now, ownerID, f.Market, f.Code, f.UserID)
 		}
 	}
 	if err != nil {
 		return fmt.Errorf("apply fill %s %s: %w", f.Code, f.Side, err)
 	}
-	// §WS-A A3 作用域化清仓：只删"本次成交归属账号（∪遗留全局行）"下的 qty<=0 行，
+	// §WS-A A3 作用域化清仓：只删"本次成交归属账号（∪遗留全局行）、本市场"下的 qty<=0 行，
 	// 绝不 `DELETE FROM real_positions WHERE qty<=0` 扫全表（多账号下会误删他人刚清仓的零仓行）。
+	// §P1c：清仓谓词加 market=?——成交只清零它所在市场的仓。
 	if f.UserID == "" {
-		if _, err := tx.Exec(`DELETE FROM real_positions WHERE qty <= 0 AND user_id=''`); err != nil {
+		if _, err := tx.Exec(`DELETE FROM real_positions WHERE qty <= 0 AND user_id='' AND market=?`, f.Market); err != nil {
 			return err
 		}
 	} else {
-		if _, err := tx.Exec(`DELETE FROM real_positions WHERE qty <= 0 AND (user_id='' OR user_id=?)`, f.UserID); err != nil {
+		if _, err := tx.Exec(`DELETE FROM real_positions WHERE qty <= 0 AND (user_id='' OR user_id=?) AND market=?`, f.UserID, f.Market); err != nil {
 			return err
 		}
 	}
@@ -526,13 +666,14 @@ func (d *DB) ApplyRealFill(f RealFill) error {
 		}
 	}
 	if dup > 0 {
-		log.Printf("[store] fills 幂等命中(重复回报): order=%s trade_id=%s traded_at=%s qty=%d",
-			f.OrderID, f.TradeID, f.TradedAt, f.Qty)
+		log.Printf("[store] fills 幂等命中(重复回报): order=%s trade_id=%s traded_at=%s qty=%s",
+			f.OrderID, f.TradeID, f.TradedAt, QtyString(f.Qty))
 		return tx.Rollback()
 	}
-	if _, err := tx.Exec(`INSERT INTO fills (order_id, code, side, price, qty, amount, traded_at, signal_id, user_id, fee, stamp_tax, serial, trade_id)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		f.OrderID, f.Code, f.Side, f.Price, f.Qty, f.Amount, f.TradedAt, f.SignalID, f.UserID, f.Fee, f.StampTax, f.Serial, f.TradeID); err != nil {
+	// §BINANCE-P1c：成交流水带 market/currency 归属列（判重键不变：trade_id 或复合键均市场无关）。
+	if _, err := tx.Exec(`INSERT INTO fills (order_id, code, side, price, qty, amount, traded_at, signal_id, user_id, fee, stamp_tax, serial, trade_id, market, currency)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		f.OrderID, f.Code, f.Side, f.Price, f.Qty, f.Amount, f.TradedAt, f.SignalID, f.UserID, f.Fee, f.StampTax, f.Serial, f.TradeID, f.Market, f.Currency); err != nil {
 		return err
 	}
 	return tx.Commit()
@@ -557,8 +698,8 @@ func buyDateOf(tradedAt string) string {
 // 可卖量 = 持仓量 − 当日买入量（当日买入的份额 T+1 才能卖）。
 // English: WS-A T+1 sell-availability helper — sums a code's today-bought qty per user/day,
 // so sellable = held − todayBought (same-day buys are T+1 locked).
-func (d *DB) TodayBoughtQty(userID, tsCode, day string) int {
-	var n int
+func (d *DB) TodayBoughtQty(userID, tsCode, day string) float64 {
+	var n float64
 	if err := d.db.QueryRow(`SELECT COALESCE(SUM(qty),0) FROM fills
 		WHERE user_id=? AND code=? AND side='买入' AND substr(traded_at,1,10)=?`,
 		userID, tsCode, day).Scan(&n); err != nil {
@@ -569,7 +710,7 @@ func (d *DB) TodayBoughtQty(userID, tsCode, day string) int {
 
 // BuyableQtyForUserSell §WS-A T+1：返回某账号某代码"可立即卖出"的数量（持仓 − 当日买入）。
 // 遗留全局行（user_id=”）对该账号可见。English: WS-A T+1 sellable qty = held − todayBought.
-func (d *DB) BuyableQtyForUserSell(userID, tsCode, day string) int {
+func (d *DB) BuyableQtyForUserSell(userID, tsCode, day string) float64 {
 	p, err := d.RealPositionByCodeForUser(userID, tsCode)
 	if err != nil {
 		return 0
@@ -608,8 +749,7 @@ func (d *DB) LocalBuyFrozen(userID, day string) (float64, error) {
 	frozen := 0.0
 	for rows.Next() {
 		var sid, status string
-		var price float64
-		var qty int
+		var price, qty float64
 		if err := rows.Scan(&sid, &status, &price, &qty); err != nil {
 			continue
 		}
@@ -618,7 +758,7 @@ func (d *DB) LocalBuyFrozen(userID, day string) (float64, error) {
 		if remain < 0 {
 			remain = 0
 		}
-		frozen += price * float64(remain)
+		frozen += price * remain
 	}
 	// 游标迭代错误同样上抛（旧实现静默丢弃半截结果当全额有效）。
 	if err := rows.Err(); err != nil {
@@ -654,10 +794,15 @@ func (d *DB) SweepStaleBuyOrders(userID, beforeDay string) (int64, error) {
 // exists (idempotent — never double-sends). Returns (alreadyExisted, err).
 func (d *DB) UpsertRealOrder(o RealOrder) (bool, error) {
 	// §W2-10 租户列：委托行打归属账号（存量行为空串=遗留全局）
+	// §BINANCE-P1c：market/currency 归一后随列写入（空 market=CN，QMT 链零改动）。
+	o.Market = normalizeMarket(o.Market)
+	if o.Currency == "" {
+		o.Currency = defaultCurrency(o.Market)
+	}
 	res, err := d.db.Exec(`INSERT OR IGNORE INTO orders
-		(order_id, signal_id, code, side, status, price, qty, created_at, user_id)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		o.OrderID, o.SignalID, o.Code, o.Side, o.Status, o.Price, o.Qty, o.CreatedAt, o.UserID)
+		(order_id, signal_id, code, side, status, price, qty, created_at, user_id, market, currency)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		o.OrderID, o.SignalID, o.Code, o.Side, o.Status, o.Price, o.Qty, o.CreatedAt, o.UserID, o.Market, o.Currency)
 	if err != nil {
 		return false, err
 	}
@@ -690,8 +835,8 @@ func (d *DB) UpdateRealOrderStatus(orderID, status string) error {
 // English: §FIX#1 — sell fills carry the full signal id (base + ":r<remaining>" suffix), so an exact
 // match on base always returned 0 and re-sells overlapped pending old orders (oversold exposure).
 // Aggregate by signal_id prefix to count fills across the base and every :rN bucket.
-func (d *DB) SumFilledQty(userID, signalID string) int {
-	var total int
+func (d *DB) SumFilledQty(userID, signalID string) float64 {
+	var total float64
 	if err := d.db.QueryRow(`SELECT COALESCE(SUM(qty),0) FROM fills WHERE user_id=? AND signal_id LIKE ?||'%'`,
 		userID, signalID).Scan(&total); err != nil {
 		return 0
@@ -709,8 +854,8 @@ func (d *DB) SumFilledQty(userID, signalID string) int {
 // English: §P0-2 — sums today's still-open sell qty for a code (statuses 已报/部成/已报待撤/部成待撤;
 // terminal and send-failed rows excluded). Sell remaining = held − Σfilled − Σopen, so a same-round
 // M8 liquidation + stop-loss advice can no longer both fire a full-qty sell before fills are reported.
-func (d *DB) SumOpenSellQty(userID, tsCode, day string) int {
-	var total int
+func (d *DB) SumOpenSellQty(userID, tsCode, day string) float64 {
+	var total float64
 	if err := d.db.QueryRow(`SELECT COALESCE(SUM(qty),0) FROM orders
 		WHERE (user_id = '' OR user_id = ?) AND code = ? AND side = '卖出'
 		  AND created_at LIKE ?||'%'
@@ -866,11 +1011,11 @@ func (d *DB) ResetFailedRealOrder(userID, signalID string) (bool, error) {
 	return true, nil
 }
 
-// RealOrders 返回全部实盘委托单（倒序）。
+// RealOrders 返回全部实盘委托单（倒序）。§P1c：带出 market/currency。
 // （RealOrders returns all live orders, newest first.）
 func (d *DB) RealOrders() ([]RealOrder, error) {
 	rows, err := d.db.Query(`SELECT order_id, signal_id, code, side, status, price, qty, created_at,
-		COALESCE(user_id,'') FROM orders ORDER BY created_at DESC, order_id DESC`)
+		COALESCE(user_id,''), COALESCE(market,'CN'), COALESCE(currency,'') FROM orders ORDER BY created_at DESC, order_id DESC`)
 	if err != nil {
 		return nil, err
 	}
@@ -878,7 +1023,7 @@ func (d *DB) RealOrders() ([]RealOrder, error) {
 	var out []RealOrder
 	for rows.Next() {
 		var o RealOrder
-		if err := rows.Scan(&o.OrderID, &o.SignalID, &o.Code, &o.Side, &o.Status, &o.Price, &o.Qty, &o.CreatedAt, &o.UserID); err != nil {
+		if err := rows.Scan(&o.OrderID, &o.SignalID, &o.Code, &o.Side, &o.Status, &o.Price, &o.Qty, &o.CreatedAt, &o.UserID, &o.Market, &o.Currency); err != nil {
 			return nil, err
 		}
 		out = append(out, o)
@@ -887,10 +1032,11 @@ func (d *DB) RealOrders() ([]RealOrder, error) {
 }
 
 // RealOrdersForUser §P0-3 按账号返回实盘委托单；遗留全局行（user_id=”）对查询账号可见。
+// §P1c：带出 market/currency（跨市场全返回，调用方按 Market 过滤）。
 // English: user-scoped live orders; legacy global rows are visible to any caller.
 func (d *DB) RealOrdersForUser(userID string) ([]RealOrder, error) {
 	rows, err := d.db.Query(`SELECT order_id, signal_id, code, side, status, price, qty, created_at,
-		COALESCE(user_id,'') FROM orders WHERE user_id = '' OR user_id = ?
+		COALESCE(user_id,''), COALESCE(market,'CN'), COALESCE(currency,'') FROM orders WHERE user_id = '' OR user_id = ?
 		ORDER BY created_at DESC, order_id DESC`, userID)
 	if err != nil {
 		return nil, err
@@ -899,7 +1045,7 @@ func (d *DB) RealOrdersForUser(userID string) ([]RealOrder, error) {
 	var out []RealOrder
 	for rows.Next() {
 		var o RealOrder
-		if err := rows.Scan(&o.OrderID, &o.SignalID, &o.Code, &o.Side, &o.Status, &o.Price, &o.Qty, &o.CreatedAt, &o.UserID); err != nil {
+		if err := rows.Scan(&o.OrderID, &o.SignalID, &o.Code, &o.Side, &o.Status, &o.Price, &o.Qty, &o.CreatedAt, &o.UserID, &o.Market, &o.Currency); err != nil {
 			return nil, err
 		}
 		out = append(out, o)
@@ -994,6 +1140,11 @@ const (
 // longer drop a report. Monotonic rank guard, signal_id scoping and INSERT OR IGNORE idempotency
 // are preserved verbatim; returns one of advanced/inserted/ignored.
 func (d *DB) ApplyOrderReportTx(o RealOrder) (string, error) {
+	// §BINANCE-P1c：补插路径的 market/currency 归一（与 UpsertRealOrder 同口径）。
+	o.Market = normalizeMarket(o.Market)
+	if o.Currency == "" {
+		o.Currency = defaultCurrency(o.Market)
+	}
 	tx, err := d.db.Begin()
 	if err != nil {
 		return "", err
@@ -1028,10 +1179,11 @@ func (d *DB) ApplyOrderReportTx(o RealOrder) (string, error) {
 		return OrderReportAdvanced, nil
 	case sql.ErrNoRows:
 		// 本地无此单（网侧重放/回报先于下单回填到达）：补插完整委托行。
+		// §BINANCE-P1c：补插行带 market/currency（函数入口已归一）。
 		res, err := tx.Exec(`INSERT OR IGNORE INTO orders
-			(order_id, signal_id, code, side, status, price, qty, created_at, user_id)
-			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-			o.OrderID, o.SignalID, o.Code, o.Side, o.Status, o.Price, o.Qty, o.CreatedAt, o.UserID)
+			(order_id, signal_id, code, side, status, price, qty, created_at, user_id, market, currency)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			o.OrderID, o.SignalID, o.Code, o.Side, o.Status, o.Price, o.Qty, o.CreatedAt, o.UserID, o.Market, o.Currency)
 		if err != nil {
 			return "", err
 		}
@@ -1096,7 +1248,8 @@ func (d *DB) UpdateRealOrderStatusMonotonic(userID, orderID, status string) (boo
 // （RealFills returns all live fills, newest first; now carrying fee/stamp_tax/user legs.）
 func (d *DB) RealFills() ([]RealFill, error) {
 	rows, err := d.db.Query(`SELECT id, order_id, code, side, price, qty, amount, traded_at, signal_id,
-		COALESCE(user_id,''), COALESCE(fee,0), COALESCE(stamp_tax,0), COALESCE(trade_id,'')
+		COALESCE(user_id,''), COALESCE(fee,0), COALESCE(stamp_tax,0), COALESCE(trade_id,''),
+		COALESCE(market,'CN'), COALESCE(currency,'')
 		FROM fills ORDER BY id DESC`)
 	if err != nil {
 		return nil, err
@@ -1106,7 +1259,7 @@ func (d *DB) RealFills() ([]RealFill, error) {
 	for rows.Next() {
 		var f RealFill
 		if err := rows.Scan(&f.ID, &f.OrderID, &f.Code, &f.Side, &f.Price, &f.Qty, &f.Amount, &f.TradedAt, &f.SignalID,
-			&f.UserID, &f.Fee, &f.StampTax, &f.TradeID); err != nil {
+			&f.UserID, &f.Fee, &f.StampTax, &f.TradeID, &f.Market, &f.Currency); err != nil {
 			return nil, err
 		}
 		out = append(out, f)

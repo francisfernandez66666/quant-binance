@@ -39,7 +39,7 @@ type brokerTrade struct {
 	Code     string
 	Side     string
 	Price    float64
-	Qty      int
+	Qty      float64 // §P1-d int→float64（交割量与本地 fills 同型比对）
 	Fee      float64
 	OrderID  string // 券商委托号（sync_fills 补记时回填真实委托号，不再置空）
 	TradedAt string // 券商成交时间（补记时回填真实时间，不再用 day+" 00:00:00"）
@@ -107,7 +107,8 @@ func (c *Controller) SettleDay(day, mode string) (*store.SettlementDiff, error) 
 			continue // 无法归一：跳过（记录在 diff）
 		}
 		bt := brokerTrade{
-			Code: t.TsCode, Side: side, Price: t.Price, Qty: t.Qty,
+			// §P1-d：网关交割单 qty 仍是 JSON int（QMT 整数量），此处显式转 float64 与本地 fills 同型比对。
+			Code: t.TsCode, Side: side, Price: t.Price, Qty: float64(t.Qty),
 			Fee: t.Fee + t.StampTax, OrderID: t.OrderID, TradedAt: t.TradedAt, Serial: t.Serial,
 		}
 		k := settleFactKey(bt.Code, bt.Side, bt.Qty, bt.Price)
@@ -147,12 +148,12 @@ func (c *Controller) SettleDay(day, mode string) (*store.SettlementDiff, error) 
 				lf := lfs[i]
 				// 同键存在：校验 量/价 一致（键已含量价，此处防御价格分位舍入差）
 				if lf.Qty != bt.Qty || abs(lf.Price-bt.Price) > 0.011 {
-					diff.Mismatch = append(diff.Mismatch, fmt.Sprintf("%s %s 量价不符 本地(%d@%.2f) vs 券商(%d@%.2f)",
-						k, bt.Code, lf.Qty, lf.Price, bt.Qty, bt.Price))
+					diff.Mismatch = append(diff.Mismatch, fmt.Sprintf("%s %s 量价不符 本地(%s@%.2f) vs 券商(%s@%.2f)",
+						k, bt.Code, store.QtyString(lf.Qty), lf.Price, store.QtyString(bt.Qty), bt.Price))
 				}
 			} else {
-				diff.MissingInLocal = append(diff.MissingInLocal, fmt.Sprintf("%s %s %d@%.2f",
-					k, bt.Code, bt.Qty, bt.Price))
+				diff.MissingInLocal = append(diff.MissingInLocal, fmt.Sprintf("%s %s %s@%.2f",
+					k, bt.Code, store.QtyString(bt.Qty), bt.Price))
 				missing = append(missing, missingTrade{bt: bt, k: k})
 			}
 		}
@@ -162,8 +163,8 @@ func (c *Controller) SettleDay(day, mode string) (*store.SettlementDiff, error) 
 		bts := broker[k]
 		for i, lf := range lfs {
 			if i >= len(bts) {
-				diff.ExtraInLocal = append(diff.ExtraInLocal, fmt.Sprintf("%s %s %d@%.2f",
-					k, lf.Code, lf.Qty, lf.Price))
+				diff.ExtraInLocal = append(diff.ExtraInLocal, fmt.Sprintf("%s %s %s@%.2f",
+					k, lf.Code, store.QtyString(lf.Qty), lf.Price))
 			}
 		}
 	}
@@ -190,7 +191,7 @@ func (c *Controller) SettleDay(day, mode string) (*store.SettlementDiff, error) 
 			}
 			fill := store.RealFill{
 				OrderID: bt.OrderID, Code: bt.Code, Side: bt.Side, Price: bt.Price, Qty: bt.Qty,
-				Amount: bt.Price * float64(bt.Qty), TradedAt: tradedAt,
+				Amount: bt.Price * bt.Qty, TradedAt: tradedAt,
 				SignalID: "settle:" + day, UserID: c.userID, Fee: bt.Fee, Serial: bt.Serial,
 			}
 			if err := c.store.ApplySettlementFill(fill); err != nil {
@@ -216,8 +217,8 @@ func (c *Controller) SettleDay(day, mode string) (*store.SettlementDiff, error) 
 // Deliberately independent of serial/order_id/timestamps (gateway never produced serials; order-id
 // shapes differ per channel; timestamp formats diverge) — any such key never matched across sides.
 // The physical facts must agree; multi-fill same keys are paired positionally via lists.
-func settleFactKey(code, side string, qty int, price float64) string {
-	return fmt.Sprintf("%s|%s|%d|%.2f", code, side, qty, price)
+func settleFactKey(code, side string, qty float64, price float64) string {
+	return fmt.Sprintf("%s|%s|%s|%.2f", code, side, store.QtyString(qty), price)
 }
 
 // normalizeSide 归一交割方向（买入/卖出）；无法识别返回空串。
