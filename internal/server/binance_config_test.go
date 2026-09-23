@@ -102,3 +102,33 @@ func TestBinanceConfigValidation400(t *testing.T) {
 		t.Fatal("400 路径不得产生落库副作用")
 	}
 }
+
+// TestBinanceConfigDataPlane §MR-1 HTTP 端点回归：数据面开关免凭证可开（200 落库、GET 回显），
+// 但永不置起 enabled（交易判定与凭证闸都不看它）；子开关全关的纯 data_plane=true 必须 400。
+// English: §MR-1 endpoint regression — data_plane opens credential-free yet never implies
+// enabled=true; data_plane with all sub-switches off is rejected 400.
+func TestBinanceConfigDataPlane(t *testing.T) {
+	s := newBinanceConfigServer(t)
+	if rr := binancePost(t, s, `{"data_plane":true,"spot":{"enabled":true}}`); rr.Code != 200 {
+		t.Fatalf("数据面免凭证应 200: %d %s", rr.Code, rr.Body.String())
+	}
+	cfg := s.cfg.GetBinanceConfigFor("")
+	if !cfg.DataPlane || cfg.Enabled {
+		t.Fatalf("data_plane 落库错误或越权置起 enabled: data_plane=%v enabled=%v", cfg.DataPlane, cfg.Enabled)
+	}
+	if !cfg.Spot.Enabled {
+		t.Fatal("spot 子档案整段替换未生效")
+	}
+	if v := binanceGet(t, s); v["data_plane"] != true {
+		t.Fatalf("GET 视图未回显 data_plane: %v", v["data_plane"])
+	}
+	// 子开关全关 + 无凭证的纯数据面：validate 拒 400，且不得污染已落库值
+	// （出厂缺省 stock/spot.enabled=true，须整档案替换显式关死才触发「≥1 子开关」规则）
+	s2 := newBinanceConfigServer(t)
+	if rr := binancePost(t, s2, `{"data_plane":true,"stock":{"enabled":false},"spot":{"enabled":false}}`); rr.Code != 400 {
+		t.Fatalf("data_plane 无任何子开关应 400: %d %s", rr.Code, rr.Body.String())
+	}
+	if s2.cfg.GetBinanceConfigFor("").DataPlane {
+		t.Fatal("400 路径不得落库")
+	}
+}

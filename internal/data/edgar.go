@@ -23,6 +23,7 @@
 package data
 
 import (
+	"bytes"
 	"encoding/xml"
 	"fmt"
 	"io"
@@ -119,7 +120,12 @@ func (c *EDGARClient) FetchRecent8K(limit int) ([]XEvent, error) {
 		return nil, fmt.Errorf("edgar: 读取响应失败")
 	}
 	var feed edgarFeed
-	if err := xml.Unmarshal(body, &feed); err != nil {
+	// §MR-EDGAR-ENC：EDGAR Atom 头声明 encoding="ISO-8859-1"，encoding/xml 无
+	// CharsetReader 时直接拒解（现网 100% 失败：xml: declared but Decoder.CharsetReader is nil）。
+	// 零新依赖处置：注入 Latin-1→UTF-8 转换 reader（x/text 属新依赖，红线禁）。
+	dec := xml.NewDecoder(bytes.NewReader(body))
+	dec.CharsetReader = latin1ToUTF8Reader
+	if err := dec.Decode(&feed); err != nil {
 		return nil, fmt.Errorf("edgar: Atom XML 解析失败: %v", err)
 	}
 	events := make([]XEvent, 0, len(feed.Entries))
@@ -205,4 +211,32 @@ func edgarTickerIn(s string) string {
 		}
 	}
 	return ""
+}
+
+// latin1ToUTF8Reader xml.Decoder 的 CharsetReader 注入件（§MR-EDGAR-ENC）。
+// EDGAR 的 Atom 头声明 ISO-8859-1；Go 标准库 encoding/xml 不带转换件时遇非 UTF-8
+// 声明直接报错，而 x/text/html/charset 属新依赖（红线禁）——这里手转 Latin-1 单字节
+// 为等价码点的 UTF-8 双字节。windows-1252 按 Latin-1 宽容处理（SEC 正文只到重音字母，
+// 0x80-0x9F 区间实际不出现）；其余编码如实报不支持。
+// English: stdlib-only CharsetReader converting ISO-8859-1 bytes to UTF-8; other
+// declared encodings surface as explicit unsupported errors rather than silent garbage.
+func latin1ToUTF8Reader(charset string, input io.Reader) (io.Reader, error) {
+	switch strings.ToLower(strings.TrimSpace(charset)) {
+	case "iso-8859-1", "iso8859-1", "latin-1", "latin1", "windows-1252":
+	default:
+		return nil, fmt.Errorf("edgar: 不支持的 XML 编码 %q", charset)
+	}
+	raw, err := io.ReadAll(io.LimitReader(input, 8<<20))
+	if err != nil {
+		return nil, err
+	}
+	out := make([]byte, 0, len(raw)+64)
+	for _, b := range raw {
+		if b < 0x80 {
+			out = append(out, b)
+			continue
+		}
+		out = append(out, 0xC0|b>>6, 0x80|b&0x3F)
+	}
+	return bytes.NewReader(out), nil
 }

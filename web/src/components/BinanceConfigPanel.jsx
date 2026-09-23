@@ -20,7 +20,7 @@ const subTitleStyle = { fontWeight: 700, fontSize: 13, margin: '10px 0 2px' }
 
 // 表单初值空壳：GET 回来后整对象覆盖；提交前用 baseRef（服务端原值）做合并底座
 const emptyForm = () => ({
-  enabled: false, mode: 'manual', testnet: true, quote_asset: 'USDC',
+  enabled: false, data_plane: false, mode: 'manual', testnet: true, quote_asset: 'USDC',
   timeout_sec: 10, miss_heartbeat_sec: 120, cancel_stale_sec: 120, paper_separate: true,
   halted: false, disclaimer_signed_at: '',
   api_key: '', api_secret: '',
@@ -43,7 +43,7 @@ export default function BinanceConfigPanel() {
       baseRef.current = c
       setForm({
         ...emptyForm(),
-        enabled: !!c.enabled, mode: c.mode || 'manual', testnet: !!c.testnet,
+        enabled: !!c.enabled, data_plane: !!c.data_plane, mode: c.mode || 'manual', testnet: !!c.testnet,
         quote_asset: c.quote_asset || 'USDC',
         timeout_sec: c.timeout_sec ?? 10, miss_heartbeat_sec: c.miss_heartbeat_sec ?? 120,
         cancel_stale_sec: c.cancel_stale_sec ?? 120, paper_separate: !!c.paper_separate,
@@ -74,7 +74,7 @@ export default function BinanceConfigPanel() {
     setSaving(true)
     try {
       const body = {
-        enabled: form.enabled, mode: form.mode, testnet: form.testnet,
+        enabled: form.enabled, data_plane: form.data_plane, mode: form.mode, testnet: form.testnet,
         timeout_sec: form.timeout_sec, miss_heartbeat_sec: form.miss_heartbeat_sec,
         cancel_stale_sec: form.cancel_stale_sec, quote_asset: form.quote_asset,
         paper_separate: form.paper_separate,
@@ -132,6 +132,11 @@ export default function BinanceConfigPanel() {
             {form.halted && <Tag theme="danger">⛔ 紧急停止中</Tag>}
             <Button size="xs" theme={form.halted ? 'default' : 'danger'} variant="outline"
               onClick={() => toggleHalt(!form.halted)}>{form.halted ? '解除熔断' : '置位紧急停止'}</Button>
+          </div>
+          <div style={rowStyle}>
+            <span style={labelStyle}>数据面 data_plane</span>
+            <ToggleSw checked={!!form.data_plane} onChange={(v) => set('data_plane', v)} />
+            <span style={{ fontSize: 12, color: 'var(--app-muted)' }}>§MR-1 无凭证即可装配行情/K线/情绪/事件观测链；结构上不能下单（真交易只认 enabled）。改开关需重启引擎重新装配 Controller</span>
           </div>
           <div style={rowStyle}>
             <span style={labelStyle}>运行模式 mode</span>

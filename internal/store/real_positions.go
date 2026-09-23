@@ -780,21 +780,26 @@ func (d *DB) LocalBuyFrozenForMarket(userID, day, market string) (float64, error
 }
 
 // SweepStaleBuyOrders §C1b（2026-09-22 修复批）跨日陈旧买单无条件降级：
-// created_at 早于 beforeDay（北京日，不含）且仍停在 已报/部成 的买单一律置为 废单终态留痕。
-// A 股委托当日收盘即失效，跨日挂单永不可能是活单；旧行为下这些行的解冻完全依赖
-// SweepOrders 的网关撤单路（!Enabled/Tripped/cancel_stale_sec=-1 时整体跳过），
+// created_at 早于 beforeDay（**调用方市场的当地日**，不含）且仍停在 已报/部成 的买单一律
+// 置为 废单终态留痕。A 股委托当日收盘即失效，跨日挂单永不可能是活单；旧行为下这些行的
+// 解冻完全依赖 SweepOrders 的网关撤单路（!Enabled/Tripped/cancel_stale_sec=-1 时整体跳过），
 // 网关崩溃/断连留下的 已报 行会长期以僵尸单形态滞留委托簿。本方法是纯本地账操作，
 // 不触网关、不受熔断管辖，作为 C1 日期过滤之外的终态兜底。
-// English: §C1b — unconditional local demotion of cross-day 已报/部成 buys to terminal 废单;
-// A-share orders die at close, and this path must not depend on gateway reachability.
-func (d *DB) SweepStaleBuyOrders(userID, beforeDay string) (int64, error) {
+// §MR-3 市场隔离：加 market 过滤——三市场控制器共用一张 orders 表，此前 CN 控制器的
+// 清扫会连带把 US/CRYPTO 的跨日挂单按北京日界降级（日界口径与市场实际不符）；
+// 存量行迁移列 DEFAULT 'CN'，CN 控制器传 "CN" 时命中集与旧行为逐行一致。
+// English: §C1b + §MR-3 market scoping — demote cross-day pending buys per market ledger.
+func (d *DB) SweepStaleBuyOrders(userID, beforeDay, market string) (int64, error) {
 	if beforeDay == "" {
 		return 0, nil
 	}
+	if market == "" {
+		market = "CN" // 空市场键按 CN 归一（与 UpsertRealOrder 的 normalizeMarket 同口径）
+	}
 	res, err := d.db.Exec(`UPDATE orders SET status='废单'
-		WHERE user_id=? AND side='买入' AND status IN ('已报','部成')
+		WHERE user_id=? AND market=? AND side='买入' AND status IN ('已报','部成')
 		AND substr(created_at,1,10) <> '' AND substr(created_at,1,10) < ?`,
-		userID, beforeDay)
+		userID, market, beforeDay)
 	if err != nil {
 		return 0, err
 	}

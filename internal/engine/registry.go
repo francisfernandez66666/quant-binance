@@ -926,17 +926,20 @@ func (r *Registry) build(userID string) *Engine {
 		// degenerates to the legacy CN-only channel.
 		liveRouter := trading.NewBrokerRouter(ctrl)
 		bnCfg := *opts.CfgMgr.GetBinanceConfigFor(userID)
-		if bnCfg.Enabled && !opts.ShadowExec {
+		// §MR-1 装配闸＝任一平面开（交易面 Enabled 或数据面 DataPlane）——行情/feed/FNG/事件腿
+		// 是公开数据，不再被凭证闸卡死；下面的真执行器仍只认 TradingActive+凭证，数据面恒 Noop。
+		if (bnCfg.Enabled || bnCfg.DataPlane) && !opts.ShadowExec {
 			for _, mkt := range []string{"US", "CRYPTO"} {
 				view := config.BinanceBrokerView{Cfg: bnCfg, Market: mkt}
 				if !view.BrokerEnabled() {
 					continue // 子市场开关关：不装配
 				}
 				var bexec trading.Executor = trading.NoopExecutor{}
-				if view.Cfg.APIKey != "" && view.Cfg.APISecret != "" {
+				// 真执行器硬条件=交易面活跃+凭证齐（§MR-1）：数据面即使误配钥匙也构造不出真单通道。
+				if view.TradingActive() && view.Cfg.APIKey != "" && view.Cfg.APISecret != "" {
 					bexec = trading.NewBinanceExecutor(view)
 				} else {
-					log.Printf("[engine] 账号 %s 币安 %s 已启用但凭证缺失，executor 落 Noop（记账不真下）", userID, mkt)
+					log.Printf("[engine] 账号 %s 币安 %s 平面装配但交易面未激活（数据面或凭证缺失），executor 落 Noop（记账不真下）", userID, mkt)
 				}
 				bctrl := trading.NewController(bexec, opts.RealStore, userID, view, onAlert, "binance")
 				if opts.Coordinator != nil {

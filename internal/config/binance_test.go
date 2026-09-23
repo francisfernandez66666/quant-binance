@@ -169,3 +169,40 @@ func TestBinanceBrokerView(t *testing.T) {
 		t.Fatal("US 子开关不得牵连 CRYPTO")
 	}
 }
+
+// TestBinanceDataPlane §MR-1 行为锁：数据面/交易面拆分。
+// ① data_plane=true 无凭证合法（观测链免钥匙——美股/加密货币行情本就公开）；
+// ② data_plane=true 双子开关全关仍拒（开了没意义）；
+// ③ 视图语义：数据面 BrokerEnabled=true 但 TradingActive=false（真执行器永不因数据面出现）；
+// ④ enabled=true 无凭证仍拒（交易面凭证闸不因拆分而松）。
+func TestBinanceDataPlane(t *testing.T) {
+	b := DefaultBinanceConfig()
+	b.DataPlane = true // 凭证留空、spot 子开关出厂为开
+	if err := validateBinance(&b); err != nil {
+		t.Fatalf("数据面无凭证应合法: %v", err)
+	}
+	b.Stock.Enabled = false
+	b.Spot.Enabled = false
+	if err := validateBinance(&b); err == nil {
+		t.Fatal("数据面双子开关全关应被拒")
+	}
+	// 视图双闸语义
+	c := DefaultBinanceConfig()
+	c.DataPlane = true
+	us := BinanceBrokerView{Cfg: c, Market: "US"}
+	if !us.BrokerEnabled() || us.TradingActive() {
+		t.Fatalf("数据面视图应活跃但非交易态: enabled=%v trading=%v", us.BrokerEnabled(), us.TradingActive())
+	}
+	c.Enabled = true
+	c.APIKey, c.APISecret = "k", "s"
+	if v := (BinanceBrokerView{Cfg: c, Market: "US"}); !v.BrokerEnabled() || !v.TradingActive() {
+		t.Fatal("交易面视图两闸都须为真")
+	}
+	// 交易面凭证闸不松
+	d := DefaultBinanceConfig()
+	d.Enabled = true
+	d.APIKey, d.APISecret = "", ""
+	if err := validateBinance(&d); err == nil {
+		t.Fatal("enabled=true 无凭证必须仍被拒")
+	}
+}

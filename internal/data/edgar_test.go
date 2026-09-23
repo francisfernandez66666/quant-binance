@@ -162,3 +162,36 @@ func TestEdgarBaseDefaultAndTrim(t *testing.T) {
 		t.Fatalf("尾斜杠必须去掉, got=%q", got)
 	}
 }
+
+// TestEdgarISO8859CharsetDecode §MR-EDGAR-ENC 回归锁：EDGAR 真实现网头声明
+// encoding="ISO-8859-1"，无 CharsetReader 时 encoding/xml 直接拒解（US 事件腿 100%
+// 失败的根因）——修复后必须解析成功且重音字节按码点还原（0xE9=é）；未知编码
+// （shift_jis）须显式报错而不是吞成乱码。
+// English: §MR-EDGAR-ENC regression — ISO-8859-1 declared Atom must decode with the
+// injected latin-1 CharsetReader; unsupported charsets surface as explicit errors.
+func TestEdgarISO8859CharsetDecode(t *testing.T) {
+	latin1Atom := "<?xml version=\"1.0\" encoding=\"ISO-8859-1\"?>\n" +
+		"<feed xmlns=\"http://www.w3.org/2005/Atom\"><entry>" +
+		"<title>Ren\xe9 Holdings (ACME, CIK 0001000000)</title>" +
+		"<published>2026-09-22T08:00:00-04:00</published>" +
+		"<link href=\"https://www.sec.gov/e/1\"/></entry></feed>"
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/atom+xml")
+		_, _ = w.Write([]byte(latin1Atom))
+	}))
+	defer srv.Close()
+	events, err := NewEDGARClient(srv.URL, "QuantResearch admin@example.com").FetchRecent8K(0)
+	if err != nil {
+		t.Fatalf("ISO-8859-1 声明必须可解: %v", err)
+	}
+	if len(events) != 1 || events[0].Title != "René Holdings (ACME, CIK 0001000000)" || events[0].Ticker != "ACME" {
+		t.Fatalf("Latin-1 字节未按码点还原: %+v", events)
+	}
+	bad := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte("<?xml version=\"1.0\" encoding=\"shift_jis\"?><feed><entry><title>x</title></entry></feed>"))
+	}))
+	defer bad.Close()
+	if _, err := NewEDGARClient(bad.URL, "QuantResearch admin@example.com").FetchRecent8K(0); err == nil {
+		t.Fatal("不支持的编码必须显式报错，不得吞成乱码")
+	}
+}

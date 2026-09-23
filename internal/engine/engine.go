@@ -1066,6 +1066,18 @@ func (e *Engine) LiveRouter() *trading.BrokerRouter {
 	return e.liveRouter
 }
 
+// MaintenanceBinanceOnce §MR-2 币安链维护的单次入口——供 main.go 的 7×24 独立节拍 goroutine
+// 调用。此前币安维护（健康探测/僵尸委托清扫/对账/待生效配置）唯一调用点在 A 股主循环的
+// Engine.Run 里，北京夜间/周末整段停摆，与 CRYPTO 7×24、US RTH 跨北京午夜的市场实际相悖。
+// 路由器为空（未装配币安链）时零行为；子步自带 30s/5min 节流，重复调用无害。
+// English: one-shot binance-chain maintenance for the dedicated 7x24 ticker in main.go —
+// previously reachable only through the A-share main loop, so the crypto chain idled overnight.
+func (e *Engine) MaintenanceBinanceOnce(now time.Time) {
+	if lr := e.LiveRouter(); lr != nil {
+		lr.MaintenanceBinance(now)
+	}
+}
+
 // paperSignals 把本轮翻转信号 + 卖出侧纪律信号（止损/止盈/移动止盈）送入模拟盘撮合。
 // 优先按账号分发，回退全局引擎。仅交易时段执行（盘后停自动撮合，省内存）。
 // exit 为卖出侧纪律信号（CheckPositionsExits/CheckPositionAlerts 产出），并入撮合，

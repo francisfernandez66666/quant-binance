@@ -647,13 +647,22 @@ func TestSweepStaleBuyOrders(t *testing.T) {
 	up(RealOrder{OrderID: "O4", SignalID: "S4", Code: "600000.SH", Side: "卖出", Status: "已报", Price: 10, Qty: 100, CreatedAt: "2026-09-21T14:50:00+08:00", UserID: "u1"})
 	up(RealOrder{OrderID: "O5", SignalID: "S5", Code: "600000.SH", Side: "买入", Status: "已成", Price: 10, Qty: 100, CreatedAt: "2026-09-21T14:50:00+08:00", UserID: "u1"})
 	up(RealOrder{OrderID: "O6", SignalID: "S6", Code: "600000.SH", Side: "买入", Status: "已报", Price: 10, Qty: 100, CreatedAt: "", UserID: "u1"})
+	// §MR-3 市场隔离反例：同账号 US 市场的跨日买单——CN 清扫不许碰、US 清扫只动它。
+	up(RealOrder{OrderID: "U1", SignalID: "US1", Market: "US", Code: "AAPL", Side: "买入", Status: "已报", Price: 10, Qty: 100, CreatedAt: "2026-09-21T14:50:00+08:00", UserID: "u1"})
 
-	n, err := db.SweepStaleBuyOrders("u1", "2026-09-22")
+	n, err := db.SweepStaleBuyOrders("u1", "2026-09-22", "CN")
 	if err != nil {
 		t.Fatalf("sweep: %v", err)
 	}
 	if n != 2 {
 		t.Fatalf("应恰降级 O1/O2 两笔跨日买单，got %d", n)
+	}
+	if st, err := db.RealOrdersForUser("u1"); err == nil {
+		for _, o := range st {
+			if o.OrderID == "U1" && o.Status != "已报" {
+				t.Fatalf("§MR-3 CN 清扫越市降级了 US 委托: %s", o.Status)
+			}
+		}
 	}
 	status := map[string]string{}
 	orders, _ := db.RealOrdersForUser("u1")
@@ -673,8 +682,12 @@ func TestSweepStaleBuyOrders(t *testing.T) {
 		t.Fatalf("终态/时间戳空行不许动: O5=%s O6=%s", status["O5"], status["O6"])
 	}
 	// beforeDay 为空 = 不清扫（防御）
-	if n, err := db.SweepStaleBuyOrders("u1", ""); err != nil || n != 0 {
+	if n, err := db.SweepStaleBuyOrders("u1", "", "CN"); err != nil || n != 0 {
 		t.Fatalf("空 beforeDay 应无操作: n=%d err=%v", n, err)
+	}
+	// §MR-3 US 清扫：只降 US 市场的跨日行（U1），CN 行不受二次影响
+	if n, err := db.SweepStaleBuyOrders("u1", "2026-09-22", "US"); err != nil || n != 1 {
+		t.Fatalf("US 清扫应恰降级 U1 一笔: n=%d err=%v", n, err)
 	}
 }
 

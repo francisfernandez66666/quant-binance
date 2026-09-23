@@ -571,6 +571,24 @@ func main() {
 	go func() {
 		<-scoreLoopCtx.Done()
 	}()
+	// §MR-2 币安链 7×24 独立维护节拍：健康探测/僵尸委托清扫/对账/待生效配置不再挤在
+	// A 股时段门后的主循环里（CRYPTO 全周无休、US RTH 横跨北京午夜）。60s 一跳，
+	// 子步自带 30s/5min 节流；未装配币安链的引擎零行为。
+	// English: dedicated 7x24 binance maintenance heartbeat, decoupled from the A-share session gate.
+	go func() {
+		bnMaint := time.NewTicker(60 * time.Second)
+		defer bnMaint.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-bnMaint.C:
+				for _, e := range registry.All() {
+					e.MaintenanceBinanceOnce(time.Now())
+				}
+			}
+		}
+	}()
 	go func() {
 		// §A+B 近实时节拍可配置（默认 5s）：降低以加快信号翻转检出与下单；非交易时段仍休眠。
 		// English: A+B — configurable near-realtime cadence (default 5s); off-hours still hibernated.

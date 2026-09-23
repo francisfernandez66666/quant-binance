@@ -35,6 +35,7 @@ func binanceConfigView(cfg *config.BinanceConfig) map[string]interface{} {
 	}
 	return map[string]interface{}{
 		"enabled":              cfg.Enabled,
+		"data_plane":           cfg.DataPlane, // §MR-1 数据面开关（免凭证观测，结构上不可真下单）
 		"mode":                 cfg.Mode,
 		"testnet":              cfg.Testnet,
 		"api_key_masked":       apiKeyMasked,
@@ -64,6 +65,7 @@ func binanceConfigView(cfg *config.BinanceConfig) map[string]interface{} {
 // stock/spot/risk_gate 为整档案替换（指针 nil=不动），前端表单总是回传完整三段。
 type setBinanceConfigReq struct {
 	Enabled            *bool                        `json:"enabled"`
+	DataPlane          *bool                        `json:"data_plane"` // §MR-1 数据面开关（免凭证；交易判定仍只看 enabled）
 	Mode               *string                      `json:"mode"`
 	Testnet            *bool                        `json:"testnet"`
 	APIKey             *string                      `json:"api_key"`
@@ -97,6 +99,9 @@ func (s *Server) handleSetBinanceConfig(w http.ResponseWriter, r *http.Request) 
 
 	if req.Enabled != nil {
 		cfg.Enabled = *req.Enabled
+	}
+	if req.DataPlane != nil {
+		cfg.DataPlane = *req.DataPlane // §MR-1 数据面：无凭证即可开，交易判定永不读它（TradingActive 只认 Enabled）
 	}
 	if req.Mode != nil {
 		m := strings.TrimSpace(*req.Mode)

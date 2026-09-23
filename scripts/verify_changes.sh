@@ -659,7 +659,7 @@ grep -A6 'func (d \*DB) LocalBuyFrozen' internal/store/real_positions.go | grep 
 # A 静态锁②（负向）：gate 侧不得回到单值吞错形态 `frozen := g.st.LocalBuyFrozen(...)`
 if grep -q 'frozen := g.st.LocalBuyFrozen' internal/risk/gate.go; then echo "--- FAIL: 冻结账读取错误被吞回单值形态（§C1 fail-open 复活）"; exit 1; fi
 # C 静态锁③：跨日清扫必须接在 SweepOrders 早退之前（引用 + 独立节流戳同时在位）
-grep -q 'SweepStaleBuyOrders(c.userID, beforeDay)' internal/trading/controller.go || { echo "--- FAIL: §C1b 跨日陈旧买单清扫未接线"; exit 1; }
+grep -q 'SweepStaleBuyOrders(c.userID, beforeDay, c.MarketKey())' internal/trading/controller.go || { echo "--- FAIL: §C1b 跨日陈旧买单清扫未接线（§MR-3 起须带市场键）"; exit 1; }
 grep -q 'lastStaleSweepAt' internal/trading/controller.go || { echo "--- FAIL: §C1b 独立节流戳丢失（会与 Enabled 早退共享节流而失效）"; exit 1; }
 echo "ok - §C1 专项守卫通过（行为回归 3 组 + 静态锁 4 道）"
 
@@ -1378,6 +1378,47 @@ python3 -c "import json;json.load(open('ops/grafana/dashboard.json'))" || { echo
 # 明文密钥负锁：ops/ 任何 yml/yaml/json 不得出现 token/key/secret 明文赋值（ENV 占位除外）。
 if grep -RniE '(token|key|secret)[[:space:]]*[:=][[:space:]]*["'"'"']?[A-Za-z0-9_-]{8,}' ops --include='*.yml' --include='*.yaml' --include='*.json' | grep -v '\${' | grep -viE 'cryptopanic_token"|_masked|has_crypto' | grep -q .; then echo "--- FAIL: §ENH-A2/A3 ops/ 出现明文密钥赋值（只准 ENV 变量占位）"; exit 1; fi
 echo "ok - §ENH 增强批 A+B 专项守卫通过（行为锁 7 组 + 静态锁 26 道〔等值锁 1：slipFracs=2；负锁 5：WalkForward 占位 / config 工厂默认 / Go 依赖红线 / pages 试点越界 / ops 明文密钥；ops 解析锁 3；余为正锁/定点锁〕）"
+
+echo "==> 61 §MR 市场实际改造批：数据面/交易面拆分 + 7×24 维护节拍 + NYSE 规则日历 + 清扫按市场（2026-09-23 PLAN_MARKET_REALITY）..."
+# 背景（docs/PLAN_MARKET_REALITY_20260923.md §MR-1/2/3）：旧口径下 binance.enabled 一开关同时
+# 决定「装配观测链」与「允许真下单」，无凭证即整链关闭——本地/演示环境永远空态；维护节拍
+# 挂在 CN 时段门上，美股休市语义用 weekday 近似、跨日清扫用北京日界，且 SweepStaleBuyOrders
+# 无市场过滤会跨市场误伤。本批：data_plane 拆平面、MR-2 独立 60s ticker、MR-3 规则化 NYSE
+# 节假日/半日 + 市场时区日界 + 清扫带 market 键。
+# 行为锁①：§MR-1 数据面四链（无凭证合法 / 子开关全关拒 / BrokerEnabled=true 且 TradingActive=false / enabled 仍强制凭证）
+go test -count=1 ./internal/config/ -run 'TestBinanceDataPlane' 2>&1 | grep -q '^ok' || { echo "--- FAIL: §MR-1 data_plane 行为回归未过"; exit 1; }
+go test -count=1 ./internal/server/ -run 'TestBinanceConfigDataPlane' 2>&1 | grep -q '^ok' || { echo "--- FAIL: §MR-1 data_plane HTTP 端点回归未过"; exit 1; }
+# 行为锁②：§MR-3 NYSE 规则日历（10 节假日+位移+受难日；半日 13:00/独立日前 16:00；EXTENDED 半日 17:00 收）
+go test -count=1 ./internal/data/ -run 'TestUSMarketCalendar|TestUSSessionActiveHalfDay' 2>&1 | grep -q '^ok' || { echo "--- FAIL: §MR-3 US 日历/半日行为回归未过"; exit 1; }
+# 行为锁③：§MR-3 跨日清扫按市场隔离 + trading 侧原 C1b 回归不破
+go test -count=1 ./internal/store/ -run 'TestSweepStaleBuyOrders' 2>&1 | grep -q '^ok' || { echo "--- FAIL: §MR-3 SweepStaleBuyOrders 市场隔离回归未过"; exit 1; }
+go test -count=1 ./internal/trading/ -run 'TestSweepOrdersStaleBuyUnconditional' 2>&1 | grep -q '^ok' || { echo "--- FAIL: §C1b 清扫接线回归未过"; exit 1; }
+# ---- 静态锁：MR-1 配置契约三处 + 语义判定 ----
+grep -q 'json:"data_plane"' internal/config/binance.go || { echo "--- FAIL: §MR-1 config 段 data_plane 字段丢失"; exit 1; }
+grep -q '"data_plane"' internal/server/binance_config.go || { echo "--- FAIL: §MR-1 GET 视图不再下发 data_plane"; exit 1; }
+grep -q 'req.DataPlane != nil' internal/server/binance_config.go || { echo "--- FAIL: §MR-1 POST 不再合并 data_plane"; exit 1; }
+grep -q 'binance.data_plane=true' internal/config/binance.go || { echo "--- FAIL: §MR-1 validate「数据面须≥1子开关」规则丢失"; exit 1; }
+grep -qE 'TradingActive\(\) bool[[:space:]]+\{ return v\.Cfg\.Enabled' internal/config/binance.go || { echo "--- FAIL: §MR-1 TradingActive 判定被改写（真交易必须只认 enabled）"; exit 1; }
+grep -q '(bnCfg.Enabled || bnCfg.DataPlane) && !opts.ShadowExec' internal/engine/registry.go || { echo "--- FAIL: §MR-1 装配门未接数据面或丢了 ShadowExec 旁路"; exit 1; }
+grep -q 'view.TradingActive() && view.Cfg.APIKey != "" && view.Cfg.APISecret != ""' internal/engine/registry.go || { echo "--- FAIL: §MR-1 真执行器门不再要求 TradingActive+双凭证"; exit 1; }
+# 负锁：执行器门绝不得回退到 BrokerEnabled（平面含数据面，会把观测面接上真下单=红线）
+if grep -q 'BrokerEnabled() && view.Cfg.APIKey' internal/engine/registry.go; then echo "--- FAIL: §MR-1 真执行器误用 BrokerEnabled（数据面可下单=红线）"; exit 1; fi
+# MR-1 前端锁：配置面板 data_plane 开关三接线（提交体 + 开关本体）
+grep -q 'data_plane: form.data_plane' web/src/components/BinanceConfigPanel.jsx || { echo "--- FAIL: §MR-1 前端保存体不再提交 data_plane"; exit 1; }
+grep -q "set('data_plane', v)" web/src/components/BinanceConfigPanel.jsx || { echo "--- FAIL: §MR-1 前端 data_plane 开关未接线"; exit 1; }
+# ---- 静态锁：MR-2 维护节拍（Engine 单次入口 + main.go 独立 60s ticker，7×24 不经 CN 时段门）----
+grep -q 'func (e \*Engine) MaintenanceBinanceOnce' internal/engine/engine.go || { echo "--- FAIL: §MR-2 MaintenanceBinanceOnce 入口丢失"; exit 1; }
+grep -q 'bnMaint := time.NewTicker(60 \* time.Second)' cmd/quant/main.go || { echo "--- FAIL: §MR-2 币安维护 60s 独立 ticker 丢失"; exit 1; }
+grep -q 'e.MaintenanceBinanceOnce(time.Now())' cmd/quant/main.go || { echo "--- FAIL: §MR-2 ticker 未驱动 MaintenanceBinanceOnce"; exit 1; }
+# ---- 静态锁：MR-3 日界键 + 市场过滤 + Easter 月基修正 ----
+grep -q 'data.Session(c.MarketKey()).Loc()' internal/trading/controller.go || { echo "--- FAIL: §MR-3 清扫日界不再走市场会话时区（回退北京/UTC 日界）"; exit 1; }
+grep -A8 'func (d \*DB) SweepStaleBuyOrders' internal/store/real_positions.go | grep -q 'AND market=?' || { echo "--- FAIL: §MR-3 SweepStaleBuyOrders 市场过滤丢失（跨市场误伤复活）"; exit 1; }
+# Easter 月基修正必须在位（匿名格里高利历月序 0=三月，缺 +3 则受难日整体错位一年）
+grep -q '/31+3' internal/data/market_session.go || { echo "--- FAIL: §MR-3 easterSunday 月基 +3 修正丢失（受难日错位）"; exit 1; }
+# 行为锁④：§MR-EDGAR-ENC EDGAR Atom 声明 ISO-8859-1 必须可解（现网 US 事件腿曾因 CharsetReader nil 恒失败）
+go test -count=1 ./internal/data/ -run 'TestEdgarISO8859CharsetDecode' 2>&1 | grep -q '^ok' || { echo "--- FAIL: §MR-EDGAR-ENC Latin-1 解码回归未过"; exit 1; }
+grep -q 'dec.CharsetReader = latin1ToUTF8Reader' internal/data/edgar.go || { echo "--- FAIL: §MR-EDGAR-ENC CharsetReader 注入丢失（xml.Unmarshal 裸奔=US 事件腿全灭复活）"; exit 1; }
+echo "ok - §MR 市场实际改造批专项守卫通过（行为回归 5 组 + 静态锁 17 道〔含 MR-1 执行器误用负锁〕）"
 
 echo ""
 echo "==> 全部通过"

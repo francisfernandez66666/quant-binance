@@ -938,8 +938,11 @@ func (c *Controller) SweepOrders(now time.Time) *SweepResult {
 			c.mu.Lock()
 			c.lastStaleSweepAt = now
 			c.mu.Unlock()
-			beforeDay := cntime.In(now).Format("2006-01-02")
-			n, err := c.store.SweepStaleBuyOrders(c.userID, beforeDay)
+			// §MR-3 日键按市场会话时区取（此前恒北京日）：US RTH 横跨北京午夜、CRYPTO 记 UTC 日，
+			// 拿北京日界会把美东/UTC "当日"委托误判为跨日僵尸。CN 视图 Session("CN").Loc()==北京，
+			// 行为逐字节不变（加市场不换市场）。
+			beforeDay := now.In(data.Session(c.MarketKey()).Loc()).Format("2006-01-02")
+			n, err := c.store.SweepStaleBuyOrders(c.userID, beforeDay, c.MarketKey())
 			if err != nil {
 				log.Printf("[trading] §C1b 跨日陈旧买单清扫失败: %v", err)
 			} else if n > 0 {

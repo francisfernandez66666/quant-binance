@@ -14,7 +14,14 @@ import (
 // BinanceConfig rules.binance 顶层段：币安双市场（stock=美股 equity、spot=加密货币）共享的
 // 连接与开关配置；市场级交易参数放 BinanceMarketProfile。
 type BinanceConfig struct {
-	Enabled            bool                 `json:"enabled"`     // 总开关（同 qmt.enabled 语义；出厂 false）
+	// Enabled 交易面总开关（同 qmt.enabled 语义；出厂 false）：开=允许真下单，须凭证齐备。
+	Enabled bool `json:"enabled"`
+	// DataPlane §MR-1 数据面开关：只装配观测链（行情/状态 feed、FNG、事件腿、K 线读档、
+	// 维护节拍），**永不真下**——真执行器构造硬条件仍是 Enabled+凭证（registry.go 装配面）。
+	// 依据市场实际：美股/加密货币的行情与历史数据本就不需要钥匙，凭证只属于交易面。
+	// English: observation-plane switch — feeds/FNG/events/klines with zero credentials; the live
+	// executor still requires Enabled+APIKey, so orders are structurally impossible on this plane.
+	DataPlane          bool                 `json:"data_plane"`
 	Mode               string               `json:"mode"`        // auto | manual
 	Testnet            bool                 `json:"testnet"`     // true=testnet.binance.vision（仅现货有意义）
 	APIKey             string               `json:"api_key"`     // 行情/交易 API Key
@@ -208,7 +215,8 @@ func validateBinance(b *BinanceConfig) error {
 	if b.RiskGate.SlippagePassthrough < 0 || b.RiskGate.SlippagePassthrough > 0.05 {
 		return fmt.Errorf("binance.risk_gate.slippage_passthrough 超出范围 0~0.05（实际 %.4f）", b.RiskGate.SlippagePassthrough)
 	}
-	// 启用一致性：总开关开 ⇒ 凭证齐 + 至少一个子市场开
+	// 启用一致性：交易面开 ⇒ 凭证齐 + 至少一个子市场开；数据面开 ⇒ 至少一个子市场开（**不查凭证**——
+	// §MR-1 行情/事件/K线是公开数据腿，钥匙闸只属于交易面，这正是美股/加密货币的实际）。
 	if b.Enabled {
 		if b.APIKey == "" || b.APISecret == "" {
 			return fmt.Errorf("binance.enabled=true 但 api_key/api_secret 为空")
@@ -216,6 +224,9 @@ func validateBinance(b *BinanceConfig) error {
 		if !b.Stock.Enabled && !b.Spot.Enabled {
 			return fmt.Errorf("binance.enabled=true 但 stock/spot 子开关全部关闭")
 		}
+	}
+	if b.DataPlane && !b.Stock.Enabled && !b.Spot.Enabled {
+		return fmt.Errorf("binance.data_plane=true 但 stock/spot 子开关全部关闭")
 	}
 	return nil
 }
@@ -325,7 +336,18 @@ func (v BinanceBrokerView) profile() BinanceMarketProfile {
 	return v.Cfg.Spot
 }
 
-func (v BinanceBrokerView) BrokerEnabled() bool       { return v.Cfg.Enabled && v.profile().Enabled }
+// BrokerEnabled 视图活跃判定＝（交易面 || 数据面）且子开关开。§MR-1 起本方法的语义是
+// 「该市场控制器是否装配/维护」，不再等价于「允许交易」——交易判定用 TradingActive()。
+// English: plane-active (trading OR data-plane) — use TradingActive() for "may place live orders".
+func (v BinanceBrokerView) BrokerEnabled() bool {
+	return (v.Cfg.Enabled || v.Cfg.DataPlane) && v.profile().Enabled
+}
+
+// TradingActive §MR-1 交易面活跃：仅 Enabled（数据面永不满足）且子开关开。真执行器/回报链
+// 的构造闸用它——数据面模式下即使误配了凭证也不会出现真单通道。
+// English: trading plane requires Cfg.Enabled; the data plane can never satisfy it, so a live
+// executor/reporter channel is structurally impossible without the trading switch.
+func (v BinanceBrokerView) TradingActive() bool       { return v.Cfg.Enabled && v.profile().Enabled }
 func (v BinanceBrokerView) BrokerMode() string        { return v.Cfg.Mode }
 func (v BinanceBrokerView) BrokerHalted() bool        { return v.Cfg.Halted }
 func (v BinanceBrokerView) BrokerCancelStaleSec() int { return v.Cfg.CancelStaleSec }
