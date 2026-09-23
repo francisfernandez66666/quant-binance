@@ -132,20 +132,20 @@ func TestRecommendedSolution(t *testing.T) {
 		res(35, 2.0, 0.9, 1.0, 25), // Sharpe 最高 → 推荐
 		res(60, 1.2, 0.4, 0.9, 100),
 	}
-	r := recommendedSolution(front, cfg)
+	r := recommendedSolution(front, cfg, nil)
 	if r == nil || !nearly(r.ProfitFactor, 2.0) {
 		t.Fatalf("推荐解错误: %+v", r)
 	}
 	// 并列 Sharpe 取触发数多者
 	front[0].Sharpe = 0.9
 	front[0].Count = 80
-	r = recommendedSolution(front, cfg)
+	r = recommendedSolution(front, cfg, nil)
 	if r == nil || !nearly(r.WinRate, 40) || r.Count != 80 {
 		t.Fatalf("并列应取样本多者: %+v", r)
 	}
 	// 门槛全灭 → nil
 	tight := config.ParetoConfig{MinWinRate: 90, MinProfitFactor: 5, MinSharpe: 5, MinCalmar: 5}
-	if r := recommendedSolution(front, tight); r != nil {
+	if r := recommendedSolution(front, tight, nil); r != nil {
 		t.Fatalf("门槛全灭应返回 nil, got %+v", r)
 	}
 }

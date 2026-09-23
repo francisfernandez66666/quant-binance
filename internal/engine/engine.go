@@ -1506,6 +1506,14 @@ func (e *Engine) autoPlace(sig combat_agent.Signal, live map[string]*data.StockI
 	// one merged admission yet carried two distinct buy keys (theoretical double-order per day).
 	stratKey := signalctl.StrategyKeyOf(sig)
 	id := fmt.Sprintf("buy:%s:%s:%s", pureTsCode(sig.Code), stratKey, data.TradingDayDate(time.Now()))
+	// §ENH-B7 滑点校准回灌挂价：risk_gate.slippage_passthrough>0 时买单挂价 =
+	// 参考价×(1+实测买入滑点比例，钳制进帽)；缺省 0 → slipBuyPrice 原样返回 price，
+	// 载荷逐字节等价现状。数量仍按原参考价整手（滑点是定价预算不是仓位口径）；
+	// CurrentPrice/PrevClose 仍传真实行情，涨跌停/复核闸不被回灌价干扰。
+	// English: §ENH-B7 — calibrated-slippage limit pricing; frac=0 (default) leaves the request
+	// byte-identical, and quote-context fields stay raw so the risk gates see real market prices.
+	buySlip, _ := e.slipFracs(ctrl, sig.Strategy, sig.StrategyID)
+	ordPrice := slipBuyPrice(price, buySlip)
 	// 组装买入订单请求：金额按数量×价格计算，幂等键随信号 ID 传递。
 	// §WS-C 行情上下文装配：StalenessMs（fetcher 快照陈旧度）/ CurrentPrice / PrevClose 供
 	// risk.Gate 的行情新鲜度、集中度与涨跌停不可追单闸消费（缺失时对应闸 fail-open）。
@@ -1520,9 +1528,9 @@ func (e *Engine) autoPlace(sig combat_agent.Signal, live map[string]*data.StockI
 		StrategyType: sig.StrategyType,
 		Side:         trading.SideBuy,
 		PriceType:    cfg.PriceType,
-		Price:        price,
+		Price:        ordPrice,
 		Qty:          qty,
-		Amount:       float64(qty) * price,
+		Amount:       float64(qty) * ordPrice,
 		CreatedAt:    time.Now().Format(time.RFC3339),
 		StalenessMs:  e.quoteStalenessMs(sig.Code),
 	}

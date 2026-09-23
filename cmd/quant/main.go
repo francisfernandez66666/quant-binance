@@ -414,6 +414,17 @@ func main() {
 		ShadowExec:         isStaging(), // §WS-G staging 影子执行器：决策落 shadow_orders、永不真下
 	})
 	srv.SetEngineRegistry(registry)
+	// §ENH-A1 FNG 恐慌贪婪证据闭包：/api/binance/state 的 "fng" 节经 Registry.FNGSnapshot 供数
+	// （懒踢刷新+节流，见 internal/engine/registry_fng.go）。CRYPTO 链未装配时快照恒 ok=false，
+	// 节点如实报"无证据"、零外呼——注入本身对现网零行为变化。
+	// English: §ENH-A1 wires the FNG evidence closure (lazy throttled snapshot via the engine
+	// registry); with the CRYPTO leg unbuilt it reports ok=false and never calls out.
+	srv.SetFNGSource(func() (int, string, int64, bool) { return registry.FNGSnapshot() })
+	// §ENH-A4/B8 事件血源快照闭包（EDGAR=US / CryptoPanic=CRYPTO）：凭证空=腿不装配=
+	// 两市场恒 ok=false、零外呼；本批只喂观测面与战法入参，派发链保持 Phase 5。
+	srv.SetXEventsSource(func(market string) ([]map[string]any, int64, bool) {
+		return registry.XEventsJSON(market)
+	})
 
 	// §R6 P1-1 部署漂移自检：启动阶段汇总高影响配置的"声明态 vs 实际生效态"，与二进制指纹一并
 	// 落到 opslog + 启动日志，早期暴露 2026-09-01 三类线上事故（旧二进制缺修复 / LLM key 拼写/
@@ -534,6 +545,10 @@ func main() {
 		// nAgent.Stop/fetcher.Stop 永不执行（注释宣称"最终落盘"与实现相反），
 		// 非原子写状态文件可能被拦腰截断。改为显式执行关键 Stop 后再退出，
 		// 与 defer 链语义对齐（scoreLoopCancel 等由 ctx 派生自动生效）。
+		// §ENH-X2 币安侧生命周期腿先收摊（reporter WS/listenKey + quotes/status feeds 的
+		// close 帧），再停 CN 采集链——此前 feed 只启不停，WS 靠进程退出连带掐断
+		// （对端半开连接要等超时才清）。ShutdownLive 幂等且单腿失败不拖链。
+		registry.ShutdownLive()
 		fetcher.Stop()
 		nAgent.Stop()
 		log.Println("[main] 优雅停机完成")

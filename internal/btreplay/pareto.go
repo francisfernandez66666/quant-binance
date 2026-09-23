@@ -93,22 +93,34 @@ func capFront(front []sweepResult, maxPoints int) []sweepResult {
 	return out
 }
 
-// recommendedSolution 硬门槛全达标的前沿解中取 Sharpe 最高者（并列取触发数多者）。
-// A1 轮落地后评分键切换为样本外 IR（验证窗日频 Sharpe）——届时代码只换键名。
-// 返回 nil = 无达标解（前端降级为纯前沿展示）。
-// English: among frontier points passing all hard gates, pick the best Sharpe (tie: more triggers);
-// nil when no solution qualifies.
-func recommendedSolution(front []sweepResult, cfg config.ParetoConfig) *sweepResult {
+// recommendedSolution 硬门槛全达标的前沿解中取最优者。
+//   - oosIR=nil（§ENH-B6 开关关/无 WF 数据）：评分键=全样本 Sharpe（并列取触发数多者）——旧行为；
+//   - oosIR≠nil：评分键切换为样本外 IR（oos_ir=OOS 日频 Sharpe，walkforward.go 产出）。
+//     不在 oosIR 中的前沿点=未进 IS Top-K 重放或 low_sample_oos，一律不参与推荐（宁缺勿荐）；
+//     全部不合格返回 nil，前端照常降级为纯前沿展示。
+//
+// English: recommendedSolution — full-sample Sharpe key when oosIR is nil (legacy); with WF data
+// the key switches to out-of-sample daily Sharpe and points lacking OOS evidence never qualify.
+func recommendedSolution(front []sweepResult, cfg config.ParetoConfig, oosIR map[comboKey]float64) *sweepResult {
 	var best *sweepResult
+	var bestScore float64
 	for i := range front {
 		s := &front[i]
 		if s.WinRate < cfg.MinWinRate || s.ProfitFactor < cfg.MinProfitFactor ||
 			s.Sharpe < cfg.MinSharpe || s.Calmar < cfg.MinCalmar {
 			continue // 硬门槛
 		}
-		if best == nil || s.Sharpe > best.Sharpe ||
-			(s.Sharpe == best.Sharpe && s.Count > best.Count) {
-			best = s
+		score := s.Sharpe
+		if oosIR != nil {
+			v, ok := oosIR[keyOf(s)]
+			if !ok {
+				continue // 无样本外证据的点不参与推荐（§ENH-B6 键切换的核心约束）
+			}
+			score = v
+		}
+		if best == nil || score > bestScore ||
+			(score == bestScore && s.Count > best.Count) {
+			best, bestScore = s, score
 		}
 	}
 	return best

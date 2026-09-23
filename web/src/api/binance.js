@@ -50,3 +50,14 @@ export async function binanceHalt(halted) {
 export async function refreshBinanceExchangeInfo() {
   return request('/api/binance/exchange_info', { method: 'POST' })
 }
+
+// —— §BINANCE-P5 新市场历史 K 线（只读端点，路由挂 authMiddleware）——
+// GET /api/binance/kline?market=US|CRYPTO&code=BTCUSDT|AAPL.US&count=N（count 缺省 180、上限 500）
+//   → [{date:'2026-09-23',open,high,low,close,volume}] 时间升序；无数据如实 []（前端有轴无图）
+// 数据源=研究库 daily 表离线归档（scripts/download_binance_klines.py），非实时、不兜底拉交易所。
+// 分轨约束：CN 的 K 线/分时仍走 api/index.js 的 /api/kline——本口传 market=CN 后端直接 400。
+export async function fetchBinanceKline(market, code, count) {
+  const q = new URLSearchParams({ market: String(market || ''), code: String(code || '') })
+  if (count) q.set('count', String(count))
+  return request('/api/binance/kline?' + q.toString())
+}

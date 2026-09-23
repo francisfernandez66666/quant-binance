@@ -32,6 +32,26 @@ func (s *Server) binanceLive(r *http.Request) (*trading.BrokerRouter, string, bo
 	return lr, userIDFor(r), true
 }
 
+// SetFNGSource §ENH-A1 注入恐慌贪婪指数（FNG）证据闭包（装配层用 data.FNGClient 的
+// 缓存面包装而来：只读内存不触网）。nil=未配置，/api/binance/state 响应不含 "fng" 节
+// ——零配置零行为；注入后每请求转读一次缓存，ok=false 呈现为 {"ok":false}（无证据
+// ≠中性，与 §9 market_halt 同姿势）。
+// English: injects the Fear & Greed evidence closure (cache-only read of data.FNGClient).
+// nil keeps the "fng" node absent from /api/binance/state entirely (zero-config,
+// zero-behavior); ok=false renders as no-evidence, never as neutral.
+func (s *Server) SetFNGSource(fn func() (value int, classification string, ageSec int64, ok bool)) {
+	s.fngSource = fn
+}
+
+// SetXEventsSource §ENH-A4/B8 注入事件血源快照闭包（装配层=engine.Registry.XEventsJSON，
+// 内部只读缓存+异步踢刷新）。nil=未注入时 /api/binance/state 不含 "events" 节
+// （零配置零行为）；注入后两市场各成一节，未装配腿如实呈现 {"ok":false}。
+// English: injects the §ENH-A4/B8 event-leg snapshot closure; nil omits the "events"
+// node entirely, markets without an attached leg report ok=false (no evidence, no fabrication).
+func (s *Server) SetXEventsSource(fn func(market string) (events []map[string]any, ageSec int64, ok bool)) {
+	s.xeventsSource = fn
+}
+
 // handleBinanceState GET /api/binance/state：双市场控制器快照 + 执行器/接收器健康度。
 // 前端 BinanceStatusCard 消费；只读、零副作用。
 func (s *Server) handleBinanceState(w http.ResponseWriter, r *http.Request) {
@@ -69,6 +89,34 @@ func (s *Server) handleBinanceState(w http.ResponseWriter, r *http.Request) {
 	// §P3 feed 观测节：行情双 feed（CRYPTO/US quotes）+ 状态 feed（US tradingStatus）。
 	// 未装配（配置缺省/Dial 缺失）时为空数组——前端卡片按"无数据"渲染，绝不缺键崩页。
 	out["feeds"] = lr.FeedStats()
+	// §ENH-A1 FNG 情绪证据节：仅在装配层注入闭包后出现（nil=响应零变化，前端零特判）。
+	// ok=false 只报 ok=false 不造 value——"无证据≠中性"在 JSON 契约层的落点。
+	if s.fngSource != nil {
+		value, classification, ageSec, ok := s.fngSource()
+		node := map[string]any{"ok": ok}
+		if ok {
+			node["value"] = value
+			node["classification"] = classification
+			node["age_sec"] = ageSec
+		}
+		out["fng"] = node
+	}
+	// §ENH-A4/B8 事件血源节：US=EDGAR 8-K、CRYPTO=CryptoPanic 热帖的最近去重批次。
+	// 未装配（凭证空）的市场只有 {"ok":false}——观测面先于派发链（Phase 5 边界），
+	// 前端按"无数据"渲染；闭包未注入=整节省略（与 fng 同零配置零行为惯例）。
+	if s.xeventsSource != nil {
+		node := map[string]any{}
+		for _, m := range []string{"US", "CRYPTO"} {
+			evs, ageSec, xok := s.xeventsSource(m)
+			entry := map[string]any{"ok": xok}
+			if xok {
+				entry["events"] = evs
+				entry["age_sec"] = ageSec
+			}
+			node[m] = entry
+		}
+		out["events"] = node
+	}
 	writeJSON(w, 200, out)
 }
 

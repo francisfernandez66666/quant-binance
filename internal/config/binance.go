@@ -29,6 +29,25 @@ type BinanceConfig struct {
 	Spot               BinanceMarketProfile `json:"spot"`                           // —— CRYPTO 市场档案 ——
 	RiskGate           RiskGateConfig       `json:"risk_gate"`
 	PaperSeparate      bool                 `json:"paper_separate"` // 新市场纸面盘独立资金池（P2 接 paper）
+	// Events §ENH-A4/B8 事件血源腿（SEC EDGAR 8-K / CryptoPanic 热帖）的凭证与范围。
+	// 缺省零值=两腿全部不装配（"空配置=不装配"惯例）；token 属密钥，GET 侧只回掩码。
+	// English: §ENH-A4/B8 event-leg credentials (EDGAR UA / CryptoPanic key); zero value
+	// keeps both legs inert, the token is masked on the read API like api_secret.
+	Events BinanceEventsConfig `json:"events,omitempty"`
+}
+
+// BinanceEventsConfig 事件腿配置（§ENH-A4 EDGAR + §ENH-B8 CryptoPanic）。
+// 消费位点=engine Registry 装配面（registry_events.go）：US 分支 EdgarUserAgent 非空才挂
+// EDGAR 源、CRYPTO 分支 CryptoPanicToken 非空才挂热帖源；两腿只喂观测面与战法入参，
+// 派发链保持 Phase 5 边界（本批不发任何新单）。
+// English: event-leg config; consumed at registry assembly — empty key ⇒ leg never built.
+type BinanceEventsConfig struct {
+	// EdgarUserAgent SEC 自动化访问政策要求的 User-Agent（含联系邮箱）；空=US 事件腿拒发=不装配。
+	EdgarUserAgent string `json:"edgar_user_agent,omitempty"`
+	// CryptoPanicToken 热帖 API key；空=整腿惰性不装配（客户端 Enabled() 同源判定点）。
+	CryptoPanicToken string `json:"cryptopanic_token,omitempty"`
+	// CryptoPanicCurrencies 关注的币种列表（如 ["BTC","ETH"]）；空=客户端缺省集。
+	CryptoPanicCurrencies []string `json:"cryptopanic_currencies,omitempty"`
 }
 
 // BinanceMarketProfile 单市场档案（US/CRYPTO 共用形状）。Enabled 为子开关：
@@ -183,6 +202,11 @@ func validateBinance(b *BinanceConfig) error {
 	}
 	if b.RiskGate.MaxOrderAmount < 0 {
 		return fmt.Errorf("binance.risk_gate.max_order_amount 不能为负（%.2f）", b.RiskGate.MaxOrderAmount)
+	}
+	// §ENH-B7 滑点回灌比例帽同构域校验（0~0.05）。当前消费面=engine 自动挂价链
+	// （autoPlace/sellRealPosition 读 ctrl.QMT().RiskGate），binance 侧仅做输入卫生。
+	if b.RiskGate.SlippagePassthrough < 0 || b.RiskGate.SlippagePassthrough > 0.05 {
+		return fmt.Errorf("binance.risk_gate.slippage_passthrough 超出范围 0~0.05（实际 %.4f）", b.RiskGate.SlippagePassthrough)
 	}
 	// 启用一致性：总开关开 ⇒ 凭证齐 + 至少一个子市场开
 	if b.Enabled {

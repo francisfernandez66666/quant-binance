@@ -1,0 +1,65 @@
+# ── 文件头注释（§ENH-A2 Gatus 状态页配置）────────────────────────────────
+# 用途：双站 /api/status 存活探测 + 失败开窗 ntfy 推送 + 公网可读状态页（默认仅回环）。
+# 投放位置：首尔站 /etc/gatus/config.yaml（与 Prometheus 同机或独立小机均可）。
+# 启动示例：GATUS_CONFIG_PATH=/etc/gatus/config.yaml QUANT_OPS_TOKEN=*** gatus
+#   或 systemd：EnvironmentFile=/etc/gatus/secret.env（0600，仅 owner 可读，放 QUANT_OPS_TOKEN）
+#   二进制：github.com/TwiN/gatus releases 单文件；配置改动收到即热加载，无需重启。
+# 凭据说明：/api/status 实测经 authMiddleware 鉴权（Authorization 兼容裸 token 或 Bearer 前缀），
+#   故下方 headers 用 ${QUANT_OPS_TOKEN} 环境变量注入（Gatus 原生支持 $VAR/${VAR} 替换），
+#   token=运维账号 POST /api/auth/login 签发、TTL 30 天，到期换发后改 secret.env 重启 gatus。
+# 暴露策略：web 只绑 127.0.0.1:8888——公网挂状态页=owner 决定（反代/防火墙自行加）。
+# ──────────────────────────────────────────────────────────────────────────
+web:
+  address: 127.0.0.1   # 默认仅回环；要公网读再由 owner 挂反代
+  port: 8888
+
+alerting:
+  ntfy:
+    url: https://ntfy.sh          # 自建 ntfy  relay 则改此处；topic 占位符与现网 C9 通知通道同源
+    topic: "<QUANT_NTFY_TOPIC>"   # 与服务端配置的 ntfy topic 保持一致，勿另起新 topic
+    priority: 4
+    default-alert:
+      failure-threshold: 3        # 连续 3 次探测失败 → 开窗告警（防毛刺）
+      success-threshold: 2        # 连续 2 次成功 → 关窗恢复
+      send-on-resolved: true
+
+endpoints:
+  - name: quant-seoul-status
+    group: quant-binance
+    url: http://<SEOUL_HOST>:8080/api/status
+    interval: 30s
+    headers:
+      Authorization: "Bearer ${QUANT_OPS_TOKEN}"   # /api/status 需鉴权；adminMiddleware 兼容 Bearer 前缀
+    conditions:
+      - "[STATUS] == 200"
+      - "has([BODY].uptime) == true"               # handleFixStatus 恒下发 uptime/session 字段
+      - "has([BODY].session) == true"
+    alerts:
+      - type: ntfy
+
+  - name: quant-guangzhou-status
+    group: quant-binance
+    url: http://<GUANGZHOU_HOST>:8080/api/status
+    interval: 30s
+    headers:
+      Authorization: "Bearer ${QUANT_OPS_TOKEN}"
+    conditions:
+      - "[STATUS] == 200"
+      - "has([BODY].uptime) == true"
+      - "has([BODY].session) == true"
+    alerts:
+      - type: ntfy
+
+  # ── 币安面部署后启用（admin 鉴权同 /api/metrics/prometheus；未接线时该端点回 503，
+  #    启用过早会长期红窗——等币安 live channel 真正 wired 后再取消注释）──
+  # - name: quant-binance-state
+  #   group: quant-binance
+  #   url: http://<SEOUL_HOST>:8080/api/binance/state
+  #   interval: 60s
+  #   headers:
+  #     Authorization: "Bearer ${QUANT_OPS_TOKEN}"
+  #   conditions:
+  #     - "[STATUS] == 200"
+  #     - "has([BODY].enabled) == true"    # handleBinanceState 恒含 enabled/mode/halted 字段
+  #   alerts:
+  #     - type: ntfy

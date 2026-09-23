@@ -126,6 +126,9 @@ func cmdRunTask(db *store.DB, dbPath string, args []string) {
 				// §WS-H C2 多重检验校正开关（payload mcc=true 时输出 Bonferroni 校正后 p 简报）
 				MCC: payloadBool(p, "mcc"),
 			}
+			// §ENH-B6 样本外验证开关：payload.walk_forward = true（全缺省 0.7/10/20）或
+			// 对象 {is_ratio,min_oos_triggers,top_k}（逐键覆盖）；缺字段=nil=旧行为载荷逐字节等价。
+			o.Sweep.WalkForward = payloadWalkForward(p)
 		}
 		if err := o.Run(); err != nil {
 			log.Fatalf("战法库回放失败: %v", err)
@@ -181,6 +184,49 @@ func payloadBacktest(p map[string]any) *config.BacktestConfig {
 		return nil
 	}
 	return &cfg
+}
+
+// payloadWalkForward §ENH-B6 解码 payload.walk_forward → btreplay.WalkForwardOptions：
+//   - 缺失/false/nil = nil（扫参载荷与基线逐字节等价的旧行为）；
+//   - true = 全缺省档（ISRatio 0.7 / MinOOSTrig 10 / TopK 20，引擎侧 wfEffective 归一）；
+//   - 对象 {is_ratio,min_oos_triggers,top_k} = 开启 + 逐键覆盖（零/非法键回退缺省）。
+//
+// English: decodes payload.walk_forward (bool → defaults, object → overrides); absent/false = nil.
+func payloadWalkForward(p map[string]any) *btreplay.WalkForwardOptions {
+	switch v := p["walk_forward"].(type) {
+	case bool:
+		if !v {
+			return nil
+		}
+		return &btreplay.WalkForwardOptions{}
+	case map[string]any:
+		return &btreplay.WalkForwardOptions{
+			ISRatio:    payloadFloatAny(v, "is_ratio", 0),
+			MinOOSTrig: payloadIntDefAny(v, "min_oos_triggers", 0),
+			TopK:       payloadIntDefAny(v, "top_k", 0),
+		}
+	case string:
+		if v == "true" || v == "1" {
+			return &btreplay.WalkForwardOptions{}
+		}
+	}
+	return nil
+}
+
+// payloadFloatAny/payloadIntDefAny 子对象取数小助手（与 payloadFloat/payloadIntDef 同口径，
+// 但作用于已解出的 map；缺失或非数字回退默认值 0=让引擎侧归一缺省）。
+func payloadFloatAny(m map[string]any, key string, def float64) float64 {
+	if v, ok := m[key].(float64); ok {
+		return v
+	}
+	return def
+}
+
+func payloadIntDefAny(m map[string]any, key string, def int) int {
+	if v, ok := m[key].(float64); ok {
+		return int(v)
+	}
+	return def
 }
 
 // payloadStr 取字符串参数：缺失或空串回退默认值。

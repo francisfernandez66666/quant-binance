@@ -140,6 +140,24 @@ type Registry struct {
 	// English: P1-4 admin predicate (same source as autoCheck, wired from auth.IsAdmin) — forwarded to
 	// each account engine so primaryMember can prefer an admin owner.
 	isAdminFn func(userID string) bool
+
+	// §ENH-X2 优雅停机链：build 阶段创建的全部币安侧 BrokerRouter 收纳于此（每引擎一个，
+	// 创建即登记、不再变更），ShutdownLive 逐一收摊 reporter 与 feed 生命周期腿。
+	// 独立锁与 r.mu 分离——登记发生在引擎构建临界区内，复用一个锁会自锁。
+	liveMu      sync.Mutex
+	liveRouters []*trading.BrokerRouter
+
+	// §ENH-A1 FNG 恐慌贪婪指数证据面：CRYPTO 分支装配时惰性挂上进程级唯一客户端
+	// （全账号共享同一外部证据，不按账号重复拉取），FNGSnapshot 为 server 闭包只读面。
+	// 独立锁：attach 在构建临界区、Snapshot 在 HTTP 读路径，两者都不该碰 r.mu/liveMu。
+	fngMu     sync.Mutex
+	fng       *data.FNGClient
+	fngKickAt time.Time // 最近一次异步 Refresh 踢发时刻（拉流节流，防轮询风暴）
+
+	// §ENH-A4/B8 事件血源腿（EDGAR=US / CryptoPanic=CRYPTO）：market→腿，凭证在场才挂
+	// （registry_events.go）。与 fng 同族独立锁——attach 在构建临界区、快照在 HTTP 读路径。
+	xevMu   sync.Mutex
+	xevLegs map[string]*xeventLeg
 }
 
 // NewRegistry 创建引擎注册表。
@@ -154,6 +172,19 @@ func NewRegistry(opts EngineOptions) *Registry {
 		papers:         make(map[string]*paper.Engine),
 		coreUsers:      make(map[*Engine][]string),
 		paperExportDay: make(map[string]string),
+	}
+}
+
+// ShutdownLive §ENH-X2 优雅停机入口：对注册表创建过的每个 BrokerRouter 执行币安侧收摊
+// （reporter WS/listenKey 腿 + quotes/status feed 的 WS close）。main 的停机链在停 CN 腿
+// （fetcher/nAgent）之前调用本方法；重复调用安全，单腿失败不拖其它腿。
+// English: graceful shutdown of all binance-side routers ever built by this registry.
+func (r *Registry) ShutdownLive() {
+	r.liveMu.Lock()
+	rs := append([]*trading.BrokerRouter(nil), r.liveRouters...)
+	r.liveMu.Unlock()
+	for _, lr := range rs {
+		lr.ShutdownLive()
 	}
 }
 
@@ -952,11 +983,11 @@ func (r *Registry) build(userID string) *Engine {
 						log.Printf("[engine] 账号 %s 币安 %s 行情 feed 构造失败（该市场无实时快照）: %v", userID, mkt, qerr)
 					} else {
 						qfeed.Start()
-						liveRouter.RegisterFeed("quotes-"+strings.ToLower(mkt), mkt, func() trading.FeedStat {
+						liveRouter.RegisterFeedWithStop("quotes-"+strings.ToLower(mkt), mkt, func() trading.FeedStat {
 							recv, _, _, _ := qfeed.Stats()
 							return trading.FeedStat{Name: "quotes-" + strings.ToLower(mkt), Market: mkt,
 								Healthy: qfeed.Healthy(), SilenceMs: qfeed.SilenceMs(), Frames: recv}
-						})
+						}, qfeed.Stop)
 					}
 				}
 				if mkt == "US" && len(prof.StatusSymbols) > 0 {
@@ -968,20 +999,46 @@ func (r *Registry) build(userID string) *Engine {
 					} else {
 						sfeed.Start()
 						bctrl.SetHaltEvidenceSource(sfeed.GateSource())
-						liveRouter.RegisterFeed("status-us", "US", func() trading.FeedStat {
+						liveRouter.RegisterFeedWithStop("status-us", "US", func() trading.FeedStat {
 							return trading.FeedStat{Name: "status-us", Market: "US",
 								Healthy: sfeed.Healthy(), SilenceMs: sfeed.SilenceMs(), Frames: sfeed.Frames(),
 								Unconfirmed: sfeed.Store().Unconfirmed(), MissCount: sfeed.Store().MissCount()}
-						})
+						}, sfeed.Stop)
 					}
 				}
 				liveRouter.Register(mkt, bctrl)
+				// §ENH-A1 FNG 情绪腿装配（见 registry_fng.go）：CRYPTO 分支在场才挂证据客户端——
+				// CRYPTO 关闭时 FNGSnapshot 恒 ok=false、零外呼，/api/binance/state 零行为变化。
+				if mkt == "CRYPTO" {
+					r.attachFNG()
+				}
+				// §ENH-A4/B8 事件血源腿装配（见 registry_events.go）：凭证在场才建腿——
+				// US=EDGAR 8-K 全文 RSS（UA 是 SEC 政策的硬要求）、CRYPTO=CryptoPanic 热帖；
+				// 空键=整腿不装配=快照恒 ok=false（零配置零行为，出厂默认不碰外源）。
+				// 本批消费面=观测（state "events" 节）+ 战法入参源闭包，派发链保持 Phase 5。
+				if ev := bnCfg.Events; mkt == "US" && ev.EdgarUserAgent != "" {
+					ua := ev.EdgarUserAgent
+					r.attachXEventSource("US", func() ([]data.XEvent, error) {
+						return data.NewEDGARClient("", ua).FetchRecent8K(0)
+					})
+				} else if mkt == "CRYPTO" && ev.CryptoPanicToken != "" {
+					cp := data.NewCryptoPanicClient(ev.CryptoPanicToken, "")
+					cur := ev.CryptoPanicCurrencies
+					r.attachXEventSource("CRYPTO", func() ([]data.XEvent, error) {
+						return cp.Fetch(cur, 0)
+					})
+				}
 				log.Printf("[engine] 账号 %s 币安 %s 实盘控制器装配完成 (mode=%s testnet=%v)", userID, mkt, view.BrokerMode(), bnCfg.Testnet)
 			}
 		}
 		e.SetLiveRouter(liveRouter)
 		// 回报接收器随引擎启动（进程级生命周期，与引擎共存亡；单腿失败内部降级不阻塞）。
 		liveRouter.StartReporters()
+		// §ENH-X2 创建即登记：优雅停机时经 Registry.ShutdownLive 统一收摊（此前 feed 只启不停，
+		// WS 靠进程退出连带掐断，属不对称生命周期）。
+		r.liveMu.Lock()
+		r.liveRouters = append(r.liveRouters, liveRouter)
+		r.liveMu.Unlock()
 	}
 	// 账号开关初始化（按共享组配置固化到引擎，运行期不随单账号变化）
 	ls := opts.CfgMgr.GetLongShortConfigFor(userID)

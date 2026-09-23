@@ -222,6 +222,18 @@ type Server struct {
 	// §C9-UX（2026-09-22 PM 批清扫）通知器注入：/api/notify-test 从空 stub 升级为
 	// 真实连通性探测（webhook/网关/ntfy 逐通道试发）。nil=独立 server 模式，接口回显 noop。
 	notifier *notify.Notifier
+
+	// fngSource §ENH-A1 恐慌贪婪指数（FNG）证据闭包：由装配层经 SetFNGSource 注入，
+	// /api/binance/state 的 "fng" 节唯一数据腿。nil=零配置零行为（响应不含该节，
+	// 前端按"无数据"渲染）；闭包只读缓存不触网（出呼节奏归装配层，见 data.FNGClient）。
+	fngSource func() (value int, classification string, ageSec int64, ok bool)
+
+	// xeventsSource §ENH-A4/B8 事件血源腿（EDGAR/CryptoPanic）快照闭包：market → 最近
+	// 一批去重候选（值拷贝）+ 证据龄。nil=零配置零行为（/api/binance/state 不含 "events"
+	// 节）；装配层实现见 engine.Registry.XEventsJSON——懒踢刷新不阻塞本请求。
+	// English: §ENH-A4/B8 event-leg snapshot closure (market → dedup'd candidates/age);
+	// nil keeps the "events" node absent; refresh is kicked asynchronously by the assembler.
+	xeventsSource func(market string) (events []map[string]any, ageSec int64, ok bool)
 }
 
 // EngineRegistry 引擎注册表的 HTTP 可见接口（由 engine.Registry 实现，避免 server→engine 依赖环）。
@@ -644,6 +656,8 @@ func (s *Server) registerRoutes() {
 	// （CN 快照与撤单仍归 /api/qmt/*）；写面 cancel/halt/disclaimer 全过 adminMiddleware——
 	// halt 只扇出币安控制器（A 股紧急停止互不牵连），disclaimer 是资金安全闩的人工复位口。
 	s.mux.HandleFunc("GET /api/binance/state", s.adminMiddleware(s.handleBinanceState))
+	// §BINANCE-P5 新市场（US/CRYPTO）历史 K 线只读面（研究库 daily 表）：CN 仍走 /api/kline，两链分轨。
+	s.mux.HandleFunc("GET /api/binance/kline", s.authMiddleware(s.handleBinanceKline))
 	s.mux.HandleFunc("GET /api/binance/orders", s.adminMiddleware(s.handleBinanceOrders))
 	s.mux.HandleFunc("GET /api/binance/exchange_info", s.adminMiddleware(s.handleBinanceExchangeInfo))
 	s.mux.HandleFunc("POST /api/binance/cancel", s.adminMiddleware(s.handleBinanceCancel))

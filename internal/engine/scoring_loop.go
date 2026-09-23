@@ -855,6 +855,12 @@ func (e *Engine) sellRealPosition(ctrl *trading.Controller, p store.RealPosition
 	if qty <= 0 || price <= 0 {
 		return nil
 	}
+	// §ENH-B7 滑点校准回灌卖出侧镜像：挂价 = 参考价×(1−实测卖出滑点比例，钳制进帽)；
+	// 缺省帽 0 → 原样返回 price，载荷逐字节等价。持仓只带显示名（无规则ID），池键映射
+	// 不中时按全局样本回退——与 btreplay 分组口径同源，不猜小样本价。
+	// English: §ENH-B7 sell-side mirror of calibrated-slippage limit pricing; 0 cap = byte-identical.
+	_, sellSlip := e.slipFracs(ctrl, p.Strategy, "")
+	ordPrice := slipSellPrice(price, sellSlip)
 	req := trading.OrderRequest{
 		SignalID:    signalID,
 		Code:        p.TsCode,
@@ -862,9 +868,9 @@ func (e *Engine) sellRealPosition(ctrl *trading.Controller, p store.RealPosition
 		Strategy:    p.Strategy,
 		Side:        trading.SideSell,
 		PriceType:   cfg.PriceType,
-		Price:       price,
+		Price:       ordPrice,
 		Qty:         qty,
-		Amount:      price * float64(qty),
+		Amount:      ordPrice * float64(qty),
 		CreatedAt:   time.Now().Format(time.RFC3339),
 		StalenessMs: e.quoteStalenessMs(p.TsCode),
 	}

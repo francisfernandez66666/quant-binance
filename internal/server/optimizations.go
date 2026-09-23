@@ -40,11 +40,17 @@ func (s *Server) handleOptimizeEnqueue(w http.ResponseWriter, r *http.Request) {
 		Start     string `json:"start"`
 		End       string `json:"end"`
 		TopN      int    `json:"top_n"`
+		// §ENH-B6 样本外验证开关透传：true=缺省档，对象 {is_ratio,min_oos_triggers,top_k}=逐键覆盖；
+		// 缺省不下发 → 扫参载荷与基线逐字节等价（引擎侧 payloadWalkForward 收口）。
+		WalkForward any `json:"walk_forward"`
 	}
 	if r.Body != nil {
 		_ = json.NewDecoder(r.Body).Decode(&body)
 	}
 	payload := map[string]any{"kind": "optimize"}
+	if body.WalkForward != nil {
+		payload["walk_forward"] = body.WalkForward
+	}
 	if body.Objective != "" {
 		payload["objective"] = body.Objective
 	}

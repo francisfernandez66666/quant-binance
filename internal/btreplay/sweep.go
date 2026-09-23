@@ -40,6 +40,18 @@ type SweepConfig struct {
 	// English: W7 minimum trigger count — combos below this are excluded from champion contention;
 	// 0 uses per-objective defaults.
 	MinTriggers int
+	// §ENH-B6 样本外验证开关：nil=关闭（载荷与基线逐字节等价、推荐键保持全样本 Sharpe）；
+	// 非 nil=对该战法追加 walk_forward 节（IS Top-K→OOS 重放）并把 Pareto 推荐键切到 oos_ir。
+	// English: walk-forward gate — nil keeps the payload byte-identical to baseline; non-nil adds
+	// the walk_forward brief and switches the Pareto recommendation key to OOS daily Sharpe.
+	WalkForward *WalkForwardOptions
+}
+
+// combo5 单个参数组合的五维坐标（止盈/止损/持仓/门槛/ATR 倍数）。
+// §ENH-B6 起提升为包级类型：样本外验证（walkforward.go）要在 runSweep 内复用组合枚举。
+type combo5 struct {
+	tp, sl, score, atr float64
+	hold               int
 }
 
 // minTriggersForObj 按目标函数取默认最小样本量：
@@ -309,10 +321,6 @@ func (o *Options) runSweep(db *store.DB, codes []string, ads []adapter,
 		atrMults := stepRangeF(poolCfg.AtrFrom, poolCfg.AtrTo, poolCfg.AtrStep)
 
 		// 2c) 全组合枚举（指数级：|tp|×|sl|×|hold|×|score|×|atr|，护栏由保存端校验 ≤10万）
-		type combo5 struct {
-			tp, sl, score, atr float64
-			hold               int
-		}
 		var combos []combo5
 		for _, tp := range tps {
 			for _, sl := range sls {
@@ -570,12 +578,25 @@ func (o *Options) runSweep(db *store.DB, codes []string, ads []adapter,
 				"objective": ch.ObjectiveScore,
 			})
 		}
+		// §ENH-B6 样本外验证（开关关闭时整段跳过，WalkForward 载荷键保持缺位=旧载荷逐字节等价）。
+		// 数据不足（日期轴不可切分/IS 无过门槛解）时同样降级为无 WF 节——宁缺勿假。
+		var wfBrief any
+		var wfOOS map[comboKey]float64
+		if o.Sweep.WalkForward != nil {
+			if wf := runWalkForward(ad.Name(), kind, o.Sweep.WalkForward, trigs, klines, atrs,
+				sc, combos, obj, minTriggers, o.RiskFreeRate); wf != nil {
+				wfBrief = walkForwardJSON(wf)
+				wfOOS = wf.OOSIR
+				log.Printf("样本外验证 %s：切分日 %s，IS 触发 %d / OOS 触发 %d，合格推荐点 %d/%d",
+					ad.Name(), wf.SplitDate, wf.ISTriggers, wf.OOStiggers, wf.Qualified, len(wf.Points))
+			}
+		}
 		// §回测自动增强 C：Pareto 多目标前沿 + 推荐解（bt.Pareto.Enabled 才输出该段；
 		// worker 端 payload struct 必须同步加顶层字段，否则 json 解析静默丢弃）。
 		var paretoBrief any
 		if bt != nil && bt.Pareto.Enabled {
 			front := paretoFront(all, bt.Pareto.MaxFrontPoints)
-			rec := recommendedSolution(front, bt.Pareto)
+			rec := recommendedSolution(front, bt.Pareto, wfOOS)
 			paretoBrief = map[string]any{
 				"total": len(all), // 候选总点数（前端展示 N/M）
 				"gates": map[string]any{"min_win_rate": bt.Pareto.MinWinRate,
@@ -594,14 +615,15 @@ func (o *Options) runSweep(db *store.DB, codes []string, ads []adapter,
 			Grid      []gridCell       `json:"grid,omitempty"`
 			Results   []any            `json:"results"`
 			// §回测自动增强：顶层新增键（pareto 含 gates/front/recommended；
-			// slippage_calib=滑点校准审计；walk_forward A1 轮填充同容器捎带）。
+			// slippage_calib=滑点校准审计；walk_forward=§ENH-B6 样本外验证节，
+			// 开关关/数据不足时为 nil→键缺位）。
 			// 三键全部 omitempty——增强关闭时载荷形状与基线逐字节一致（回归保证）。
 			Pareto        any `json:"pareto,omitempty"`
 			SlippageCalib any `json:"slippage_calib,omitempty"`
 			WalkForward   any `json:"walk_forward,omitempty"`
 			// §W7 样本门槛审计（min_triggers/low_sample/tested），worker 端透传进 grid_json.sample。
 			Sample any `json:"sample,omitempty"`
-		}{ad.Name(), obj, batchList, grid, []any{jsonResult}, paretoBrief, calibBrief, nil, sampleBrief}
+		}{ad.Name(), obj, batchList, grid, []any{jsonResult}, paretoBrief, calibBrief, wfBrief, sampleBrief}
 		if bj, jerr := json.Marshal(payload); jerr == nil {
 			fmt.Printf("SWEEP_JSON:%s\n", bj)
 		}

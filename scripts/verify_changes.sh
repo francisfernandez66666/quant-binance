@@ -19,6 +19,7 @@
 #   + 2026-09-22 §BINANCE Phase 1 多市场地基（PLAN_BINANCE_MULTI_ASSET：BrokerConfig/rules.binance/store 市场迁移/Qty float64/时段+风控 14 闸×3 市场矩阵，见 57）
 #     + 2026-09-23 §BINANCE Phase 2 执行/回报/隔离（BinanceExecutor 契约 golden 7 格/binance_report 三条腿/§15.2 ForMarket 隔离/运维端点 6 条，见 58）
 #     + 2026-09-23 §BINANCE Phase 3+4 行情/状态双 WS+StdWsDial（纯标准库 RFC6455）/§9 第 15 闸 market_halt 证据链/xasset 三腿/前端市场维度+历史K线（见 59）
+#     + 2026-09-23 §ENH 增强批 A+B（PLAN_ENHANCE_20260923：FNG 情绪腿/EDGAR+CryptoPanic 事件腿/观测面三件套/lightweight-charts 试点/walk-forward/滑点回灌挂价，见 60）
 # ...
 # §全链路 UAT 修复批（2026-09-18 §UAT_FULLCHAIN_VERIFY）专项（见 11/11）：
 #   费用腿       ：成交回报 fee/stamp_tax 五路径透传（xt 回调/桥行/网关装配/mock/Go 落库），
@@ -1299,6 +1300,9 @@ go test -count=1 ./internal/trading/ -run 'Feed' 2>&1 | grep -E '^(--- FAIL|FAIL
 if grep -Fq '"@"+EquityStreamTradingStatus' internal/data/binance_trading_status_io.go; then echo "--- FAIL: §P3 状态分流大小写直比回潮（缺陷①）"; exit 1; fi
 # 依赖回潮负锁：WS 客户端必须留在纯标准库（引入 gorilla/nhooyr 等即违 PLAN §2.9 依赖面纪律）。
 if grep -qi 'websocket' go.mod; then echo "--- FAIL: §P3 go.mod 出现 websocket 依赖（必须走内建 StdWsDial）"; exit 1; fi
+# §ENH-X1 镜像端点正锁（GAP §5 遗留锁①收口）：现货公共行情必须保留 data-api.binance.vision 镜像
+# 常量（本机/广州实测唯一可达面）——被删=行情链回退主域直连，公网出口受限时整链静默瞎掉。
+grep -q 'data-api\.binance\.vision' internal/data/binance_ws.go || { echo "--- FAIL: §P3 镜像端点常量丢失（GAP G-1/W-4 结论被回退）"; exit 1; }
 grep -q 'func StdWsDial' internal/data/binance_ws_std.go || { echo "--- FAIL: §P3 StdWsDial 拨号器丢失"; exit 1; }
 grep -q 'func (f \*BinanceStatusFeed) GateSource' internal/data/binance_status_feed.go || { echo "--- FAIL: §P3 状态 feed 的 GateSource 注入面丢失"; exit 1; }
 # 装配链锁：feed 订阅/闸证据源/观测注册三条都必须在 registry 里（断一条=行情盲区或闸恒惰性）。
@@ -1317,7 +1321,63 @@ NX=$(grep -cE 'SignalType = "(ma_cross|rsi_momentum|news_xasset)"' internal/stra
 # 历史 K 线 + 前端市场维度文件在位（缺文件=Phase 4 面板/回测数据面整块蒸发）。
 grep -q 'func (c \*BinanceRestClient) KLines' internal/data/binance_kline.go || { echo "--- FAIL: §P4 BinanceRestClient.KLines 历史K线入口丢失"; exit 1; }
 test -f web/src/utils.market.js && test -f web/src/market.jsx || { echo "--- FAIL: §P4 前端市场维度模块丢失（utils.market.js/market.jsx）"; exit 1; }
-echo "ok - §BINANCE Phase 3+4 专项守卫通过（行为锁 7 组 + 静态锁 12 道〔等值锁 2：BINANCE 源=2 / xasset 信号=3；负锁 2：分流大小写 / websocket 依赖；余为正锁/定点锁〕）"
+echo "ok - §BINANCE Phase 3+4 专项守卫通过（行为锁 7 组 + 静态锁 13 道〔等值锁 2：BINANCE 源=2 / xasset 信号=3；负锁 2：分流大小写 / websocket 依赖；§ENH-X1 镜像端点正锁；余为正锁/定点锁〕）"
+
+echo ""
+echo "==> 60 §ENH 增强批 A+B：FNG/EDGAR/CryptoPanic 证据腿 + 观测面三件套 + lightweight-charts 试点 + walk-forward + 滑点回灌（2026-09-23 PLAN_ENHANCE_20260923）..."
+# 背景：A1 FNG 恐慌贪婪指数（data.FNGClient + registry 惰性节流闭包 + /api/binance/state "fng" 节，
+# 零配置零行为）；A4/B8 SEC EDGAR 8-K（US）与 CryptoPanic（CRYPTO）事件腿（BinanceConfig.Events
+# 凭证面 + registry per-market 缓存 + "events" 观测节，token 掩码与 api_key 同口径）；A2/A3 观测面
+# 交付物（ops/gatus + ops/grafana + ops/prometheus）；B5 lightweight-charts 试点（XProChart 组件，
+# 仅 web 依赖，Go 零新依赖红线不变）；B6 walk-forward 样本外验证（btreplay Top-K→OOS 重放）；
+# B7 滑点校准回灌实单挂价（RiskGateConfig.SlippagePassthrough 比例上限，0=关=字节兼容）。
+# 本段把「证据链断装、无证据≠中性回潮、工厂默认值被改、观测面文件缺失」钉成静态+行为双守卫。
+# ---- 行为锁（全部实跑通过后才入册）----
+go test -count=1 ./internal/data/ -run 'FNG|Edgar|CryptoPanic|XEvent' 2>&1 | grep -E '^(--- FAIL|FAIL|ok)'
+go test -count=1 ./internal/strategies/xasset/ -run 'Sentiment' 2>&1 | grep -E '^(--- FAIL|FAIL|ok)'
+go test -count=1 ./internal/trading/ -run 'Feed' 2>&1 | grep -E '^(--- FAIL|FAIL|ok)'
+go test -count=1 ./internal/btreplay/ -run 'WalkForward' 2>&1 | grep -E '^(--- FAIL|FAIL|ok)'
+go test -count=1 ./internal/engine/ -run 'SlipFracs|FNGSnapshot|XEvents' 2>&1 | grep -E '^(--- FAIL|FAIL|ok)'
+go test -count=1 ./internal/server/ -run 'BinanceKline|BinanceStateFNG|BinanceStateXEvents|BinanceConfigEvents' 2>&1 | grep -E '^(--- FAIL|FAIL|ok)'
+# B5 前端图表试点两文件（文件级锁，非全量 npm test——全量在 -full 档）
+( cd web && npx vitest run src/__tests__/xpro_chart_p5.test.jsx src/__tests__/binance_xpro_p5.test.jsx >/dev/null 2>&1 ) || { echo "--- FAIL: §ENH-B5 XProChart vitest 两文件未通过"; exit 1; }
+# ---- 静态锁：正锁（装配断链=证据腿整块蒸发）----
+grep -q 'func (r \*Registry) FNGSnapshot' internal/engine/registry_fng.go || { echo "--- FAIL: §ENH-A1 Registry.FNGSnapshot 证据出口丢失"; exit 1; }
+grep -q 'func (r \*Registry) attachXEventSource' internal/engine/registry_events.go || { echo "--- FAIL: §ENH-A4/B8 Registry.attachXEventSource 事件腿装配口丢失"; exit 1; }
+grep -q 'func (r \*Registry) XEventsJSON' internal/engine/registry_events.go || { echo "--- FAIL: §ENH-A4/B8 XEventsJSON 观测面出口丢失"; exit 1; }
+grep -q 'DedupeEvents' internal/data/xasset_events.go || { echo "--- FAIL: §ENH-A4/B8 DedupeEvents 幂等去重丢失"; exit 1; }
+grep -q 'type FNGClient struct' internal/data/fng.go || { echo "--- FAIL: §ENH-A1 data.FNGClient 丢失"; exit 1; }
+grep -q 'type EDGARClient struct' internal/data/edgar.go || { echo "--- FAIL: §ENH-A4 data.EDGARClient 丢失"; exit 1; }
+grep -q 'type CryptoPanicClient struct' internal/data/cryptopanic.go || { echo "--- FAIL: §ENH-B8 data.CryptoPanicClient 丢失"; exit 1; }
+grep -q 'SlippagePassthrough float64' internal/config/config.go || { echo "--- FAIL: §ENH-B7 RiskGateConfig.SlippagePassthrough 字段丢失"; exit 1; }
+# B7 消费面等值锁：买卖两条挂价链各恰好 1 处 slipFracs 调用（缺一条=半边回灌断链）。
+NS=$(grep -c 'e.slipFracs(' internal/engine/engine.go internal/engine/scoring_loop.go | awk -F: '{s+=$2} END {print s}')
+[ "$NS" -eq 2 ] || { echo "--- FAIL: §ENH-B7 slipFracs 消费点计数=${NS}≠2（autoPlace+sellRealPosition 两条链）"; exit 1; }
+grep -q 'srv.SetFNGSource' cmd/quant/main.go || { echo "--- FAIL: §ENH-A1 main.go SetFNGSource 装配断链"; exit 1; }
+grep -q 'srv.SetXEventsSource' cmd/quant/main.go || { echo "--- FAIL: §ENH-A4/B8 main.go SetXEventsSource 装配断链"; exit 1; }
+grep -q 'out\["events"\]' internal/server/binance_api.go || { echo "--- FAIL: §ENH-A4/B8 /api/binance/state events 观测节丢失"; exit 1; }
+grep -q 's.mux.HandleFunc("GET /api/binance/kline", s.authMiddleware(s.handleBinanceKline))' internal/server/server.go || { echo "--- FAIL: §ENH-B5 kline 路由鉴权装配行丢失"; exit 1; }
+grep -q 'func (r \*BrokerRouter) ShutdownLive' internal/trading/router.go || { echo "--- FAIL: §ENH-X2 BrokerRouter.ShutdownLive 对称出口丢失"; exit 1; }
+grep -q 'RegisterFeedWithStop' internal/trading/router.go || { echo "--- FAIL: §ENH-X2 RegisterFeedWithStop 生命周期配对丢失"; exit 1; }
+test -f web/src/components/XProChart.jsx || { echo "--- FAIL: §ENH-B5 XProChart 组件文件丢失"; exit 1; }
+grep -q 'lightweight-charts' web/package.json || { echo "--- FAIL: §ENH-B5 web 图表依赖声明丢失"; exit 1; }
+# ---- 静态锁：负锁（工厂默认值/依赖红线/页级未授权接入）----
+# B6 负锁：装配层不得出现 WalkForward: nil 显式占位（nil=关闭由零值天然达成，显式写出=口径漂移信号；测试夹具除外）。
+if grep -rn 'WalkForward: nil' internal cmd --include='*.go' | grep -v _test.go | grep -q .; then echo "--- FAIL: §ENH-B6 非测试代码出现 WalkForward: nil 显式占位"; exit 1; fi
+# B7 工厂默认锁：internal/config/ 任何 .go 不得字面量初始化 SlippagePassthrough（工厂必须 0=关=字节兼容）。
+if grep -rn 'SlippagePassthrough:' internal/config/ --include='*.go' | grep -q .; then echo "--- FAIL: §ENH-B7 internal/config/ 出现 SlippagePassthrough 非零初始化（工厂必须保持 0=关）"; exit 1; fi
+# Go 零新依赖红线（§2.9）：图表依赖只准留在 web/，go.mod/go.sum 出现 lightweight 即违例。
+if grep -qi 'lightweight' go.mod go.sum; then echo "--- FAIL: §ENH-B5 go.mod/go.sum 出现 lightweight 依赖（Go 侧零新依赖红线）"; exit 1; fi
+# B5 试点范围锁：XProChart 仅组件+测试，未授权前不得进入 pages/ 现网页。
+if grep -rq 'XProChart' web/src/pages/; then echo "--- FAIL: §ENH-B5 XProChart 越出试点范围进入 pages/"; exit 1; fi
+# ---- A2/A3 观测面交付物：三文件在位 + 可解析 + 明文密钥负锁 ----
+test -f ops/gatus/config.yaml && test -f ops/grafana/dashboard.json && test -f ops/prometheus/prometheus.yml || { echo "--- FAIL: §ENH-A2/A3 ops/ 观测面三件套缺失"; exit 1; }
+ruby -ryaml -e 'YAML.safe_load(File.read(ARGV[0]))' ops/prometheus/prometheus.yml || { echo "--- FAIL: §ENH-A2 prometheus.yml YAML 解析失败"; exit 1; }
+ruby -ryaml -e 'YAML.safe_load(File.read(ARGV[0]))' ops/gatus/config.yaml || { echo "--- FAIL: §ENH-A2 gatus config.yaml YAML 解析失败"; exit 1; }
+python3 -c "import json;json.load(open('ops/grafana/dashboard.json'))" || { echo "--- FAIL: §ENH-A3 grafana dashboard.json JSON 解析失败"; exit 1; }
+# 明文密钥负锁：ops/ 任何 yml/yaml/json 不得出现 token/key/secret 明文赋值（ENV 占位除外）。
+if grep -RniE '(token|key|secret)[[:space:]]*[:=][[:space:]]*["'"'"']?[A-Za-z0-9_-]{8,}' ops --include='*.yml' --include='*.yaml' --include='*.json' | grep -v '\${' | grep -viE 'cryptopanic_token"|_masked|has_crypto' | grep -q .; then echo "--- FAIL: §ENH-A2/A3 ops/ 出现明文密钥赋值（只准 ENV 变量占位）"; exit 1; fi
+echo "ok - §ENH 增强批 A+B 专项守卫通过（行为锁 7 组 + 静态锁 26 道〔等值锁 1：slipFracs=2；负锁 5：WalkForward 占位 / config 工厂默认 / Go 依赖红线 / pages 试点越界 / ops 明文密钥；ops 解析锁 3；余为正锁/定点锁〕）"
 
 echo ""
 echo "==> 全部通过"

@@ -507,6 +507,15 @@ type RiskGateConfig struct {
 	// English: nil/true = cross-check hits are recorded ([shadow]-prefixed) but not enforced;
 	// explicit false turns the gate into a hard reject. Mirrors the shadow_blacklist convention.
 	CrossCheckShadow *bool `json:"cross_check_shadow,omitempty"`
+	// SlippagePassthrough §ENH-B7 滑点校准回灌挂价的比例帽（小数比例，0=关=现状逐字节等价）：
+	// >0 时实单挂价 = 参考价 × (1 ± min(实测滑点中位数/1e4, 帽))（买加卖减），实测滑点来自
+	// paper_trades 分方向中位数（战法级→全局两级回退，btreplay 同源）；样本不足（单方向<30）
+	// → 不调价并 opslog 按日留痕。比例帽的存在理由：极小样本下中位数可被单笔异常价拉飞，
+	// 帽把回灌的最坏伤害钉死（建议 ≤0.01 即 1%，保存校验上限 0.05）。
+	// 注意：本键是定价增强而非拒单闸，故不计入 AnyEnabled（该面专表「命中即拒」的闸）。
+	// English: §ENH-B7 cap for feeding calibrated slippage (paper-fill median) back into live
+	// limit pricing; 0 = off = byte-identical, >0 = price×(1±min(median/1e4, cap)).
+	SlippagePassthrough float64 `json:"slippage_passthrough,omitempty"`
 }
 
 // CrossCheckEnforce §XCHECK 价格复核闸是否已切正式（拒单）模式：仅显式 false 时为 true；

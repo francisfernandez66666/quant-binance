@@ -12,6 +12,9 @@
 import React, { useState, useEffect } from 'react'
 import * as api from '../api/index.js'
 import MinuteView from './MinuteView.jsx'
+// §BINANCE-P5（PLAN §11.2 新市场页面积试点）：US/CRYPTO 详情改挂 lightweight-charts 专业蜡烛图
+// English: §BINANCE-P5 — new-market (US/CRYPTO) detail body uses the professional candle chart.
+import XProChart from './XProChart.jsx'
 // §BINANCE-P4：代码→市场解析单一来源（纯函数模块，无环依赖）
 import { parseCode } from '../utils.market.js'
 
@@ -92,6 +95,8 @@ export default function StockDetailDrawer({ open, code, name, price, changePct, 
   const rawChg = changePct
   const chg = Number.isFinite(Number(rawChg)) ? Number(rawChg) : null
   const chgUp = chg != null && chg >= 0
+  // §BINANCE-P5：本标的所属市场（决定详情体走哪条 K 线链）——CN=自研分时/盘口，US/CRYPTO=专业蜡烛图
+  const codeMarket = parseCode(code).market
 
   const rel = related || {}
   // 关联数据按本股代码过滤（信号/持仓/消息）
@@ -139,7 +144,13 @@ export default function StockDetailDrawer({ open, code, name, price, changePct, 
         </div>
         {/* 主体：分时/盘口 + 关联信息（可滚动） */}
         <div style={{ flex: 1, overflowY: 'auto', padding: 14 }}>
-          <MinuteView code={code} name={showName} />
+          {/* §BINANCE-P5 两链分轨（GAP §G-8）：US/CRYPTO 走专业 K 线（lightweight-charts +
+              /api/binance/kline 研究库日 K），CN 仍走 MinuteView→KLineChart 自研 canvas 链，
+              本行只加市场分支、不改 CN 分支一行代码。
+              English: new markets render the pro candle chart; the CN intraday path is untouched. */}
+          {codeMarket === 'CN'
+            ? <MinuteView code={code} name={showName} />
+            : <XProChart code={code} market={codeMarket} name={showName} />}
 
           {mySignals.length > 0 && (
             <section style={{ marginTop: 16 }}>

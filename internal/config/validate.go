@@ -63,6 +63,10 @@ func validateQMT(q *QMTConfig) error {
 	if q.RiskGate.MaxOrderAmount < 0 {
 		return fmt.Errorf("qmt.risk_gate.max_order_amount 不能为负（%.2f）", q.RiskGate.MaxOrderAmount)
 	}
+	// §ENH-B7 滑点回灌比例帽：0=关；上限 0.05（5%）——超过即视为把校准噪声当定价的配置错误。
+	if q.RiskGate.SlippagePassthrough < 0 || q.RiskGate.SlippagePassthrough > 0.05 {
+		return fmt.Errorf("qmt.risk_gate.slippage_passthrough 超出范围 0~0.05（实际 %.4f）", q.RiskGate.SlippagePassthrough)
+	}
 	if q.MissHeartbeatSec != 0 && (q.MissHeartbeatSec < 30 || q.MissHeartbeatSec > 3600) {
 		return fmt.Errorf("qmt.miss_heartbeat_sec 超出范围 30-3600（实际 %d）", q.MissHeartbeatSec)
 	}

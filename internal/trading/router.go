@@ -42,8 +42,11 @@ type FeedStat struct {
 }
 
 // feedEntry 注册项：stats 闭包由装配层提供（对 feed 本体的读取都在闭包里，路由层零 data 依赖）。
+// §ENH-X2 stop 闭包同理由装配层注入（feed 本体归装配层持有，路由层只收纳「怎么停」这一动作；
+// nil=该 feed 无停止义务/旧 RegisterFeed 注册）。
 type feedEntry struct {
 	stats func() FeedStat
+	stop  func()
 }
 
 // NewBrokerRouter 以 CN（QMT）控制器建路由；cn 可为 nil（无网关部署），币安市场仍可 Register。
@@ -209,12 +212,44 @@ func (r *BrokerRouter) StopReporters() {
 	}
 }
 
+// ShutdownLive §ENH-X2 币安侧全生命周期收摊：先停回报接收器（WS+listenKey 腿），再逐一调用
+// 各 feed 的 stop 闭包（quotes/status feed 的 WS close 帧与读协程退出）。设计为优雅停机链
+// 的显式一步；重复调用安全（reporter/feed 内部各自幂等），单腿 stop panic 不影响其余腿。
+// English: shuts down every binance-side reporter and registered feed; safe to call twice.
+func (r *BrokerRouter) ShutdownLive() {
+	r.StopReporters()
+	r.mu.RLock()
+	stops := make([]func(), 0, len(r.feeds))
+	for _, e := range r.feeds {
+		if e.stop != nil {
+			stops = append(stops, e.stop)
+		}
+	}
+	r.mu.RUnlock()
+	for _, s := range stops {
+		func() {
+			// 单腿 stop panic 隔离：一扇门炸不许带走整条停机链（与 safeFeedStats 同姿势）。
+			defer func() { _ = recover() }()
+			s()
+		}()
+	}
+}
+
 // RegisterFeed §P3 注册/替换一条行情/状态 feed 的观测位（name 幂等覆盖）。
 // 路由层不持有 feed 本体、不启停其生命周期（装配层负责），这里只做 stats 闭包收纳，
 // 供 /api/binance/state 的 "feeds" 节统一呈现（观测不干扰：stats 闭包按名升序调用）。
+// 无停止义务的 feed 走本入口；需随 ShutdownLive 关停的用 RegisterFeedWithStop。
 // English: registers a read-only observability closure for a quote/status feed; the router
 // never owns the feed lifecycle.
 func (r *BrokerRouter) RegisterFeed(name, market string, stats func() FeedStat) {
+	r.RegisterFeedWithStop(name, market, stats, nil)
+}
+
+// RegisterFeedWithStop §ENH-X2 观测位 + 停止闭包一起注册。stop 由装配层给出（形如 feed.Stop），
+// ShutdownLive 时逐一调用——补齐「Start 有主、Stop 无门」的进程生命周期不对称：以前 feed 只能
+// 靠进程退出连带收摊（WS 无 close 帧、对端半开连接要等超时），现在优雅停机链可显式关停。
+// stop=nil 与 RegisterFeed 同语义。重复注册同 name 覆盖旧 stop（幂等约定同 stats）。
+func (r *BrokerRouter) RegisterFeedWithStop(name, market string, stats func() FeedStat, stop func()) {
 	if name == "" || stats == nil {
 		return
 	}
@@ -222,7 +257,7 @@ func (r *BrokerRouter) RegisterFeed(name, market string, stats func() FeedStat) 
 	if r.feeds == nil {
 		r.feeds = map[string]feedEntry{}
 	}
-	r.feeds[name] = feedEntry{stats: stats}
+	r.feeds[name] = feedEntry{stats: stats, stop: stop}
 	r.mu.Unlock()
 }
 

@@ -28,6 +28,11 @@ func binanceConfigView(cfg *config.BinanceConfig) map[string]interface{} {
 	if cfg.APISecret != "" {
 		apiSecretMasked = maskSecret(cfg.APISecret)
 	}
+	// §ENH-B8 CryptoPanic key 与 api_secret 同红线：明文永不回显，只给掩码+已配置布尔。
+	cryptoPanicMasked := ""
+	if cfg.Events.CryptoPanicToken != "" {
+		cryptoPanicMasked = maskSecret(cfg.Events.CryptoPanicToken)
+	}
 	return map[string]interface{}{
 		"enabled":              cfg.Enabled,
 		"mode":                 cfg.Mode,
@@ -45,6 +50,13 @@ func binanceConfigView(cfg *config.BinanceConfig) map[string]interface{} {
 		"spot":                 cfg.Spot,
 		"risk_gate":            cfg.RiskGate,
 		"paper_separate":       cfg.PaperSeparate,
+		// §ENH-A4/B8 事件腿对外形状：UA（含联系邮箱，非密钥）原样回显供核对，token 只回掩码。
+		"events": map[string]interface{}{
+			"edgar_user_agent":         cfg.Events.EdgarUserAgent,
+			"cryptopanic_token_masked": cryptoPanicMasked,
+			"has_cryptopanic_token":    cfg.Events.CryptoPanicToken != "",
+			"cryptopanic_currencies":   cfg.Events.CryptoPanicCurrencies,
+		},
 	}
 }
 
@@ -66,6 +78,9 @@ type setBinanceConfigReq struct {
 	Spot               *config.BinanceMarketProfile `json:"spot"`
 	RiskGate           *config.RiskGateConfig       `json:"risk_gate"`
 	PaperSeparate      *bool                        `json:"paper_separate"`
+	// Events §ENH-A4/B8 POST 写入面（GET 视图已加 events 节，此处为配套的请求字段+合并逻辑）：
+	// 指针整档替换，nil=不动；token 空串/掩码哨兵不回写覆盖真值（同 api_key 惯例）。
+	Events *config.BinanceEventsConfig `json:"events"`
 }
 
 // handleSetBinanceConfig 处理 POST /api/config/binance：局部合并→校验→落该账号配置。
@@ -130,6 +145,7 @@ func (s *Server) handleSetBinanceConfig(w http.ResponseWriter, r *http.Request) 
 	if req.PaperSeparate != nil {
 		cfg.PaperSeparate = *req.PaperSeparate
 	}
+	mergeBinanceEvents(&cfg, &req)
 
 	// 全量复校验（枚举/范围/启用一致性，config 包单一权威）：非法 400 且不落库。
 	if err := config.ValidateBinance(&cfg); err != nil {
@@ -138,4 +154,23 @@ func (s *Server) handleSetBinanceConfig(w http.ResponseWriter, r *http.Request) 
 	}
 	s.cfg.SetBinanceConfigFor(user, &cfg)
 	writeJSON(w, 200, binanceConfigView(&cfg))
+}
+
+// mergeBinanceEvents §ENH-A4/B8 事件腿整档替换的局部合并（nil=本次不动）：
+// UA/currencies 直接换新（TrimSpace），token 走「掩码哨兵/空串不回写覆盖真值」同口径，
+// 真新 key 才覆盖并 TrimSpace。独立成函数供行为锁单测直调（同 mergeXxx 惯例）。
+// English: merges the events profile — masked/empty token never clobbers the stored key.
+func mergeBinanceEvents(cfg *config.BinanceConfig, req *setBinanceConfigReq) config.BinanceEventsConfig {
+	if req.Events == nil {
+		return cfg.Events
+	}
+	ev := *req.Events
+	ev.EdgarUserAgent = strings.TrimSpace(ev.EdgarUserAgent)
+	if ev.CryptoPanicToken == "" || isMaskedSecret(ev.CryptoPanicToken) {
+		ev.CryptoPanicToken = cfg.Events.CryptoPanicToken
+	} else {
+		ev.CryptoPanicToken = strings.TrimSpace(ev.CryptoPanicToken)
+	}
+	cfg.Events = ev
+	return ev
 }
