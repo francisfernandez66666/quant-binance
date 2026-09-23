@@ -142,6 +142,11 @@ func normalizeMarket(market string) string {
 	return m
 }
 
+// NormalizeMarket §BINANCE-P2 对外导出版：供 risk/server 层把订单市场串归一后
+// 传入 ForMarket 系列聚合（空串=CN，与库内回填值同口径）。
+// English: exported normalizer for market-scoped aggregate callers.
+func NormalizeMarket(market string) string { return normalizeMarket(market) }
+
 // defaultCurrency §BINANCE-P1c：按市场给计价币缺省（CN→CNY、US→USD、CRYPTO→USDT）。
 // 加密货币的实际计价币以行自带 currency 为准（ETHUSDC 行由写入方打 USDC），
 // 这里只兜底"写入方未指定"的场合。
@@ -739,9 +744,16 @@ func (d *DB) BuyableQtyForUserSell(userID, tsCode, day string) float64 {
 // cross-day stale 已报/部成 buys no longer freeze the daily budget forever; query errors surface
 // to the caller (fail-closed) instead of silently returning 0.
 func (d *DB) LocalBuyFrozen(userID, day string) (float64, error) {
+	return d.LocalBuyFrozenForMarket(userID, day, "CN")
+}
+
+// LocalBuyFrozenForMarket §BINANCE-P2（PLAN §15.2）市场作用域在途冻结：
+// 只计该市场当日 已报/部成 买单的未成交余量（orders.market 过滤，空串归一 CN）。
+// English: market-scoped in-flight buy freeze (crypto/US freezes never occupy the CNY ledger).
+func (d *DB) LocalBuyFrozenForMarket(userID, day, market string) (float64, error) {
 	rows, err := d.db.Query(`SELECT signal_id, status, price, qty FROM orders
-		WHERE user_id=? AND side='买入' AND (status='已报' OR status='部成')
-		AND substr(created_at,1,10)=?`, userID, day)
+		WHERE user_id=? AND side='买入' AND market=? AND (status='已报' OR status='部成')
+		AND substr(created_at,1,10)=?`, userID, NormalizeMarket(market), day)
 	if err != nil {
 		return 0, err
 	}
@@ -855,12 +867,18 @@ func (d *DB) SumFilledQty(userID, signalID string) float64 {
 // terminal and send-failed rows excluded). Sell remaining = held − Σfilled − Σopen, so a same-round
 // M8 liquidation + stop-loss advice can no longer both fire a full-qty sell before fills are reported.
 func (d *DB) SumOpenSellQty(userID, tsCode, day string) float64 {
+	return d.SumOpenSellQtyForMarket(userID, tsCode, day, "CN")
+}
+
+// SumOpenSellQtyForMarket §BINANCE-P2（PLAN §15.2）市场作用域在途卖量。
+// English: market-scoped open-sell quantity.
+func (d *DB) SumOpenSellQtyForMarket(userID, tsCode, day, market string) float64 {
 	var total float64
 	if err := d.db.QueryRow(`SELECT COALESCE(SUM(qty),0) FROM orders
-		WHERE (user_id = '' OR user_id = ?) AND code = ? AND side = '卖出'
+		WHERE (user_id = '' OR user_id = ?) AND code = ? AND market = ? AND side = '卖出'
 		  AND created_at LIKE ?||'%'
 		  AND status IN ('已报','部成','已报待撤','部成待撤')`,
-		userID, tsCode, day).Scan(&total); err != nil {
+		userID, tsCode, NormalizeMarket(market), day).Scan(&total); err != nil {
 		return 0
 	}
 	return total
@@ -1364,22 +1382,36 @@ func MigrateRealTablesIfEmpty(dst, src *DB) (bool, error) {
 		fRows.Close()
 	}
 
-	// real_account（惰性建表，一并迁移）
-	if _, err := tx.Exec(`CREATE TABLE IF NOT EXISTS real_account (
-		user_id TEXT PRIMARY KEY, available_cash REAL NOT NULL DEFAULT 0,
-		frozen_cash REAL NOT NULL DEFAULT 0, total_asset REAL NOT NULL DEFAULT 0,
-		market_value REAL NOT NULL DEFAULT 0, updated_at TEXT NOT NULL)`); err != nil {
+	// real_account（惰性建表，一并迁移）——§BINANCE-P2 v2 复合格式（PK=user_id+market）；
+	// 源库若有 market 列按列搬运，旧库源整体归 CN。
+	if _, err := tx.Exec(realAccountSchemaV2); err != nil {
 		return false, err
 	}
-	if aRows, aerr := src.db.Query(`SELECT user_id,available_cash,frozen_cash,total_asset,market_value,updated_at FROM real_account`); aerr == nil {
+	srcHasMarket := 0
+	if pr, perr := src.db.Query(`SELECT 1 FROM pragma_table_info('real_account') WHERE name='market' LIMIT 1`); perr == nil {
+		if pr.Next() {
+			srcHasMarket = 1
+		}
+		pr.Close()
+	}
+	aq := `SELECT user_id,available_cash,frozen_cash,total_asset,market_value,updated_at FROM real_account`
+	if srcHasMarket == 1 {
+		aq = `SELECT user_id,available_cash,frozen_cash,total_asset,market_value,updated_at, COALESCE(market,'CN') FROM real_account`
+	}
+	if aRows, aerr := src.db.Query(aq); aerr == nil {
 		for aRows.Next() {
 			var a RealAccount
-			if err := aRows.Scan(&a.UserID, &a.AvailableCash, &a.FrozenCash, &a.TotalAsset, &a.MarketValue, &a.UpdatedAt); err != nil {
+			var cols []any = []any{&a.UserID, &a.AvailableCash, &a.FrozenCash, &a.TotalAsset, &a.MarketValue, &a.UpdatedAt}
+			if srcHasMarket == 1 {
+				cols = append(cols, &a.Market)
+			}
+			if err := aRows.Scan(cols...); err != nil {
 				aRows.Close()
 				return false, err
 			}
-			if _, err := tx.Exec(`INSERT OR REPLACE INTO real_account(user_id,available_cash,frozen_cash,total_asset,market_value,updated_at) VALUES(?,?,?,?,?,?)`,
-				a.UserID, a.AvailableCash, a.FrozenCash, a.TotalAsset, a.MarketValue, a.UpdatedAt); err != nil {
+			a.Market = normalizeMarket(a.Market)
+			if _, err := tx.Exec(`INSERT OR REPLACE INTO real_account(user_id,market,available_cash,frozen_cash,total_asset,market_value,updated_at) VALUES(?,?,?,?,?,?,?)`,
+				a.UserID, a.Market, a.AvailableCash, a.FrozenCash, a.TotalAsset, a.MarketValue, a.UpdatedAt); err != nil {
 				aRows.Close()
 				return false, err
 			}

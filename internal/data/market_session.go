@@ -1,8 +1,9 @@
 // 文件职责：§P1-e 市场时段抽象（PLAN_BINANCE_MULTI_ASSET §6.10/§10）——
 // Session(market) 返回按市场的「时区 + 交易时段 + 交易日 + 收盘清单」规则集：
-//   CN     → 完全包装现有 trade_time/cntime（A 股链字节级零漂移）；
-//   CRYPTO → 7×24 恒真，时区 UTC（评分循环不再被 session 门控跳过）；
-//   US     → America/New_York 周一至五 09:30–16:00（RTH 缺省），EXTENDED=04:00–20:00、24H=恒真。
+//
+//	CN     → 完全包装现有 trade_time/cntime（A 股链字节级零漂移）；
+//	CRYPTO → 7×24 恒真，时区 UTC（评分循环不再被 session 门控跳过）；
+//	US     → America/New_York 周一至五 09:30–16:00（RTH 缺省），EXTENDED=04:00–20:00、24H=恒真。
 //
 // 边界（加市场不换市场）：本文件只新增抽象，不改任何现有 CN 调用点——Controller/评分循环
 // 切到 Session(market) 在 Phase 2 Router 接线时执行；美股节假日 P1 为 weekday 粗判，

@@ -89,10 +89,16 @@ func collectSnapshotVars(f *ast.File) map[string]bool {
 }
 
 // isSnapshotType 判断类型表达式是否为 MarketSnapshot / *MarketSnapshot。
+// ⚠ *ast.CompositeLit 分支不可缺：`snap := &MarketSnapshot{...}` 的 UnaryExpr.X 是
+// CompositeLit（类型在 .Type 上），缺这一支会让所有**构造即带源名**的写入点全部漏检
+// （§20260923 Agent B 缺陷⑥排查时实锤：BINANCE 快照构造因缺此支从未进 snapshotSourceSet，
+// 双向锁对"构造字面量"形态形同虚设）。
 func isSnapshotType(expr ast.Expr) bool {
 	switch t := expr.(type) {
 	case *ast.StarExpr:
 		return isSnapshotType(t.X)
+	case *ast.CompositeLit: // &MarketSnapshot{...}
+		return isSnapshotType(t.Type)
 	case *ast.Ident:
 		return t.Name == "MarketSnapshot"
 	}
@@ -154,7 +160,9 @@ func scanQuoteSources(t *testing.T) quoteSourceScan {
 					continue
 				}
 				for i, n := range vs.Names {
-					if !strings.HasPrefix(n.Name, "QuoteSource") {
+					// 前缀匹配含 "QuoteSource*" 与 "*QuoteSource*"（§BINANCE-P3 起 BinanceQuoteSource*
+					// 也在此块——扫描器认名字里带 QuoteSource 的常量，枚举仍由 golden 双向锁收口）。
+					if !strings.Contains(n.Name, "QuoteSource") {
 						continue
 					}
 					if bl, ok := vs.Values[i].(*ast.BasicLit); ok && bl.Kind == token.STRING {

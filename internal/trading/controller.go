@@ -39,11 +39,12 @@ type Controller struct {
 	// 只串行化下单路径（HealthCheck/StateSnapshot 等读路径不取该锁），单实盘账户场景无吞吐损失。
 	orderMu sync.Mutex // 下单路径互斥锁
 
-	exec            atomic.Value     // 下单执行器（真实网关 / noop）——§修复 FIX#7 原子引用，持 Executor 接口
-	store           *store.DB        // 研究库（real_positions/orders/fills 落库）
-	cfg             config.QMTConfig // 当前生效的 QMT 配置（热加载替换）
-	userID          string           // 归属账号（多账号模式下各引擎独立控制器）
-	lastReconcileAt time.Time        // §W6-a 上次主动对账时间（节流用）
+	exec            atomic.Value        // 下单执行器（真实网关 / noop）——§修复 FIX#7 原子引用，持 Executor 接口
+	store           *store.DB           // 研究库（real_positions/orders/fills 落库）
+	cfg             config.BrokerConfig // 当前生效的券商配置（热加载替换）——§P2 泛化为 BrokerConfig
+	broker          string              // §P2 broker 标识（"qmt"/"binance"）：日志/告警前缀与 executor 重建分支的开关
+	userID          string              // 归属账号（多账号模式下各引擎独立控制器）
+	lastReconcileAt time.Time           // §W6-a 上次主动对账时间（节流用）
 
 	// §QMT-PENDING 待生效配置（开关队列）：普通配置变更（enabled/mode/白名单/纪律）先入队，
 	// 由引擎在交易时段（scoreCycle 的 IsActiveSession 门控内）调用 ApplyPendingConfig 才真正
@@ -53,7 +54,7 @@ type Controller struct {
 	// English: pending config (switch queue). Ordinary config changes are queued and only applied at
 	// trading session via ApplyPendingConfig, which also rebuilds the executor (Noop↔QMTClient) to avoid
 	// the build-time-Noop-stuck bug. halt (kill-switch) bypasses the queue via UpdateConfig — immediate.
-	pendingCfg *config.QMTConfig // 待生效配置（nil=无待应用变更）
+	pendingCfg *config.BrokerConfig // 待生效配置（nil=无待应用变更）——§P2 泛化：QMT 传 QMTConfig、币安传 BinanceBrokerView
 
 	// 熔断状态：tripped=true 表示网关失联/心跳超时，暂停一切新下单
 	tripped      bool      // 是否处于熔断状态
@@ -98,16 +99,24 @@ type Controller struct {
 	onAlert func(level, title, content string) // 告警回调（可空）
 }
 
-// NewController 创建控制器。onAlert 可空。
-// English: NewController builds a controller; onAlert may be nil.
-func NewController(exec Executor, db *store.DB, userID string, cfg config.QMTConfig, onAlert func(level, title, content string)) *Controller {
+// NewController 创建控制器。onAlert 可空。§P2（PLAN §6.4）：cfg 泛化为 config.BrokerConfig，
+// 新增可选 broker 参数（"qmt"|"binance"，缺省 "qmt"——CN 单市场时代的 5 参调用点全部保持原样，
+// 存量测试/装配零改动即零回归；币安装配显式传 "binance"）。
+// English: NewController builds a controller; onAlert may be nil. §P2: cfg is generalized to
+// config.BrokerConfig and an optional broker tag ("qmt"/"binance") drives alert prefixes and the executor rebuild.
+func NewController(exec Executor, db *store.DB, userID string, cfg config.BrokerConfig, onAlert func(level, title, content string), broker ...string) *Controller {
 	if exec == nil {
 		exec = NoopExecutor{}
+	}
+	b := "qmt" // 兼容缺省：CN 单市场时代所有控制器都是 QMT
+	if len(broker) > 0 && broker[0] != "" {
+		b = broker[0]
 	}
 	c := &Controller{
 		store:   db,
 		userID:  userID,
 		cfg:     cfg,
+		broker:  b,
 		onAlert: onAlert,
 	}
 	c.exec.Store(execHolder{exec}) // §FIX#7 executor 走原子引用
@@ -136,7 +145,7 @@ func (c *Controller) execRef() Executor {
 // English: UpdateConfig applies config immediately (emergency semantics) — halt/kill-switch and tests
 // take effect right away, bypassing the queue. Only updates c.cfg; the executor type is decided at
 // build or by ApplyPendingConfig.
-func (c *Controller) UpdateConfig(cfg config.QMTConfig) {
+func (c *Controller) UpdateConfig(cfg config.BrokerConfig) {
 	c.mu.Lock()
 	c.cfg = cfg
 	c.mu.Unlock()
@@ -147,7 +156,7 @@ func (c *Controller) UpdateConfig(cfg config.QMTConfig) {
 // English: QueueConfigUpdate queues a config change (switch queue) without applying it. Called by the
 // engine's hot-sync each cycle with the latest GetQMTConfigFor; consumed by ApplyPendingConfig at the
 // trading session.
-func (c *Controller) QueueConfigUpdate(cfg config.QMTConfig) {
+func (c *Controller) QueueConfigUpdate(cfg config.BrokerConfig) {
 	c.mu.Lock()
 	cp := cfg
 	c.pendingCfg = &cp
@@ -171,17 +180,44 @@ func (c *Controller) ApplyPendingConfig() bool {
 	cfg := *c.pendingCfg
 	c.pendingCfg = nil
 	c.cfg = cfg
-	needClient := cfg.Enabled && cfg.GatewayURL != ""
-	_, isClient := c.exec.Load().(execHolder).e.(*QMTClient)
-	switch {
-	case needClient && !isClient:
-		c.exec.Store(execHolder{NewQMTClient(cfg.GatewayURL, cfg.Token, time.Duration(cfg.TimeoutSec)*time.Second, 1)})
-		log.Printf("[trading] QMT 实盘已启用，executor 切换为真实网关 (%s)", cfg.GatewayURL)
-	case !needClient && isClient:
-		c.exec.Store(execHolder{NoopExecutor{}})
-		log.Printf("[trading] QMT 实盘已停用，executor 回退 Noop")
-	}
+	c.rebuildExecutorLocked(cfg)
 	return true
+}
+
+// rebuildExecutorLocked §P2（PLAN §6.4）：按 broker 分支重建执行器（调用方持 c.mu）。
+//   - qmt：现状口径不变——enabled 且 gateway_url 非空 → QMTClient，否则回退 Noop；
+//   - binance：BrokerEnabled（总开关 ∧ 子市场开关）且凭证齐 → BinanceExecutor，否则回退 Noop。
+//     重建即换新缓存（exchangeInfo/限速状态），配置变更语义正确。
+//
+// English: §P2 per-broker executor rebuild — qmt keeps the legacy URL-gated swap; binance builds a
+// fresh BinanceExecutor when the market view is enabled with credentials present.
+func (c *Controller) rebuildExecutorLocked(cfg config.BrokerConfig) {
+	switch c.broker {
+	case "binance":
+		view, ok := cfg.(config.BinanceBrokerView)
+		_, isBn := c.exec.Load().(execHolder).e.(*BinanceExecutor)
+		need := ok && view.BrokerEnabled() && view.Cfg.APIKey != "" && view.Cfg.APISecret != ""
+		switch {
+		case need && !isBn:
+			c.exec.Store(execHolder{NewBinanceExecutor(view)})
+			log.Printf("[trading] 币安 %s 实盘已启用，executor 切换为 BinanceExecutor (%s)", view.Market, view.Cfg.BaseURL())
+		case !need && isBn:
+			c.exec.Store(execHolder{NoopExecutor{}})
+			log.Printf("[trading] 币安实盘已停用，executor 回退 Noop")
+		}
+	default: // "qmt"
+		q, _ := cfg.(config.QMTConfig)
+		needClient := q.Enabled && q.GatewayURL != ""
+		_, isClient := c.exec.Load().(execHolder).e.(*QMTClient)
+		switch {
+		case needClient && !isClient:
+			c.exec.Store(execHolder{NewQMTClient(q.GatewayURL, q.Token, time.Duration(q.TimeoutSec)*time.Second, 1)})
+			log.Printf("[trading] QMT 实盘已启用，executor 切换为真实网关 (%s)", q.GatewayURL)
+		case !needClient && isClient:
+			c.exec.Store(execHolder{NoopExecutor{}})
+			log.Printf("[trading] QMT 实盘已停用，executor 回退 Noop")
+		}
+	}
 }
 
 // Enabled 是否启用实盘链路。
@@ -189,7 +225,7 @@ func (c *Controller) ApplyPendingConfig() bool {
 func (c *Controller) Enabled() bool {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
-	return c.cfg.Enabled
+	return c.cfg.BrokerEnabled()
 }
 
 // Mode 返回执行模式（auto/manual）。
@@ -197,7 +233,7 @@ func (c *Controller) Enabled() bool {
 func (c *Controller) Mode() string {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
-	return c.cfg.Mode
+	return c.cfg.BrokerMode()
 }
 
 // AvailableCash 返回最近一次网关上报的可用资金与其新鲜度（§M12-A 三态口径，2026-09-22 owner 定调）。
@@ -265,6 +301,20 @@ func (c *Controller) SetCrossPriceSource(fn func(code string) (float64, error)) 
 	c.gate.SetCrossPriceSource(fn)
 }
 
+// SetSymbolRulesSource §P2 为风控闸注入交易规则源（min_notional/lot_precision 两闸的数据腿，
+// 委托同 SetCrossPriceSource：规则缓存在执行器 exchangeInfo 面，装配层只接管道）。
+// English: wires the per-symbol trading-rules source (exchangeInfo-backed) into the risk gate.
+func (c *Controller) SetSymbolRulesSource(fn func(symbol string) (risk.SymbolRules, error)) {
+	c.gate.SetSymbolRulesSource(fn)
+}
+
+// SetHaltEvidenceSource §P3 为风控第 15 道闸（market_halt）注入美股 tradingStatus 证据源
+// （委托同 SetSymbolRulesSource：证据缓存在行情状态 feed 面，装配层只接管道）。
+// English: wires the US tradingStatus evidence source into risk gate 15 (market_halt).
+func (c *Controller) SetHaltEvidenceSource(fn func(symbol string) (hasEvidence, halted bool)) {
+	c.gate.SetHaltEvidenceSource(fn)
+}
+
 // StateSnapshot 互通健康快照：下行（首尔探测网关）+ 上行（网关回报到首尔）两侧状态，
 // 供 /api/qmt/state、仪表盘系统行与量化交易页消费。零值时间表示"从未发生"。
 // English: connectivity snapshot for the dashboard/system row and quant page — downlink probe
@@ -306,18 +356,18 @@ func (c *Controller) Snapshot() StateSnapshot {
 	defer c.mu.RUnlock()
 	var pendingEnabled *bool
 	if c.pendingCfg != nil {
-		v := c.pendingCfg.Enabled
+		v := (*c.pendingCfg).BrokerEnabled()
 		pendingEnabled = &v
 	}
 	// §M12-A：资金三态随快照暴露（AvailableCash 不取锁，此处 RLock 内调用安全）。
 	cash, cashFresh := c.AvailableCash()
 	return StateSnapshot{
-		Enabled:        c.cfg.Enabled,
-		Mode:           c.cfg.Mode,
+		Enabled:        c.cfg.BrokerEnabled(),
+		Mode:           c.cfg.BrokerMode(),
 		Tripped:        c.tripped,
 		TripReason:     c.tripReason,
 		TripAt:         c.tripAt,
-		GatewayURL:     c.cfg.GatewayURL,
+		GatewayURL:     c.gatewayLabel(), // §P2 QMT=网关 URL；币安=API Base（testnet 标注）
 		LastProbeAt:    c.lastHealthAt,
 		LastProbeOK:    c.lastHealthy,
 		LastLatencyMs:  c.lastLatencyMs,
@@ -327,6 +377,88 @@ func (c *Controller) Snapshot() StateSnapshot {
 		CashStale:      !cashFresh,
 		PendingEnabled: pendingEnabled,
 	}
+}
+
+// gatewayLabel §P2 互通展示的"对端标识"：QMT 沿用网关 URL（存量前端字段语义不变）；
+// 币安无外置网关进程，标为签名 REST Base（含 testnet 标记）。同时充当 HealthCheck 的
+// "是否已配置对端"判据（空串=未配置，跳过探活，与旧 `GatewayURL==""` 早退语义对齐）。
+// 调用方需持 RLock（读取 c.cfg 快照）。
+// English: §P2 peer label — QMT keeps the gateway URL; binance reports its REST base (testnet-aware).
+// Doubles as the "endpoint configured" predicate for HealthCheck's early-exit.
+func (c *Controller) gatewayLabel() string {
+	switch v := c.cfg.(type) {
+	case config.QMTConfig:
+		return v.GatewayURL
+	case config.BinanceBrokerView:
+		return v.Cfg.BaseURL()
+	}
+	return ""
+}
+
+// brokerTitle §P2 告警/日志前缀：QMT 文案逐字节不变（存量测试与告警规则按"QMT 实盘"匹配），
+// 币安控制器用 "币安"。熔断按 broker 隔离后两族告警在推送侧天然可分。
+// English: §P2 alert prefix per broker — "QMT" stays byte-identical for legacy matchers; binance says 币安.
+func (c *Controller) brokerTitle() string {
+	if c.broker == "binance" {
+		return "币安"
+	}
+	return "QMT"
+}
+
+// MarketKey §P2 本控制器所属市场：QMT=CN；币安控制器由装配期注入的 BinanceBrokerView.Market 决定
+// （US 控制器="US"、CRYPTO 控制器="CRYPTO"）。对账落库/资金三态查询以此为市场章。
+// English: §P2 the market this controller owns (QMT→CN; binance from its injected view) — used to
+// stamp reconciliation rows and scope the cash basis.
+func (c *Controller) MarketKey() string {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if v, ok := c.cfg.(config.BinanceBrokerView); ok && v.Market != "" {
+		return v.Market
+	}
+	return "CN"
+}
+
+// orderInScope §P2 市场隔离：币安控制器的 HaltAll/撤单闭环只作用于**本市场**委托（o.Market
+// 空串按 CN 归一）——否则 CRYPTO 控制器的清扫会去撤 CN 网关的在途单。QMT 控制器恒返回 true，
+// 存量单市场行为逐字节不变（零回归边界）。
+// English: §P2 market scoping — binance controllers only sweep/cancel their own market's tickets;
+// the QMT controller keeps the legacy all-orders behavior byte-for-byte.
+func (c *Controller) orderInScope(o store.RealOrder) bool {
+	if c.broker != "binance" {
+		return true
+	}
+	m := o.Market
+	if m == "" {
+		m = "CN"
+	}
+	return m == c.MarketKey()
+}
+
+// BinanceExecutor 返回本控制器当前生效的币安执行器（非币安控制器/Noop 时返回 nil）。
+// 供 /api/binance/* 端点直连查询面（exchangeInfo 规则、披露闩复位）与路由器分发。
+func (c *Controller) BinanceExecutor() *BinanceExecutor {
+	bn, _ := c.execRef().(*BinanceExecutor)
+	return bn
+}
+
+// cancelArg 装配执行器撤单键：币安现货 DELETE /api/v3/order 必须带 symbol，本地账本按 orderID
+// 反查代号拼成 "SYMBOL:orderId" 复合格（查不到原样透传，由执行器拒撤并留提示）。
+// QMT/美股路径恒透传——CN 报文零改动。
+func (c *Controller) cancelArg(orderID string) string {
+	bn, ok := c.execRef().(*BinanceExecutor)
+	if !ok || bn.Market() != "CRYPTO" || c.store == nil || strings.Contains(orderID, ":") {
+		return orderID
+	}
+	orders, err := c.store.RealOrdersForUser(c.userID)
+	if err != nil {
+		return orderID
+	}
+	for _, o := range orders {
+		if o.OrderID == orderID && o.Code != "" {
+			return strings.ToUpper(o.Code) + ":" + orderID
+		}
+	}
+	return orderID
 }
 
 // setTripped 置/解熔断并告警（仅在状态变化时触发一次）。
@@ -350,10 +482,10 @@ func (c *Controller) setTripped(tripped bool, reason string) {
 	if tripped {
 		metrics.BreakerTripped()              // §R4-9 熔断计数
 		metrics.SetGauge("breaker_active", 1) // §WS-L 熔断状态量规（告警规则 breaker_open）
-		onAlert("high", "QMT 实盘熔断", reason)
+		onAlert("high", c.brokerTitle()+" 实盘熔断", reason)
 	} else {
 		metrics.SetGauge("breaker_active", 0)
-		onAlert("info", "QMT 实盘恢复", "网关连接恢复，自动解熔")
+		onAlert("info", c.brokerTitle()+" 实盘恢复", "连接恢复，自动解熔")
 	}
 	log.Printf("[trading] circuit breaker %v: %s", tripped, reason)
 	// §DAILY_OPSLOG 熔断/恢复是资金安全的分水岭事件，必须留档
@@ -374,11 +506,12 @@ func (c *Controller) HealthCheck() {
 	c.mu.RLock()
 	cfg := c.cfg
 	last := c.lastHealthAt
+	peers := c.gatewayLabel() // §P2 空串=对端未配置（QMT 无 gateway_url / 币安无 BaseURL）→ 不探活
 	c.mu.RUnlock()
-	if !cfg.Enabled || cfg.GatewayURL == "" {
+	if !cfg.BrokerEnabled() || peers == "" {
 		return
 	}
-	interval := time.Duration(cfg.MissHeartbeatSec) * time.Second / 2
+	interval := time.Duration(cfg.BrokerMissHeartbeat()) * time.Second / 2
 	if interval <= 0 {
 		interval = 60 * time.Second
 	}
@@ -399,7 +532,7 @@ func (c *Controller) HealthCheck() {
 	c.mu.RLock()
 	cfg2 := c.cfg
 	c.mu.RUnlock()
-	miss := time.Duration(cfg2.MissHeartbeatSec) * time.Second
+	miss := time.Duration(cfg2.BrokerMissHeartbeat()) * time.Second
 	if miss <= 0 {
 		miss = 120 * time.Second
 	}
@@ -493,21 +626,21 @@ func (c *Controller) placeOrder(req OrderRequest) (*OrderResult, error) {
 	// 配置在读锁下取快照，避免热更新途中读到半份配置。
 	if c.Tripped() {
 		// §D5：currentTripReason 自带 RLock，此处调用方未持锁（安全）；旧名 tripReasonLocked 误导。
-		return nil, fmt.Errorf("qmt circuit-breaker open: %s", c.currentTripReason())
+		return nil, fmt.Errorf("%s circuit-breaker open: %s", c.broker, c.currentTripReason())
 	}
 	c.mu.RLock()
 	cfg := c.cfg
 	c.mu.RUnlock()
-	if !cfg.Enabled {
-		return nil, fmt.Errorf("qmt disabled")
+	if !cfg.BrokerEnabled() {
+		return nil, fmt.Errorf("%s disabled", c.broker)
 	}
 	// §R4-1 kill-switch（人工紧急停止）：置位时拒绝一切新下单（auto 与手动全路径）。
 	// 已报未成交委托由 SweepOrders 撤单闭环 / HaltAll 处理；卖出同样被拦——紧急停止语义下
 	// 一切柜台动作都停，宁可人工接手也不让系统在未知状态下继续动作。
 	// English: §R4-1 kill switch — when engaged, ALL new orders (auto & manual, both sides) are
 	// rejected; unfilled tickets are handled by SweepOrders/HaltAll. Deliberate fail-stop semantics.
-	if cfg.Halted {
-		return nil, fmt.Errorf("qmt kill-switch engaged (halted=true)：人工紧急停止中，拒绝一切新下单")
+	if cfg.BrokerHalted() {
+		return nil, fmt.Errorf("%s kill-switch engaged (halted=true)：人工紧急停止中，拒绝一切新下单", c.broker)
 	}
 	if c.store == nil {
 		return nil, fmt.Errorf("qmt store not set")
@@ -556,6 +689,9 @@ func (c *Controller) placeOrder(req OrderRequest) (*OrderResult, error) {
 		Qty:       req.Qty,
 		CreatedAt: req.CreatedAt,
 		UserID:    c.userID, // §W2-10 委托行打归属账号（多账号审计/后续租户读过滤）
+		Market:    req.Market,
+		// §P2（PLAN §6.4）占位行落市场章：空串由 store 归一为 CN（QMT 链逐字节不变），
+		// 币安控制器由 Router 保证 req.Market ∈ {US,CRYPTO}——委托/成交按市场隔离统计。
 	})
 	if err != nil {
 		return nil, err
@@ -572,7 +708,11 @@ func (c *Controller) placeOrder(req OrderRequest) (*OrderResult, error) {
 	}
 
 	if req.PriceType == "" {
-		req.PriceType = cfg.PriceType
+		// §P2 缺省价型来源泛化：QMT 沿用 price_type 配置；币安视图无该字段，直接落 market 档
+		// （与旧代码 cfg.PriceType 为空时的回退分支同形，CN 行为逐字节不变）。
+		if q, ok := cfg.(config.QMTConfig); ok {
+			req.PriceType = q.PriceType
+		}
 		if req.PriceType == "" {
 			req.PriceType = "market"
 		}
@@ -650,9 +790,9 @@ func (c *Controller) Reconcile() error {
 		log.Printf("[trading] 对账跳过: 网关未连接且持仓快照为空（不可信，禁止清账）")
 		return nil
 	}
-	// §BINANCE-P1c：本 Controller 现阶段唯一实例化来源是 QMT 网关（CN 市场），/state 快照
-	// 的市场章固定 CN；Phase 2 的币安 Controller 将以自己的 market 走同一函数。
-	if _, err := c.store.ReconcilePositionsForUser(c.userID, "CN", st.Positions); err != nil {
+	// §P2 对账快照的市场章：QMT 控制器=CN（与旧硬编码逐字节一致）；币安控制器=其视图市场，
+	// ReconcilePositionsForUser 只清理本市场作用域的持仓行（US 快照不会删 CRYPTO/CN 的行）。
+	if _, err := c.store.ReconcilePositionsForUser(c.userID, c.MarketKey(), st.Positions); err != nil {
 		return err
 	}
 	// 委托流水对账（此前 State 拉回即丢）：仅记日志差异告警，自动纠偏仍留给回报线程。
@@ -687,7 +827,7 @@ func (c *Controller) MaybeReconcile(interval time.Duration) {
 	}
 	c.mu.RLock()
 	last := c.lastReconcileAt
-	enabled := c.cfg.Enabled
+	enabled := c.cfg.BrokerEnabled()
 	c.mu.RUnlock()
 	if !enabled || time.Since(last) < interval {
 		return
@@ -712,12 +852,12 @@ func (c *Controller) MaybeReconcile(interval time.Duration) {
 // failures surface as errors (gateway 409 = filled/cancelled/uncancellable → let report thread progress).
 func (c *Controller) CancelOrder(orderID string) error {
 	c.mu.RLock()
-	enabled := c.cfg.Enabled
+	enabled := c.cfg.BrokerEnabled()
 	c.mu.RUnlock()
 	if !enabled {
-		return fmt.Errorf("qmt disabled")
+		return fmt.Errorf("%s disabled", c.broker)
 	}
-	if err := c.execRef().Cancel(orderID); err != nil {
+	if err := c.execRef().Cancel(c.cancelArg(orderID)); err != nil {
 		return err
 	}
 	if c.store != nil {
@@ -748,7 +888,10 @@ func (c *Controller) HaltAll() int {
 		if (o.Status != "已报" && o.Status != "部成") || strings.HasPrefix(o.OrderID, "pend:") {
 			continue
 		}
-		if err := c.execRef().Cancel(o.OrderID); err != nil {
+		if !c.orderInScope(o) {
+			continue // §P2 市场隔离：币安控制器不碰其它市场（含 CN）的委托
+		}
+		if err := c.execRef().Cancel(c.cancelArg(o.OrderID)); err != nil {
 			log.Printf("[trading] HaltAll 撤单失败 %s: %v", o.OrderID, err)
 			continue
 		}
@@ -809,7 +952,7 @@ func (c *Controller) SweepOrders(now time.Time) *SweepResult {
 	cfg := c.cfg
 	last := c.lastSweepAt
 	c.mu.RUnlock()
-	if !cfg.Enabled || c.store == nil || c.Tripped() {
+	if !cfg.BrokerEnabled() || c.store == nil || c.Tripped() {
 		return nil
 	}
 	if now.Sub(last) < 30*time.Second {
@@ -820,16 +963,19 @@ func (c *Controller) SweepOrders(now time.Time) *SweepResult {
 	c.mu.Unlock()
 
 	// 阈值解析：-1=关闭自动撤单；0=默认 120s
-	staleSec := cfg.CancelStaleSec
+	staleSec := cfg.BrokerCancelStaleSec()
 	if staleSec == 0 {
 		staleSec = 120
 	}
 
-	// 收盘清单判定：北京时到达 close_sweep_at（默认 1452）且本交易日未执行过
+	// 收盘清单判定：北京时到达 close_sweep_at（默认 1452）且本交易日未执行过。
+	// §P2 泛化取 BrokerCloseSweepAt()：QMT=1452 现状；币安视图恒 -1（CRYPTO 7×24 无收盘、
+	// 美股收盘清单由 tradingStatus/calendar 流驱动）——closeAt>0 短路使本判定对新市场天然失效，
+	// data.IsTradingDay（A 股日历）也因此只在 QMT 路径可达，无需市场分支。
 	bj := cntime.In(now)
 	day := bj.Format("20060102")
 	hhmm := bj.Hour()*100 + bj.Minute()
-	closeAt := cfg.CloseSweepAt
+	closeAt := cfg.BrokerCloseSweepAt()
 	if closeAt == 0 {
 		closeAt = 1452
 	}
@@ -861,6 +1007,9 @@ func (c *Controller) SweepOrders(now time.Time) *SweepResult {
 		if o.Status != "已报" && o.Status != "部成" {
 			continue
 		}
+		if !c.orderInScope(o) {
+			continue // §P2 市场隔离：撤单闭环只扫本市场委托（CN 行归 QMT 控制器管辖）
+		}
 		at, perr := time.Parse(time.RFC3339, o.CreatedAt)
 		if perr != nil {
 			res.Skipped++
@@ -881,7 +1030,7 @@ func (c *Controller) SweepOrders(now time.Time) *SweepResult {
 		if !((staleSec > 0 && age > staleAfter) || closeSweep) {
 			continue
 		}
-		if err := c.execRef().Cancel(o.OrderID); err != nil {
+		if err := c.execRef().Cancel(c.cancelArg(o.OrderID)); err != nil {
 			res.Errors++
 			// 典型失败：交易所委托号尚未回报（网关暂不可撤）/ 已成交（撤单被拒）——
 			// 不强试，交由回报线程推进真实状态，下轮再评估
@@ -928,22 +1077,37 @@ func (c *Controller) currentTripReason() string {
 	return c.tripReason
 }
 
-// Config 返回当前生效的 QMT 配置副本。
-// English: Config returns a copy of the current QMT config.
-func (c *Controller) Config() config.QMTConfig {
+// Config 返回当前生效的券商配置（§P2 泛化为 BrokerConfig 接口值）。
+// 需要 QMT 专属复合结构（Money/Advice/Discipline/Settle/PriceType…）的 CN 链消费方改用 QMT()。
+// English: Config returns the current broker config as the BrokerConfig interface; CN-only consumers
+// needing QMT composites switch to QMT().
+func (c *Controller) Config() config.BrokerConfig {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	return c.cfg
 }
+
+// QMT 返回当前生效的 QMTConfig 具体值（§P2）：非 QMT 控制器（币安视图）返回零值结构——
+// 调用方均为 CN 专属链路（打分循环/收盘清单/网关双通道切换），拿到零值即天然关闭。
+// English: §P2 concrete QMTConfig view; binance controllers return the zero struct, so CN-only
+// consumers degrade to "off" by construction.
+func (c *Controller) QMT() config.QMTConfig {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	q, _ := c.cfg.(config.QMTConfig)
+	return q
+}
+
+// Broker 返回 broker 标识（"qmt"/"binance"），供 Router/告警装配侧使用。
+// English: Broker exposes the broker tag for router/alert wiring.
+func (c *Controller) Broker() string { return c.broker }
 
 // gatewayClient 构建一个直连网关的临时客户端（读当前 cfg 的 gateway_url/token）。
 // §QMT-DUAL：broker 切换/状态读取不经过下单执行器抽象，独立建客户端避免耦合 Executor 接口。
 // English: builds a throwaway gateway client from the current config for broker status/switch,
 // bypassing the order executor abstraction.
 func (c *Controller) gatewayClient() *QMTClient {
-	c.mu.RLock()
-	cfg := c.cfg
-	c.mu.RUnlock()
+	cfg := c.QMT() // §P2 QMT 专属路径（双通道切换仅网关有），币安控制器恒得零值→返回 nil
 	if !cfg.Enabled || cfg.GatewayURL == "" {
 		return nil
 	}

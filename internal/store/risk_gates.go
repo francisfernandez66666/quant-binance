@@ -93,13 +93,21 @@ func (d *DB) RiskGateDay(tradeDate string, limit int) ([]RiskGateHit, error) {
 // to the row id. Filled count (not submitted count) is the ledger-level truth, and it also covers
 // broker-only manual fills backfilled by sync_fills (which have no local orders row).
 func (d *DB) CountBuyFilledOrdersByDay(userID, day string) (int, error) {
+	return d.CountBuyFilledOrdersByDayForMarket(userID, day, "CN")
+}
+
+// CountBuyFilledOrdersByDayForMarket §BINANCE-P2（PLAN §15.2）市场作用域口径：
+// 只数该市场（US/CRYPTO/CN）的成交笔数——USDT 的成交不能吃 CNY 的单日笔数额度。
+// market 空串归一为 CN（存量行 ALTER 回填 'CN'，与无后缀版逐字节同口径）。
+// English: market-scoped variant — each settlement currency keeps its own daily buy-count budget.
+func (d *DB) CountBuyFilledOrdersByDayForMarket(userID, day, market string) (int, error) {
 	var n int
 	err := d.db.QueryRow(`SELECT COUNT(DISTINCT CASE
 			WHEN COALESCE(order_id,'') <> '' THEN 'o:' || order_id
 			WHEN COALESCE(serial,'')   <> '' THEN 's:' || serial
 			ELSE 'r:' || id END)
-		FROM fills WHERE user_id=? AND side='买入' AND substr(traded_at,1,10)=?`,
-		userID, day).Scan(&n)
+		FROM fills WHERE user_id=? AND side='买入' AND market=? AND substr(traded_at,1,10)=?`,
+		userID, NormalizeMarket(market), day).Scan(&n)
 	return n, err
 }
 
@@ -113,10 +121,16 @@ func (d *DB) CountBuyFilledOrdersByDay(userID, day string) (int, error) {
 // daily-budget gate; Σ amount (falling back to price×qty for legacy rows), same fills table as the
 // count gate. In-flight freeze comes from LocalBuyFrozen (order-status derived).
 func (d *DB) SumBuyFilledAmountByDay(userID, day string) (float64, error) {
+	return d.SumBuyFilledAmountByDayForMarket(userID, day, "CN")
+}
+
+// SumBuyFilledAmountByDayForMarket §BINANCE-P2（PLAN §15.2）市场作用域买入成交金额。
+// English: market-scoped filled-buy amount (per-currency budget ledgers never cross).
+func (d *DB) SumBuyFilledAmountByDayForMarket(userID, day, market string) (float64, error) {
 	var s float64
 	err := d.db.QueryRow(`SELECT COALESCE(SUM(CASE WHEN amount>0 THEN amount ELSE price*qty END),0)
-		FROM fills WHERE user_id=? AND side='买入' AND substr(traded_at,1,10)=?`,
-		userID, day).Scan(&s)
+		FROM fills WHERE user_id=? AND side='买入' AND market=? AND substr(traded_at,1,10)=?`,
+		userID, NormalizeMarket(market), day).Scan(&s)
 	return s, err
 }
 
@@ -128,10 +142,16 @@ func (d *DB) SumBuyFilledAmountByDay(userID, day string) (float64, error) {
 // today's buy occupancy with it (floored at zero so liquidating old inventory never enlarges the
 // daily budget). Fees not deducted; undercounting proceeds only tightens, never loosens.
 func (d *DB) SumSellFilledAmountByDay(userID, day string) (float64, error) {
+	return d.SumSellFilledAmountByDayForMarket(userID, day, "CN")
+}
+
+// SumSellFilledAmountByDayForMarket §BINANCE-P2（PLAN §15.2）市场作用域卖出回款。
+// English: market-scoped sell proceeds.
+func (d *DB) SumSellFilledAmountByDayForMarket(userID, day, market string) (float64, error) {
 	var s float64
 	err := d.db.QueryRow(`SELECT COALESCE(SUM(CASE WHEN amount>0 THEN amount ELSE price*qty END),0)
-		FROM fills WHERE user_id=? AND side='卖出' AND substr(traded_at,1,10)=?`,
-		userID, day).Scan(&s)
+		FROM fills WHERE user_id=? AND side='卖出' AND market=? AND substr(traded_at,1,10)=?`,
+		userID, NormalizeMarket(market), day).Scan(&s)
 	return s, err
 }
 
@@ -143,22 +163,39 @@ func (d *DB) SumSellFilledAmountByDay(userID, day string) (float64, error) {
 // buy price when the position is gone; unknowable cost fails open (not counted) so the breaker never
 // trips on a data gap.
 func (d *DB) TodayRealizedPnl(userID, day string) (float64, error) {
-	fills, err := d.ListFillsByDay(userID, day)
+	return d.TodayRealizedPnlForMarket(userID, day, "CN")
+}
+
+// TodayRealizedPnlForMarket §BINANCE-P2（PLAN §15.2）市场作用域已实现盈亏：
+// 只汇总该市场当日卖出成交（注意 day 需为「该市场记账时区」的 yyyy-MM-dd，
+// 与 gate.marketToday 同口径——CRYPTO=UTC 日、US=纽约日、CN=北京日）。
+// 成本回落查持仓按代号互斥形态直接命中（CN 六位+.SH/.SZ、US 字母、CRYPTO 资产对不撞码）。
+// English: market-scoped realized P&L; day must be the market-local date (same key as gate.marketToday).
+func (d *DB) TodayRealizedPnlForMarket(userID, day, market string) (float64, error) {
+	m := NormalizeMarket(market)
+	rows, err := d.db.Query(`SELECT code, side, price, qty FROM fills
+		WHERE user_id=? AND market=? AND substr(traded_at,1,10)=?`, userID, m, day)
 	if err != nil {
 		return 0, err
 	}
+	defer rows.Close()
 	var pnl float64
-	for _, f := range fills {
-		if f.Side != "卖出" || f.Qty <= 0 {
+	for rows.Next() {
+		var code, side string
+		var price, qty float64
+		if err := rows.Scan(&code, &side, &price, &qty); err != nil {
+			return 0, err
+		}
+		if side != "卖出" || qty <= 0 {
 			continue
 		}
-		cost := d.costBasisFor(userID, f.Code, day)
+		cost := d.costBasisFor(userID, code, day)
 		if cost <= 0 {
 			continue // fail-open：成本不可知不计入
 		}
-		pnl += (f.Price - cost) * float64(f.Qty)
+		pnl += (price - cost) * qty
 	}
-	return pnl, nil
+	return pnl, rows.Err()
 }
 
 // costBasisFor 某 code 的成本价：优先当前持仓 CostPrice；持仓已清时回落今日该 code 买入成交均价。
@@ -191,8 +228,17 @@ func (d *DB) costBasisFor(userID, code, day string) float64 {
 // value (live price preferred, cost price fallback). When broker cash is unreported only the held
 // value is returned, letting callers skip the concentration gate.
 func (d *DB) TotalAssets(userID string) (float64, error) {
+	return d.TotalAssetsForMarket(userID, "CN")
+}
+
+// TotalAssetsForMarket §BINANCE-P2（PLAN §15.2）市场作用域总资产：
+// 现金取该市场账户行（real_account.market），持仓只计该市场行——
+// 集中度/熔断闸的分母不再被跨币种行情互相稀释（USDT 持仓不得进 CNY 口径）。
+// English: market-scoped total assets — per-market cash row plus that market's positions only.
+func (d *DB) TotalAssetsForMarket(userID, market string) (float64, error) {
+	m := NormalizeMarket(market)
 	total := 0.0
-	if acc, err := d.GetRealAccount(userID); err == nil && acc.AvailableCash > 0 {
+	if acc, err := d.GetRealAccountForMarket(userID, m); err == nil && acc.AvailableCash > 0 {
 		total += acc.AvailableCash
 	}
 	poses, err := d.RealPositionsForUser(userID)
@@ -200,6 +246,9 @@ func (d *DB) TotalAssets(userID string) (float64, error) {
 		return 0, fmt.Errorf("read real positions: %w", err)
 	}
 	for _, p := range poses {
+		if NormalizeMarket(p.Market) != m {
+			continue
+		}
 		price := p.CurPrice
 		if price <= 0 {
 			price = p.CostPrice

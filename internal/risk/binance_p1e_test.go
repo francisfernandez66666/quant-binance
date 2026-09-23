@@ -1,9 +1,11 @@
-// 文件职责：§P1-e 风控闸市场矩阵测试（PLAN §9：14 闸 × CN/CRYPTO/US 逐格断言）。
+// 文件职责：§P1-e/§P3 风控闸市场矩阵测试（PLAN §9：15 闸 × CN/CRYPTO/US 逐格断言）。
 // 判定姿势：每格构造「该闸必然命中」的订单与夹具（其余闸全关），断言——
-//   矩阵 ✅ → v.Gate 命中该闸；矩阵 ➖ → v.Pass 放行（短路生效）。
+//
+//	矩阵 ✅ → v.Gate 命中该闸；矩阵 ➖ → v.Pass 放行（短路生效）。
+//
 // 时间夹具：固定北京 2026-09-23 23:00（=UTC 15:00=纽约 11:00，三地同日期），
 // 排除按日账查询的跨日噪声；market_today 用例另用 00:30 时刻制造三地日期分歧。
-// English: §P1-e PLAN §9 matrix — 14 gates × 3 markets asserted cell by cell: armed cells must
+// English: §P1-e/§P3 PLAN §9 matrix — 15 gates × 3 markets asserted cell by cell: armed cells must
 // hit their gate id, inactive cells must pass (market short-circuit).
 package risk
 
@@ -84,12 +86,13 @@ type p1eScenario struct {
 	setup  func(t *testing.T, cfg *config.QMTConfig, g *Gate, db *store.DB, market string)
 }
 
-// p1eScenarios 14 道闸的场景表（与 PLAN §9 矩阵逐行对齐）。
+// p1eScenarios 15 道闸的场景表（与 PLAN §9 矩阵逐行对齐，§P3 补第 15 道 market_halt）。
 func p1eScenarios() []p1eScenario {
 	all := map[string]bool{"CN": true, "CRYPTO": true, "US": true}
 	cnOnly := map[string]bool{"CN": true}
 	cryptoOnly := map[string]bool{"CRYPTO": true}
 	cryptoUS := map[string]bool{"CRYPTO": true, "US": true}
+	usOnly := map[string]bool{"US": true}
 	return []p1eScenario{
 		{"st", cnOnly, func(t *testing.T, cfg *config.QMTConfig, g *Gate, db *store.DB, market string) {
 			// 名称带 *ST 特征（命中判定只看 Name，无需配置）。
@@ -123,7 +126,8 @@ func p1eScenarios() []p1eScenario {
 		}},
 		{"concentration", all, func(t *testing.T, cfg *config.QMTConfig, g *Gate, db *store.DB, market string) {
 			cfg.RiskGate.SingleStockValuePct = 20 // 25000/100000=25% > 20%
-			if err := db.UpsertRealAccount(store.RealAccount{UserID: "u_p1e", AvailableCash: 100000,
+			// §P2（§15.2）账户行按市场落行——集中度分母已改市场作用域，跨币兜底不再存在。
+			if err := db.UpsertRealAccount(store.RealAccount{UserID: "u_p1e", Market: market, AvailableCash: 100000,
 				UpdatedAt: p1eDay + " 09:00:00"}); err != nil {
 				t.Fatalf("account: %v", err)
 			}
@@ -145,10 +149,14 @@ func p1eScenarios() []p1eScenario {
 		{"lot_precision", cryptoUS, func(t *testing.T, cfg *config.QMTConfig, g *Gate, db *store.DB, market string) {
 			g.SetSymbolRulesSource(func(string) (SymbolRules, error) { return SymbolRules{StepSize: 0.001}, nil })
 		}},
+		{"market_halt", usOnly, func(t *testing.T, cfg *config.QMTConfig, g *Gate, db *store.DB, market string) {
+			// 证据源恒回「有证据且停牌」：US 必拦；CN/CRYPTO 应被市场短路放行。
+			g.SetHaltEvidenceSource(func(string) (bool, bool) { return true, true })
+		}},
 	}
 }
 
-// TestGateMarketMatrixP1E §P1-e 主锁：PLAN §9 矩阵 14 闸 × 3 市场逐格断言启停。
+// TestGateMarketMatrixP1E §P1-e/§P3 主锁：PLAN §9 矩阵 15 闸 × 3 市场逐格断言启停。
 func TestGateMarketMatrixP1E(t *testing.T) {
 	markets := []string{"CN", "CRYPTO", "US"}
 	for _, sc := range p1eScenarios() {
@@ -308,6 +316,56 @@ func TestGateLotPrecisionDecimalGeometryP1E(t *testing.T) {
 		o.Amount = 10000
 		if v := g.CheckLiveOrder(cfg, o); !v.Pass {
 			t.Fatalf("CRYPTO qty %s 应为 stepSize 0.1 合法量: %+v", store.QtyString(qty), v)
+		}
+	}
+}
+
+// TestGateMarketHaltP3 §P3 market_halt 四象限语义锁（矩阵只覆盖「恒停牌」一格，这里补齐
+// fail-close 核心纪律的正交面）：
+//  1. 证据源未装配 → 三市场全放行（零配置零行为）；
+//  2. 已装配 + US 无证据（hasEvidence=false）→ 拒（未确认≠可交易）；
+//  3. 已装配 + US 有证据且停牌 → 拒；有证据且正常 → 放行；
+//  4. 已装配 + CN/CRYPTO 即使无证据也放行（市场短路，不吃 fail-close）。
+func TestGateMarketHaltP3(t *testing.T) {
+	cfg := qmtCfg()
+	// 象限 1：未装配。
+	g0, _ := p1eGate(t)
+	for _, m := range []string{"CN", "CRYPTO", "US"} {
+		if v := g0.CheckLiveOrder(cfg, p1eOrder(m, SideBuy)); !v.Pass {
+			t.Fatalf("未装配证据源应三市场全放行 %s: %+v", m, v)
+		}
+	}
+	// 象限 2/3：按市场/按票返回不同证据。
+	g1, _ := p1eGate(t)
+	g1.SetHaltEvidenceSource(func(sym string) (bool, bool) {
+		switch sym {
+		case "HALTED":
+			return true, true
+		case "NO_EVIDENCE":
+			return false, false
+		default:
+			return true, false // 正常可交易
+		}
+	})
+	oHalt := p1eOrder("US", SideBuy)
+	oHalt.Code = "HALTED"
+	if v := g1.CheckLiveOrder(cfg, oHalt); v.Pass || v.Gate != "market_halt" {
+		t.Fatalf("US 停牌应命中 market_halt: %+v", v)
+	}
+	oNoEv := p1eOrder("US", SideBuy)
+	oNoEv.Code = "NO_EVIDENCE"
+	if v := g1.CheckLiveOrder(cfg, oNoEv); v.Pass || v.Gate != "market_halt" {
+		t.Fatalf("US 无证据应 fail-close 拒单: %+v", v)
+	}
+	if v := g1.CheckLiveOrder(cfg, p1eOrder("US", SideBuy)); !v.Pass {
+		t.Fatalf("US 有证据且正常应放行: %+v", v)
+	}
+	// 象限 4：CN/CRYPTO 同样喂「无证据」代码也放行（短路在证据查询之前）。
+	for _, m := range []string{"CN", "CRYPTO"} {
+		o := p1eOrder(m, SideBuy)
+		o.Code = p1eCode(m) // 证据源对该代码回 (true,false)，但市场短路本就不查
+		if v := g1.CheckLiveOrder(cfg, o); !v.Pass {
+			t.Fatalf("%s 不吃 market_halt fail-close: %+v", m, v)
 		}
 	}
 }

@@ -1,0 +1,64 @@
+{
+  "source": "internal/trading/binance_contract_test.go (mock 柜台 7 格实发键面)",
+  "cells": {
+    "spot_limit": [
+      "newClientOrderId",
+      "price",
+      "quantity",
+      "side",
+      "symbol",
+      "timeInForce",
+      "type"
+    ],
+    "spot_market_buy": [
+      "newClientOrderId",
+      "quoteOrderQty",
+      "side",
+      "symbol",
+      "type"
+    ],
+    "spot_market_sell": [
+      "newClientOrderId",
+      "quantity",
+      "side",
+      "symbol",
+      "type"
+    ],
+    "us_buy_limit": [
+      "price",
+      "quantity",
+      "quoteAsset",
+      "side",
+      "symbol",
+      "timeInForce",
+      "tradingSession",
+      "type"
+    ],
+    "us_buy_market": [
+      "notional",
+      "quoteAsset",
+      "side",
+      "symbol",
+      "type",
+      "walletType"
+    ],
+    "us_sell_limit": [
+      "price",
+      "quantity",
+      "quoteAsset",
+      "side",
+      "symbol",
+      "timeInForce",
+      "tradingSession",
+      "type"
+    ],
+    "us_sell_market": [
+      "quantity",
+      "quoteAsset",
+      "side",
+      "symbol",
+      "type",
+      "walletType"
+    ]
+  }
+}

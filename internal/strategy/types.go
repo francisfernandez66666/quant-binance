@@ -32,6 +32,10 @@ const (
 	SignalFactor       SignalType = "factor"         // 因子战法（E6：自动发现的因子组合，实盘信号）（Factor strategy, E6）
 	SignalPattern      SignalType = "pattern"        // 形态战法（F3：自动发现的形态模板，实盘信号）（Pattern strategy, F3）
 	SignalMomentum     SignalType = "momentum"       // 动量（量价齐升观察/买入，§动量入模拟盘）
+	// §P3 新市场最小战法族（xasset 包）：MA 交叉 / RSI 动量 / 新闻事件适配，信号必带 Market。
+	SignalMACross SignalType = "ma_cross"     // 均线交叉（US/CRYPTO）（Moving-average cross）
+	SignalRSI     SignalType = "rsi_momentum" // RSI 动量（US/CRYPTO）（RSI momentum）
+	SignalNewsX   SignalType = "news_xasset"  // 新闻事件适配（US/CRYPTO）（News-event adaptation）
 )
 
 // TradeAction 交易动作类型。（TradeAction is a trade action type.）
@@ -87,6 +91,12 @@ type Signal struct {
 	// strategy type hosts several independent rules (e.g. multiple factor strategies), so each signal's
 	// message-center dedup key stays distinct.
 	StrategyName string `json:"strategy_name,omitempty"`
+	// Market §P3 信号市场章：US/CRYPTO 战法（xasset 包）产出的信号自带市场键，
+	// 下游（dispatch/风控/账本）不再从代码格式反推市场——"信号产出直接带 Market"（PLAN §6.10）。
+	// 空串=CN（存量 A 股战法零改动，序列化 omitempty 不落新键）。
+	// English: market tag on the signal itself (US/CRYPTO xasset strategies); empty = CN, so all
+	// existing A-share strategies are byte-identical on the wire.
+	Market string `json:"market,omitempty"`
 }
 
 // SignalResult 批量信号结果。（SignalResult is a batch signal result.）

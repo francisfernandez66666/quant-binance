@@ -38,6 +38,8 @@ var writeBootstrapAllowlist = map[string]string{
 	"POST /setup":          "一次性初始化（仅未初始化状态可用，处理器内自守）",
 }
 
+// TestWriteEndpointsAllGated §M-14 写端点收权普查：扫描本包全部 POST/PUT/DELETE 路由注册，
+// 除白名单豁免（登录/setup 自守）外必须挂 adminMiddleware——新写端点裸挂即红。
 func TestWriteEndpointsAllGated(t *testing.T) {
 	files, err := os.ReadDir(".")
 	if err != nil {

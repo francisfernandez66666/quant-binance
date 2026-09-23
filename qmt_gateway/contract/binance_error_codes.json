@@ -1,0 +1,233 @@
+{
+  "source": "internal/trading/binance_errors.go binanceErrTable 展平（码升序）",
+  "rows": [
+    {
+      "code": -26004,
+      "name": "EQUITY_UNKNOWN_SYMBOL",
+      "user_action": "标的不存在——标黑并核对代码形态"
+    },
+    {
+      "code": -11001,
+      "name": "EQUITY_DO_NOT_HAVE_AN_ACCOUNT",
+      "fatal": true,
+      "user_action": "账户未开通 Stocks 子户（Phase0-Q1 资格项）"
+    },
+    {
+      "code": -3114,
+      "name": "BSTOCKS_NOT_QUALIFIED",
+      "fatal": true,
+      "user_action": "美股资格不合格——联系券商/换区，暂禁美股下单"
+    },
+    {
+      "code": -3113,
+      "name": "BSTOCKS_RESTRICTED",
+      "fatal": true,
+      "user_action": "bStocks 限制——美股通道降级，仅走现货"
+    },
+    {
+      "code": -2015,
+      "name": "REJECTED_MBX_KEY",
+      "fatal": true,
+      "user_action": "Key/IP/权限被拒（Enable Trading? IP 白名单?）——熔断该 broker"
+    },
+    {
+      "code": -2014,
+      "name": "API_KEY_FORMAT",
+      "fatal": true,
+      "user_action": "API Key 格式非法——人工核对"
+    },
+    {
+      "code": -2013,
+      "name": "ORDER_NOT_FOUND",
+      "user_action": "查无此单——视为未受理，按查重结果决定重放"
+    },
+    {
+      "code": -2011,
+      "name": "CANCEL_REJECTED",
+      "user_action": "撤单被拒（已成交/已撤）——状态由回报推进"
+    },
+    {
+      "code": -2010,
+      "name": "NEW_ORDER_REJECTED",
+      "user_action": "柜台拒单（余额/风控）——占位行降级发送失败，查 msg 定位"
+    },
+    {
+      "code": -1125,
+      "name": "INVALID_LISTEN_KEY",
+      "retryable": true,
+      "user_action": "listenKey 过期已自动重取"
+    },
+    {
+      "code": -1121,
+      "name": "INVALID_SYMBOL",
+      "user_action": "标的不存在/未上线——加入当轮观察黑名单"
+    },
+    {
+      "code": -1111,
+      "name": "BAD_PRECISION",
+      "user_action": "价格/数量精度越界——核对 stepSize/tickSize 取整链"
+    },
+    {
+      "code": -1102,
+      "name": "MANDATORY_PARAM_EMPTY",
+      "user_action": "请求缺必填参数——代码缺陷，报修"
+    },
+    {
+      "code": -1022,
+      "name": "INVALID_SIGNATURE",
+      "fatal": true,
+      "user_action": "API Secret 配置错误——熔断该 broker，人工核对密钥"
+    },
+    {
+      "code": -1021,
+      "name": "INVALID_TIMESTAMP",
+      "retryable": true,
+      "user_action": "已自动校时重签；反复出现查系统时钟/NTP"
+    },
+    {
+      "code": -1015,
+      "name": "TOO_MANY_ORDERS",
+      "retryable": true,
+      "user_action": "暂停新单窗口已开，稍后自动恢复"
+    },
+    {
+      "code": -1013,
+      "name": "FILTER_FAILURE",
+      "user_action": "数量/金额/价格未过滤（LOT_SIZE/PRICE_FILTER/MIN_NOTIONAL）——核对 exchangeInfo 缓存与取整链"
+    },
+    {
+      "code": -1003,
+      "name": "TOO_MANY_REQUESTS",
+      "retryable": true,
+      "user_action": "限速器已退避；持续出现请下调下单频率"
+    },
+    {
+      "code": -1000,
+      "name": "UNKNOWN_EXCHANGE_ERROR",
+      "user_action": "查 order/query 确认受理状态后人工决定重放"
+    },
+    {
+      "code": 486217,
+      "name": "EQUITY_ORDER_ID_OR_CLORD_REQUIRED",
+      "user_action": "查询缺 orderId/clientOrderId——代码缺陷，报修"
+    },
+    {
+      "code": 486218,
+      "name": "EQUITY_ORDER_NOT_FOUND",
+      "user_action": "查无此单——按未受理处理"
+    },
+    {
+      "code": 486405,
+      "name": "EQUITY_INSUFFICIENT_BALANCE",
+      "user_action": "余额不足——拒单（不可自动重试）"
+    },
+    {
+      "code": 486408,
+      "name": "EQUITY_SYMBOL_NO_ODD_LOT",
+      "user_action": "该票不支持碎股——改整股数量重下"
+    },
+    {
+      "code": 486409,
+      "name": "EQUITY_PREMARKET_NO_ODD_LOT",
+      "user_action": "盘前不支持碎股——转 RTH 或整股"
+    },
+    {
+      "code": 486410,
+      "name": "EQUITY_DISCLAIMER_UNSIGNED",
+      "fatal": true,
+      "user_action": "美股风险披露未签——/api/binance/disclaimer 签署后恢复"
+    },
+    {
+      "code": 486416,
+      "name": "EQUITY_QTY_BELOW_MIN",
+      "user_action": "数量低于最小——前置闸应已拦"
+    },
+    {
+      "code": 486417,
+      "name": "EQUITY_QTY_ABOVE_MAX",
+      "user_action": "数量超上限——核 exchangeInfo lot 规则"
+    },
+    {
+      "code": 486418,
+      "name": "EQUITY_QTY_LOT_STEP",
+      "user_action": "数量非 lot 步长整数倍——取整链缺陷，报修"
+    },
+    {
+      "code": 486419,
+      "name": "EQUITY_NOTIONAL_BELOW_MIN",
+      "user_action": "金额低于最小名义额（$1 起）——加大或合并"
+    },
+    {
+      "code": 486420,
+      "name": "EQUITY_NOTIONAL_ABOVE_MAX",
+      "user_action": "金额超上限——拆单"
+    },
+    {
+      "code": 486421,
+      "name": "EQUITY_PRICE_ABOVE_RANGE",
+      "user_action": "限价超允许区间——核对现价"
+    },
+    {
+      "code": 486422,
+      "name": "EQUITY_PRICE_BELOW_RANGE",
+      "user_action": "限价低于允许区间——核对现价"
+    },
+    {
+      "code": 486423,
+      "name": "EQUITY_TOO_MANY_OPEN_ORDERS",
+      "retryable": true,
+      "user_action": "在途单达上限——等待清账后自动重试"
+    },
+    {
+      "code": 486426,
+      "name": "EQUITY_BUY_FORBIDDEN",
+      "user_action": "该票禁买——标黑当轮"
+    },
+    {
+      "code": 486427,
+      "name": "EQUITY_SELL_FORBIDDEN",
+      "user_action": "该票禁卖——等待状态恢复"
+    },
+    {
+      "code": 486428,
+      "name": "EQUITY_HALTED",
+      "user_action": "停牌中——等复牌（tradingStatus 流驱动）"
+    },
+    {
+      "code": 486434,
+      "name": "EQUITY_NOTIONAL_MAX",
+      "user_action": "名义额超票级上限——拆单"
+    },
+    {
+      "code": 486439,
+      "name": "EQUITY_SELL_ONLY",
+      "user_action": "账户仅可卖（资格/保证金）——拒买+告警"
+    },
+    {
+      "code": 486440,
+      "name": "EQUITY_PDT_RESTRICTION",
+      "user_action": "PDT 保证金保护——拒买+告警，人工入金或等平仓"
+    },
+    {
+      "code": 486441,
+      "name": "EQUITY_PREMARKET_LIMIT_ONLY",
+      "user_action": "盘前仅限价单——市价单改限价"
+    },
+    {
+      "code": 486442,
+      "name": "EQUITY_ODD_LOT_MARKET_ONLY",
+      "user_action": "碎股仅市价单——碎股 LIMIT 改 MARKET 或整股"
+    },
+    {
+      "code": 486443,
+      "name": "EQUITY_TYPE_NO_ODD_LOT",
+      "user_action": "该单型不支持碎股——改单型"
+    },
+    {
+      "code": 486449,
+      "name": "EQUITY_DUPLICATE_CLIENT_ORDER_ID",
+      "idempotent_hit": true,
+      "user_action": "重复 clientOrderId——查 order/detail 回填真实单号"
+    }
+  ]
+}

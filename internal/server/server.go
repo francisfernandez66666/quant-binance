@@ -130,6 +130,9 @@ type EngineController interface {
 	// English: returns the live-trading controller (AUTO_TRADING_PLAN M1; may be nil when not wired).
 	// Lets the HTTP layer read the breaker/config, place orders and persist gateway reports.
 	QMTController() *trading.Controller
+	// LiveRouter §P2 实盘路由器（CN+US+CRYPTO 控制器聚合；可空=引擎未接入币安通道）。
+	// /api/binance/* 端点按市场取控制器（下单/撤单/状态/熔断）。
+	LiveRouter() *trading.BrokerRouter
 }
 
 // Server HTTP 服务端，聚合所有依赖组件并注册 REST/SSE 路由。
@@ -636,6 +639,16 @@ func (s *Server) registerRoutes() {
 	// 凭证脱敏回显，持久化走独立 per-user 键 binance_config_json_v1。
 	s.mux.HandleFunc("GET /api/config/binance", s.adminMiddleware(s.handleGetBinanceConfig))
 	s.mux.HandleFunc("POST /api/config/binance", s.adminMiddleware(s.handleSetBinanceConfig))
+
+	// §BINANCE-P2 币安实盘运维端点（PLAN §6.4）：读面 state/orders/exchange_info 只查币安两市场
+	// （CN 快照与撤单仍归 /api/qmt/*）；写面 cancel/halt/disclaimer 全过 adminMiddleware——
+	// halt 只扇出币安控制器（A 股紧急停止互不牵连），disclaimer 是资金安全闩的人工复位口。
+	s.mux.HandleFunc("GET /api/binance/state", s.adminMiddleware(s.handleBinanceState))
+	s.mux.HandleFunc("GET /api/binance/orders", s.adminMiddleware(s.handleBinanceOrders))
+	s.mux.HandleFunc("GET /api/binance/exchange_info", s.adminMiddleware(s.handleBinanceExchangeInfo))
+	s.mux.HandleFunc("POST /api/binance/cancel", s.adminMiddleware(s.handleBinanceCancel))
+	s.mux.HandleFunc("POST /api/binance/halt", s.adminMiddleware(s.handleBinanceHalt))
+	s.mux.HandleFunc("POST /api/binance/disclaimer", s.adminMiddleware(s.handleBinanceDisclaimerPost))
 
 	// 模拟盘（纸面交易）：运营数据统一归属管理员（系统级共享），仅管理员可读写；
 	// 子账号不操作模拟盘，后端鉴权，前端只负责展示与交互。

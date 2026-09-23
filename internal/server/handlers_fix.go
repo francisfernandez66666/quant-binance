@@ -2134,7 +2134,7 @@ func (s *Server) handleFixAction(w http.ResponseWriter, r *http.Request) {
 		}
 		res, err := ctrl.PlaceOrder(trading.OrderRequest{
 			SignalID: signalID, Code: normalizeTsCode(req.Code), Name: s.stockName(req.Code),
-			Side: side, PriceType: ctrl.Config().PriceType, Price: price, Qty: float64(qty), // §P1-d 手动入口保持 CN 整手 int 语义，进契约层转 float
+			Side: side, PriceType: ctrl.QMT().PriceType, Price: price, Qty: float64(qty), // §P1-d 手动入口保持 CN 整手 int 语义，进契约层转 float
 			Amount: float64(qty) * price, CreatedAt: time.Now().Format(time.RFC3339),
 		})
 		if err != nil {

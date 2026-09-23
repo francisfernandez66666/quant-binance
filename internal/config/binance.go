@@ -44,6 +44,11 @@ type BinanceMarketProfile struct {
 	Strategies        []string `json:"strategies"`              // 战法白名单（空=全部）
 	Blacklist         []string `json:"blacklist,omitempty"`     // 下单黑名单
 	QuoteSymbols      []string `json:"quote_symbols,omitempty"` // CRYPTO 监控池
+	// StatusSymbols §P3（market_halt 闸数据腿）：需盯 tradingStatus 证据的代码列表（仅 US 装配生效）。
+	// 空 = 不启动状态 feed = 第 15 道闸保持未装配态（零配置零行为，与 QuoteSymbols 同族缺省纪律）。
+	// English: §P3 symbols whose tradingStatus evidence feeds risk gate 15 (US only; empty = feed
+	// never starts and the gate stays unwired/inert).
+	StatusSymbols []string `json:"status_symbols,omitempty"`
 }
 
 // DefaultBinanceConfig 出厂默认（§4.1 逐键）：总开关关——发布闸要求缺省不接通。
@@ -83,6 +88,7 @@ func NormalizeBinance(b *BinanceConfig) {
 	// 整段缺失（老 config.json 无 binance 键）→ 直接落出厂默认（含 testnet=true 等布尔缺省）。
 	if b.Mode == "" && b.TimeoutSec == 0 && b.QuoteAsset == "" && b.APIKey == "" && b.RiskGate == (RiskGateConfig{}) {
 		*b = d
+		// 出厂默认已含全部键值，此处直接收工不再逐键回填（避免用零值覆盖布尔缺省 testnet=true）。
 		return
 	}
 	if b.Mode == "" {
@@ -188,6 +194,28 @@ func validateBinance(b *BinanceConfig) error {
 		}
 	}
 	return nil
+}
+
+// BaseURL 返回 REST 根地址：testnet=true 时现货走 https://testnet.binance.vision（PLAN §2.1，
+// 美股 equity 无独立 testnet，仍走正式 base 由 Key 权限隔离）。空串=未配置凭证（上层拒绝探活）。
+// English: BaseURL resolves the REST root (spot sandbox on testnet; equity stays on prod base —
+// there is no equity sandbox). Empty means credentials are not configured.
+func (b BinanceConfig) BaseURL() string {
+	if b.APIKey == "" || b.APISecret == "" {
+		return ""
+	}
+	if b.Testnet {
+		return "https://testnet.binance.vision"
+	}
+	return "https://api.binance.com"
+}
+
+// EquityBaseURL 美股 equity 正式根地址（无 testnet 变体，§2.1）。
+func (b BinanceConfig) EquityBaseURL() string {
+	if b.APIKey == "" || b.APISecret == "" {
+		return ""
+	}
+	return "https://api.binance.com"
 }
 
 // —— per-user KV（PLAN §4.4）：账号级隔离，命名空间 binance_config_json_v1 ——

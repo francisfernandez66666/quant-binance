@@ -8,6 +8,9 @@ import ToggleSw from '../components/ToggleSw'
 import * as api from '../api/index.js'
 import { requestPermission, notify as sendNotify } from '../notify.js'
 import { showToast } from '../ui.jsx'
+// §BINANCE-P4（PLAN §11.2 Settings）：币安配置表单（镜像 QMT 表单惯例，api_secret 掩码回显）
+// English: §BINANCE-P4 — Binance config card (mirrors the QMT form conventions).
+import BinanceConfigPanel from '../components/BinanceConfigPanel.jsx'
 
 // 五大战法参数分组定义：每个 group 含标题与字段列表（k=后端字段名, label=展示名, step=步进, type=控件类型, hint=悬浮说明）
 const strategyGroups = [
@@ -476,6 +479,9 @@ export default function Settings() {
   return (
     <div className="page">
       <SectionLabel>设置</SectionLabel>
+
+      {/* §BINANCE-P4 币安接入配置卡：美股 Stocks + 加密现货双子市场的开关/凭证/纪律/风控闸（GET|POST /api/config/binance）*/}
+      <BinanceConfigPanel />
 
       <Card title="服务器连接" style={{ marginBottom: 16 }}>
         <div style={rowStyle}>

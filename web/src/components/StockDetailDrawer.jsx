@@ -12,14 +12,20 @@
 import React, { useState, useEffect } from 'react'
 import * as api from '../api/index.js'
 import MinuteView from './MinuteView.jsx'
+// §BINANCE-P4：代码→市场解析单一来源（纯函数模块，无环依赖）
+import { parseCode } from '../utils.market.js'
 
 // codeEq 归一化比对：兼容 "600000" 与 "600000.SH/.SZ" 两种写法，任一前缀（6 位数字）相同即视为同一标的。
-// English: tolerant code match — treats "600000" and "600000.SH" as the same symbol via its 6-digit prefix.
+// §BINANCE-P4（PLAN §11.2）：6 位前缀假设改调 parseCode（与 Go InferMarketOf 同规则）——
+// 同市场且裸码相等才算同一标的，BTCUSDT/AAPL 等新市场代码不再被 6 位截断误配；CN 行为等价。
+// English: §BINANCE-P4 — parseCode-based match (same market + same bare symbol), replacing the
+// 6-digit prefix heuristic so new-market tickers no longer truncate-match.
 function codeEq(a, b) {
   if (!a || !b) return false
-  // 代码取前 6 位数字做同股比对键
-  const d = (x) => String(x).slice(0, 6)
-  return String(a) === String(b) || d(a) === d(b)
+  if (String(a).toUpperCase() === String(b).toUpperCase()) return true
+  const pa = parseCode(a)
+  const pb = parseCode(b)
+  return pa.market === pb.market && pa.symbol === pb.symbol
 }
 
 // fmtPct 涨跌幅带符号（红涨绿跌色由调用处决定）。English: signed change% string.

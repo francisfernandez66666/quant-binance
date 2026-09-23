@@ -656,7 +656,7 @@ func (e *Engine) pushRealAdvice(md map[string]*strategy_engine.StockMarketData, 
 		_ = res // 摘要日志已在 SweepOrders 内按需打印
 	}
 	// §WS-B 券商交割单三方对账（默认关闭；启用后每日 settle_at 后对账一次，差异告警+可选补记）
-	if sc := ctrl.Config().Settle; sc.Enabled {
+	if sc := ctrl.QMT().Settle; sc.Enabled {
 		ctrl.MaybeSettleDay(data.TradingDayDate(time.Now()), sc.Mode, sc.At, true)
 	}
 
@@ -736,7 +736,7 @@ func (e *Engine) pushRealAdvice(md map[string]*strategy_engine.StockMarketData, 
 		ShortEnabled: e.ShortEnabled(),
 		EmotionPhase: emotionPhase,
 		BearReasons:  bearReasons, // FIX#13 利空归因接线：实盘持仓命中利空 → 止损级建议 → 自动清仓
-		Cfg:          ctrl.Config(),
+		Cfg:          ctrl.QMT(),
 		DiscTracker:  dt, // 统一纪律裁决（探针+扳机）
 		// §PROD-T1（2026-09-18 生产实录）T+1 可卖量装配：可卖 = 持仓 − 当日买入成交
 		// （store.BuyableQtyForUserSell 既有账本口径，与下单闸 §WS-A 同源）。全锁持仓在
@@ -774,7 +774,7 @@ func (e *Engine) pushRealAdvice(md map[string]*strategy_engine.StockMarketData, 
 	// English: regardless of the auto-sell switch, 止损/止盈/减仓 advices also land in the message
 	// center with a P1 strong push — with auto trading off a live TP/SL/trim trip still demands manual
 	// handling; with auto on it confirms the sell fired. Deduped per code/class/trading-day.
-	e.syncLiveAdviceAlerts(sendTo, advices, ctrl.Enabled() && ctrl.Mode() == "auto" && ctrl.Config().AutoSell)
+	e.syncLiveAdviceAlerts(sendTo, advices, ctrl.Enabled() && ctrl.Mode() == "auto" && ctrl.QMT().AutoSell)
 
 	if len(advices) == 0 || sse == nil || sendTo == "" {
 		return
@@ -851,7 +851,7 @@ func pureTsCode(tsCode string) string {
 // (which fail-opens on PrevClose<=0) actually sees market context; without quotes the gate stays
 // fail-open (positions remain exitable) instead of blocking protective sells.
 func (e *Engine) sellRealPosition(ctrl *trading.Controller, p store.RealPosition, qty float64, signalID string, price float64, class, reason string) error {
-	cfg := ctrl.Config()
+	cfg := ctrl.QMT()
 	if qty <= 0 || price <= 0 {
 		return nil
 	}
@@ -930,7 +930,7 @@ func (e *Engine) autoExecuteRealSellsRound(userID string, ctrl *trading.Controll
 	// English: FIX#14 surface the silent sell gate — when stop-loss class advice exists but auto mode
 	// is off, log a throttled warning so "why didn't it auto-sell" is visible (the old early-return
 	// made users believe auto-sell was on while nothing ever fired).
-	gated := !ctrl.Enabled() || ctrl.Mode() != "auto" || !ctrl.Config().AutoSell
+	gated := !ctrl.Enabled() || ctrl.Mode() != "auto" || !ctrl.QMT().AutoSell
 	if gated {
 		for _, a := range advices {
 			if a.Action == "止损" {
@@ -938,12 +938,12 @@ func (e *Engine) autoExecuteRealSellsRound(userID string, ctrl *trading.Controll
 				if ctrl.Enabled() {
 					if ctrl.Mode() != "auto" {
 						reason = "mode-" + ctrl.Mode()
-					} else if !ctrl.Config().AutoSell {
+					} else if !ctrl.QMT().AutoSell {
 						reason = "auto_sell=false"
 					}
 				}
 				log.Printf("[qmt-gate] %s(%s) 止损级建议未自动卖出: %s (mode=%s auto_sell=%v enabled=%v)",
-					a.Code, a.Name, reason, ctrl.Mode(), ctrl.Config().AutoSell, ctrl.Enabled())
+					a.Code, a.Name, reason, ctrl.Mode(), ctrl.QMT().AutoSell, ctrl.Enabled())
 				opslog.DayOnce("auto-sell-gate:"+a.Code, func() {
 					opslog.Logf("quant", "止损级建议未自动卖出 %s(%s) 原因=%s", a.Code, a.Name, reason)
 				})

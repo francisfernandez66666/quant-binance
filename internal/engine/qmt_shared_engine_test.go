@@ -44,7 +44,7 @@ func TestSharedEngineQueuesQMTConfig(t *testing.T) {
 	if !ctrl.ApplyPendingConfig() {
 		t.Fatalf("共享引擎 syncAccountConfig 后待生效队列应为非空（旧实现在 userID==\"\" 时整体跳过）")
 	}
-	if got := ctrl.Config(); got.GatewayURL != "http://new-host:8789" || !got.Enabled {
+	if got := ctrl.QMT(); got.GatewayURL != "http://new-host:8789" || !got.Enabled {
 		t.Fatalf("应用后配置未生效: gateway=%q enabled=%v", got.GatewayURL, got.Enabled)
 	}
 }

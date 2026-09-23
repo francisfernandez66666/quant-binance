@@ -263,3 +263,22 @@ jobs:
           grep -q 'UpdateGate' mobile/app/src/main/java/com/liangzai/quant/MainActivity.kt || { echo "APPVER 原生更新闸未接线"; exit 1; }
           grep -qE 'versionCode = ([2-9]|[1-9][0-9])' mobile/app/build.gradle.kts || { echo "APPVER 版本停在没有更新通道的 1"; exit 1; }
           echo "ok - §20260922-C 批静态锁全过"
+
+      # §BINANCE（2026-09-22~23 多资产迁移）CI 侧静态锁：行为面由 verify_changes.sh §57~§59
+      # 全量覆盖，这里只钉「绝不该回退」的四件事（PLAN §12.3 上线闸的 CI 子集）。
+      - name: §BINANCE 多市场静态锁
+        run: |
+          # 锁① 发布闸：BinanceConfig 顶层出厂缺省必须 enabled=false（子市场档案 true 是被
+          # 顶层闸住的合法形态，故正锁精确行、不做全文件负 grep）
+          grep -q 'Enabled:          false,' internal/config/binance.go || { echo "binance 顶层出厂缺省不再 false（发布闸失守，PLAN §12.3-4）"; exit 1; }
+          # 锁② 第 15 道闸 market_halt 在闸清单内活体在位（US tradingStatus 证据闸，防被摘除/注释化）
+          grep -q '"market_halt", true' internal/risk/gate.go || { echo "market_halt 闸从清单消失（§P3 回退）"; exit 1; }
+          # 锁③ 信号市场章在位且 omitempty（CN 线上报文逐字节不变的序列化级证明）
+          grep -q 'json:"market,omitempty"' internal/strategy/types.go || { echo "Signal.Market 市场章丢失（§P3 信号面回退）"; exit 1; }
+          # 锁④ 历史归档下载器假绿闸：0 命中/批次失败必须非零退出（全 404 静默成功=数据链骗过调度）
+          grep -q '归档 0 命中' scripts/download_binance_klines.py || { echo "binance klines 下载器假绿闸丢失"; exit 1; }
+          grep -q '本轮存在失败批次' scripts/download_alpaca_bars.py || { echo "alpaca 下载器失败退出丢失"; exit 1; }
+          # 锁⑤ /api/binance/state 的 feed 观测节与路由层观测位（缺 feed=空数组，状态面不许假绿）
+          grep -q 'func (r \*BrokerRouter) FeedStats' internal/trading/router.go || { echo "router feed 观测位丢失（§P3 装配回退）"; exit 1; }
+          grep -q 'out\["feeds"\] = lr.FeedStats()' internal/server/binance_api.go || { echo "state 端点 feeds 节脱链"; exit 1; }
+          echo "ok - §BINANCE 多市场静态锁全过"

@@ -67,14 +67,14 @@ func TestMaxOrderAmountConfigAPI(t *testing.T) {
 		t.Fatalf("期望持久化 150000, got %v", got)
 	}
 	// 5) 保存即生效：controller 内存 cfg 同步刷新（不经开关队列、不等休市）
-	if got := ctrl.Config().RiskGate.MaxOrderAmount; got != 150000 {
+	if got := ctrl.QMT().RiskGate.MaxOrderAmount; got != 150000 {
 		t.Fatalf("UpdateConfig 应即时生效：期望 ctrl 读到 150000, got %v（若滞留队列此值为 0）", got)
 	}
 	// 6) 帽=0 显式关闭同样往返生效
 	if rr := adminDo(s, adminReq(s, admin, http.MethodPost, "/api/config/qmt", `{"max_order_amount":0}`)); rr.Code != 200 {
 		t.Fatalf("关闭帽期望 200, got %d", rr.Code)
 	}
-	if got := ctrl.Config().RiskGate.MaxOrderAmount; got != 0 {
+	if got := ctrl.QMT().RiskGate.MaxOrderAmount; got != 0 {
 		t.Fatalf("显式关闭应即时生效, got %v", got)
 	}
 }

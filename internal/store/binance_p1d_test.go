@@ -4,6 +4,7 @@
 //   - 判重保护跨重建存活（idx_fills_idem_notid 复合键仍拒重复回报）；
 //   - 碎股/加密小数全链路往返（ApplyRealFill → fills/real_positions → SumFilledQty）；
 //   - roundQty 三市场口径 + QTY 序列化兼容（整数值 JSON 串与旧 int 逐字节同「无小数点」）。
+//
 // English: P1-d regression — legacy INTEGER qty rebuilt to REAL losslessly (indexes, autoincrement,
 // all carried columns), idempotent re-open, replay-dedup survives the rebuild, fractional fills
 // round-trip, and roundQty/JSON-serialization per-market contracts.

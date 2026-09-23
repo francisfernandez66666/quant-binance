@@ -14,6 +14,9 @@ import { Card, Form, Input, Button, Tag, Table, MessagePlugin } from 'tdesign-re
 import * as api from '../api/index.js'
 import { confirmDialog } from '../ui.jsx'
 import { fmtCNY2 } from '../utils'
+// §BINANCE-P4（PLAN §11.2 Quant 执行路径卡扩）：QMT 状态卡之外并列 Binance 状态卡
+// （disclaimer/WS 订阅数/限速余量；端点未上线时 fail-soft 降级展示配置摘要）。
+import BinanceStatusCard from '../components/BinanceStatusCard.jsx'
 import { verdictDisplay } from './quantVerdicts.js'
 
 // 战法分组标签：form=内置形态战法、factor=因子战法、pattern=形态自动发现战法。
@@ -1068,6 +1071,9 @@ export default function Quant() {
 
       {/* 链路状态卡片：显示网关地址/熔断状态/紧急停止(kill-switch)/运行模式/执行路径切换 */}
       {renderChainStatusCard()}
+
+      {/* §BINANCE-P4 币安接入状态卡（与 QMT 双卡并列，双轮询 60s，fail-soft） */}
+      <BinanceStatusCard />
 
       {/* §U-2 当日委托卡：撤单按钮的宿主（order_id 数据源） */}
       {renderOrdersCard()}

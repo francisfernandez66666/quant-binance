@@ -17,6 +17,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -32,6 +33,7 @@ import (
 	"quant-trading-v2/internal/paper"
 	"quant-trading-v2/internal/report"
 	"quant-trading-v2/internal/research"
+	"quant-trading-v2/internal/risk"
 	"quant-trading-v2/internal/sector_agent"
 	"quant-trading-v2/internal/server"
 	"quant-trading-v2/internal/store"
@@ -883,6 +885,103 @@ func (r *Registry) build(userID string) *Engine {
 		if userID != "" {
 			e.SetQMTCfgSource(userID)
 		}
+		// §P2（PLAN §6.3）币安双市场控制器装配：binance.enabled 且子市场开关开时，US/CRYPTO
+		// 各建一个控制器（独立熔断/风控闸/待生效队列，市场级隔离），与 CN 控制器一起聚合进
+		// BrokerRouter 注入引擎。出厂默认（enabled=false）路由器只含 CN——行为与单通道时代一致。
+		// ShadowExec（staging 影子）是 QMT 语义，不覆盖币安链；凭证缺失时币安控制器落 Noop
+		// （记账不真下，fail-safe）。
+		// English: §P2 builds one binance controller per enabled market view (own breaker/gate/pending
+		// queue) and registers them with the router alongside CN; with the factory-off default the router
+		// degenerates to the legacy CN-only channel.
+		liveRouter := trading.NewBrokerRouter(ctrl)
+		bnCfg := *opts.CfgMgr.GetBinanceConfigFor(userID)
+		if bnCfg.Enabled && !opts.ShadowExec {
+			for _, mkt := range []string{"US", "CRYPTO"} {
+				view := config.BinanceBrokerView{Cfg: bnCfg, Market: mkt}
+				if !view.BrokerEnabled() {
+					continue // 子市场开关关：不装配
+				}
+				var bexec trading.Executor = trading.NoopExecutor{}
+				if view.Cfg.APIKey != "" && view.Cfg.APISecret != "" {
+					bexec = trading.NewBinanceExecutor(view)
+				} else {
+					log.Printf("[engine] 账号 %s 币安 %s 已启用但凭证缺失，executor 落 Noop（记账不真下）", userID, mkt)
+				}
+				bctrl := trading.NewController(bexec, opts.RealStore, userID, view, onAlert, "binance")
+				if opts.Coordinator != nil {
+					bctrl.SetCrossPriceSource(opts.Coordinator.CrossCheckPrice) // §XCHECK 同 CN 接线
+				}
+				// §P2 真实执行器在场时的两条必经接线（缺一形同虚设）：
+				//  ① exchangeInfo→风控闸规则源：min_notional/lot_precision 两闸的数据腿——不接则
+				//     两闸恒 fail-open，碎量/低于最小名义额的单可穿透（PLAN §9 矩阵要求活闸）；
+				//  ② 回报接收器：listenKey+WS+REST 差分三条腿（Dial 暂缺省=REST-only 轮询形态，
+				//     WS 快腿随装配层 dialer 注入升级；凭证热变更需重启引擎重建，边界与 QMT 网关同源）。
+				if bnExec, isReal := bexec.(*trading.BinanceExecutor); isReal {
+					bctrl.SetSymbolRulesSource(func(symbol string) (risk.SymbolRules, error) {
+						rules, ok := bnExec.SpotRules(symbol)
+						if !ok {
+							return risk.SymbolRules{}, fmt.Errorf("币安 exchangeInfo 规则不可得 %s", symbol)
+						}
+						return rules, nil
+					})
+					rep, rerr := trading.NewBinanceReporter(trading.BinanceReporterOptions{
+						Exec: bnExec, DB: opts.RealStore, UserID: userID, Market: mkt,
+						OnAlert: onAlert,
+					})
+					if rerr != nil {
+						log.Printf("[engine] 账号 %s 币安 %s 回报接收器构造失败（回报链停用）: %v", userID, mkt, rerr)
+					} else {
+						liveRouter.RegisterReporter(mkt, rep)
+					}
+				}
+				// §P3 行情/状态 feed 装配（PLAN §2.4 + §9 market_halt 数据腿；与凭证无关——
+				// Noop 控制器照样需要行情观测，闸证据更不许因为"没配 APIKey"就消失）：
+				//  ① 行情 feed：quote_symbols 非空才起流；Dial=StdWsDial（纯标准库拨号器，
+				//     go.mod 零 ws 依赖）；观测闭包注册进路由，/api/binance/state 直接呈现；
+				//  ② 状态 feed（仅 US）：status_symbols 非空才起流，GateSource 注入控制器第 15 闸；
+				//     空档=不装配=闸惰性（零配置零行为，出厂默认不变）。
+				prof := bnCfg.Spot
+				if mkt == "US" {
+					prof = bnCfg.Stock
+				}
+				if len(prof.QuoteSymbols) > 0 {
+					qfeed, qerr := data.NewBinanceQuoteFeed(data.BinanceQuoteFeedOptions{
+						Market: mkt, Symbols: prof.QuoteSymbols, Dial: data.StdWsDial,
+					})
+					if qerr != nil {
+						log.Printf("[engine] 账号 %s 币安 %s 行情 feed 构造失败（该市场无实时快照）: %v", userID, mkt, qerr)
+					} else {
+						qfeed.Start()
+						liveRouter.RegisterFeed("quotes-"+strings.ToLower(mkt), mkt, func() trading.FeedStat {
+							recv, _, _, _ := qfeed.Stats()
+							return trading.FeedStat{Name: "quotes-" + strings.ToLower(mkt), Market: mkt,
+								Healthy: qfeed.Healthy(), SilenceMs: qfeed.SilenceMs(), Frames: recv}
+						})
+					}
+				}
+				if mkt == "US" && len(prof.StatusSymbols) > 0 {
+					sfeed, serr := data.NewBinanceStatusFeed(data.BinanceStatusFeedOptions{
+						Symbols: prof.StatusSymbols, Dial: data.StdWsDial,
+					})
+					if serr != nil {
+						log.Printf("[engine] 账号 %s 币安 US 状态 feed 构造失败（market_halt 闸保持未装配=拒单由 fail-close 兜底）: %v", userID, serr)
+					} else {
+						sfeed.Start()
+						bctrl.SetHaltEvidenceSource(sfeed.GateSource())
+						liveRouter.RegisterFeed("status-us", "US", func() trading.FeedStat {
+							return trading.FeedStat{Name: "status-us", Market: "US",
+								Healthy: sfeed.Healthy(), SilenceMs: sfeed.SilenceMs(), Frames: sfeed.Frames(),
+								Unconfirmed: sfeed.Store().Unconfirmed(), MissCount: sfeed.Store().MissCount()}
+						})
+					}
+				}
+				liveRouter.Register(mkt, bctrl)
+				log.Printf("[engine] 账号 %s 币安 %s 实盘控制器装配完成 (mode=%s testnet=%v)", userID, mkt, view.BrokerMode(), bnCfg.Testnet)
+			}
+		}
+		e.SetLiveRouter(liveRouter)
+		// 回报接收器随引擎启动（进程级生命周期，与引擎共存亡；单腿失败内部降级不阻塞）。
+		liveRouter.StartReporters()
 	}
 	// 账号开关初始化（按共享组配置固化到引擎，运行期不随单账号变化）
 	ls := opts.CfgMgr.GetLongShortConfigFor(userID)

@@ -15,6 +15,11 @@ import { createStaleGuard } from '../utils/staleGuard.js' // §M-10 轮询后到
 // English: §H-2 — showToast was called without being imported; the save-failure branch died
 // with an uncaught ReferenceError (no toast at all). Import added.
 import { showToast } from '../ui.jsx'
+// §BINANCE-P4（PLAN §11.2 Positions）：市场维度工具——实盘持仓按 Tab 过滤、金额/数量按行内 market 格式化
+// （CN ¥两位 / US $两位 / CRYPTO $去尾零；CN 整手数量 vs 小数条数）。
+// English: §BINANCE-P4 — market-aware filtering/formatting for the real-positions table.
+import { fmtMoneyM, fmtQty, parseCode } from '../utils.market.js'
+import { useMarket } from '../market.jsx'
 
 // 持仓与资金数据的 localStorage 缓存键
 const CACHE_KEY = 'pos_cache_v1'
@@ -68,6 +73,10 @@ export default function Positions() {
   const [qmtState, setQmtState] = useState({ enabled: false, mode: 'manual', tripped: false, gateway_url: '' })
   // 实盘持仓列表
   const [realPositions, setRealPositions] = useState([])
+  // §BINANCE-P4：全局市场 Tab（ALL 恒不过滤，CN 链路零回归）；行内 market 缺失时按代码形态兜底推断
+  // English: global market tab; rows without an explicit market fall back to code-shape inference.
+  const { market: marketTab, match: marketMatch } = useMarket()
+  const rowMarket = (row) => row.market || parseCode(row.ts_code || row.code).market
   // 实盘账户资产（广州 QMT 上报的可用资金/冻结/总值/市值）
   const [realAccount, setRealAccount] = useState(null)
   // 实盘整体盈亏（/api/qmt/trades summary：realized/unrealized/total_pnl）——页头优先展示
@@ -670,12 +679,12 @@ export default function Positions() {
   const realColumns = [
     { colKey: 'ts_code', title: '代码', width: 90, cell: ({ row }) => <span style={{ color: 'var(--app-accent)', fontFamily: 'monospace' }}>{row.ts_code}</span> },
     { colKey: 'name', title: '名称', width: 90, cell: ({ row }) => <span style={{ color: 'var(--app-faint)' }}>{row.name}</span> },
-    { colKey: 'qty', title: '数量', width: 70, sorter: (a, b) => (a.qty || 0) - (b.qty || 0), cell: ({ row }) => row.qty },
-    { colKey: 'cost_price', title: '成本价', width: 90, sorter: (a, b) => (a.cost_price || 0) - (b.cost_price || 0), cell: ({ row }) => (row.cost_price != null ? '¥' + Number(row.cost_price).toFixed(3) : '-') },
-    { colKey: 'cur_price', title: '现价', width: 90, sorter: (a, b) => curPrice(a) - curPrice(b), cell: ({ row }) => curPrice(row) ? '¥' + curPrice(row).toFixed(2) : '—' },
+    { colKey: 'qty', title: '数量', width: 70, sorter: (a, b) => (a.qty || 0) - (b.qty || 0), cell: ({ row }) => <span title={rowMarket(row) === 'CRYPTO' ? '枚' : '股'}>{fmtQty(row.qty, rowMarket(row))}</span> },
+    { colKey: 'cost_price', title: '成本价', width: 90, sorter: (a, b) => (a.cost_price || 0) - (b.cost_price || 0), cell: ({ row }) => (row.cost_price != null ? (rowMarket(row) === 'CN' ? '¥' + Number(row.cost_price).toFixed(3) : fmtMoneyM(row.cost_price, rowMarket(row))) : '-') },
+    { colKey: 'cur_price', title: '现价', width: 90, sorter: (a, b) => curPrice(a) - curPrice(b), cell: ({ row }) => curPrice(row) ? fmtMoneyM(curPrice(row), rowMarket(row)) : '—' },
     // §F1 实盘持仓盈亏按 realPnlPct 派生值排序（成本价×数量的浮盈率），与展示口径一致
     { colKey: 'pnl', title: '持仓盈亏', width: 90, sorter: (a, b) => realPnlPct(a) - realPnlPct(b), cell: ({ row }) => <span style={{ color: realPnlPct(row) >= 0 ? 'var(--app-up)' : 'var(--app-down)', fontWeight: 600 }}>{row.cost_price > 0 && curPrice(row) ? (realPnlPct(row) > 0 ? '+' : '') + realPnlPct(row).toFixed(2) + '%' : '—'}</span> },
-    { colKey: 'highest_price', title: '最高价', width: 90, sorter: (a, b) => (a.highest_price || 0) - (b.highest_price || 0), cell: ({ row }) => <span>¥{row.highest_price != null ? Number(row.highest_price).toFixed(2) : '—'}</span> },
+    { colKey: 'highest_price', title: '最高价', width: 90, sorter: (a, b) => (a.highest_price || 0) - (b.highest_price || 0), cell: ({ row }) => <span>{row.highest_price != null ? fmtMoneyM(row.highest_price, rowMarket(row)) : '—'}</span> },
     { colKey: 'advice', title: '建议', width: 80, cell: ({ row }) => { const a = adviceFor(row.ts_code); if (!a) return <span style={{ color: 'var(--app-border)' }}>—</span>; const theme = { add: 'danger', reduce: 'warning', tp: 'success', close: 'success', hold: 'default' }[a.action] || 'default'; return <Tag theme={theme} size="small">{a.label}</Tag> } },
     //  实盘操作列：加仓/减仓/止盈/清仓（熔断时禁用） 
     { colKey: 'actions', title: '操作', width: 200, cell: ({ row }) => (
@@ -812,7 +821,7 @@ export default function Positions() {
             </Card>
           ) : (
             <Card>
-              <Table data={realPositions} columns={realColumns} rowKey="ts_code" size="small" pagination={{ defaultPageSize: 20, pageSizeOptions: [20, 50, 100] }} />
+              <Table data={realPositions.filter((p) => marketMatch(p.market, p.ts_code))} columns={realColumns} rowKey="ts_code" size="small" pagination={{ defaultPageSize: 20, pageSizeOptions: [20, 50, 100] }} />
             </Card>
           )}
           </>

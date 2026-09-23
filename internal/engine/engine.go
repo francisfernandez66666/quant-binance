@@ -218,9 +218,10 @@ type Engine struct {
 	// English: live trading (AUTO_TRADING_PLAN M1) — QMT controller + real-book store, independent of the
 	// paper book. Only active when qmt.enabled=true: reads real_positions for position advice, circuit
 	// breaking and auto-orders each 5s cycle.
-	qmtCtrl   *trading.Controller // QMT 执行控制器（下单/熔断/健康探测，可空=未启用）
-	realStore *store.DB           // 实盘账本库（live.db：real_positions/orders/fills 存取）
-	d1Store   *store.DB           // D1 评分历史库（trading.db：d1_scores 落库，与研究数据同库）
+	qmtCtrl    *trading.Controller   // QMT 执行控制器（下单/熔断/健康探测，可空=未启用）
+	liveRouter *trading.BrokerRouter // §P2 实盘路由（CN+US+CRYPTO 控制器扇出；可空=未接入币安，CN 单通道旧语义）
+	realStore  *store.DB             // 实盘账本库（live.db：real_positions/orders/fills 存取）
+	d1Store    *store.DB             // D1 评分历史库（trading.db：d1_scores 落库，与研究数据同库）
 
 	// §SIGNAL_CONTROLLER 20260917：实盘买入确认状态机（原 buyConfirmReal + realBuyConfirmPass）
 	// 已迁到信号控制器（internal/signalctl）live 通道——战法白名单/黑名单/个股/板块黑名单/持续性
@@ -946,6 +947,18 @@ func (e *Engine) syncAccountConfig() {
 		// ApplyPendingConfig 消费（重建 executor）。防止休市时配置立即翻转实盘行为。
 		c.QueueConfigUpdate(q)
 	}
+	// §P2 币安配置热同步（与 QMT 同源惯例）：账号级 GetBinanceConfigFor 每轮刷进各币安控制器的
+	// 待生效队列，按市场视图（US/CRYPTO）注入 BinanceBrokerView；消费点在 BrokerRouter.
+	// MaintenanceBinance 的市场会话门内。CN 打分循环的休市早退不影响此队列（只入队即可）。
+	if lr := e.LiveRouter(); lr != nil && qmtSrc != "" {
+		bn := *cfgMgr.GetBinanceConfigFor(qmtSrc)
+		for _, c := range lr.All() {
+			if c.Broker() != "binance" {
+				continue
+			}
+			c.QueueConfigUpdate(config.BinanceBrokerView{Cfg: bn, Market: c.MarketKey()})
+		}
+	}
 	// §GAP5.1→§FIX-7(20260919)：日预算同步已从打分循环移除——LLM 客户端是进程级共享实例，
 	// 各引擎按自己的 userRules 反复 SetBudgets 会互相覆盖（谁最后刷分谁说了算，且咨询/
 	// 共享路径可能整体跳过，见旧守卫 engine.go:858）。预算现由配置装配（llmcfg.Resolve→New）
@@ -1036,6 +1049,21 @@ func (e *Engine) QMTController() *trading.Controller {
 	e.mu.RLock()
 	defer e.mu.RUnlock()
 	return e.qmtCtrl
+}
+
+// SetLiveRouter §P2 注入实盘路由器（CN+US+CRYPTO 控制器扇出入口；nil=未接入币安，维持 CN 单通道）。
+// 由 registry 引擎装配尾段调用；维护扇出（MaintenanceBinance）挂主循环每轮，子步各自内部节流。
+func (e *Engine) SetLiveRouter(r *trading.BrokerRouter) {
+	e.mu.Lock()
+	e.liveRouter = r
+	e.mu.Unlock()
+}
+
+// LiveRouter 返回实盘路由器（HTTP 层 /api/binance/* 端点消费；可空=未接入）。
+func (e *Engine) LiveRouter() *trading.BrokerRouter {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	return e.liveRouter
 }
 
 // paperSignals 把本轮翻转信号 + 卖出侧纪律信号（止损/止盈/移动止盈）送入模拟盘撮合。
@@ -1130,7 +1158,7 @@ func (e *Engine) liveSignalPolicy() signalctl.Policy {
 	ctrl, cfgMgr, uid := e.qmtCtrl, e.cfgMgr, e.userID
 	e.mu.RUnlock()
 	if ctrl != nil {
-		q := ctrl.Config()
+		q := ctrl.QMT() // §P2 QMT 专属字段（策略白名单/黑名单/纪律）经 QMT() 快照读取；币安控制器返回零值不参与本 CN 通道
 		pol.Strategies = q.Strategies
 		pol.CodeBlacklist = q.Blacklist
 		pol.Discipline = q.Discipline
@@ -1333,7 +1361,7 @@ func (e *Engine) autoPlace(sig combat_agent.Signal, live map[string]*data.StockI
 		})
 		return
 	}
-	cfg := ctrl.Config()
+	cfg := ctrl.QMT() // §P2 CN auto 买入腿只读 QMT 专属字段（FixedAmount/StrategyAmounts/PriceType…）
 	// §SIGNAL_CONTROLLER 20260917：此处原内联白名单（含 §20260917 热修键统一）已删除——
 	// 战法准入统一由信号控制器 live 通道裁定（dispatchLive 唯一喂入），执行层不再比对名单，
 	// 双写漂移（autoPlace 一份、risk.Gate 一份）就此终结。
@@ -4088,6 +4116,13 @@ func (e *Engine) Run(ctx context.Context, since time.Time) *strategy_engine.Stra
 	// 同步本账号配置（做多/做空开关 + 战法参数），保证账号内各设备一致
 	// English: sync this account's config (long/short toggles + strategy params) for cross-device consistency.
 	e.syncAccountConfig()
+	// §P2 币安控制器维护扇出（主循环每轮，子步内部自节流）：CRYPTO 7×24 无 A 股会话门，
+	// 其健康探测/撤单闭环/对账/待生效配置必须独立于 CN 打分循环的 IsActiveSession 早退。
+	// English: binance maintenance fan-out each main-loop round — CRYPTO is 7x24 and cannot live
+	// behind the A-share session gate of the CN scoring loop.
+	if lr := e.LiveRouter(); lr != nil {
+		lr.MaintenanceBinance(time.Now())
+	}
 	// §MARKET_RISK_GATE P6：每日一次校准宏观日历真实发布日（进程级去重、失败静默降级、非阻塞主流程）。
 	e.calibrateMacroCalendarOnceToday()
 

@@ -51,6 +51,16 @@ type OrderRequest struct {
 	// Market §P1-e 订单所属市场（""/CN=存量 QMT 链——omitempty 使 /order 报文逐字节不变，
 	// 网关契约零改动；US/CRYPTO 由 Phase 2 BrokerRouter 按此键分发到 BinanceExecutor）。
 	Market string `json:"market,omitempty"`
+	// —— §P2（PLAN §6.2）美股 equity 专用四字段（CN/CRYPTO 侧忽略，omitempty 保证
+	// QMT /order 报文逐字节不变）——
+	// TradingSession RTH|EXTENDED|24H：美股 LIMIT 必填、MARKET 禁填（四格矩阵 §2.2）。
+	TradingSession string `json:"trading_session,omitempty"`
+	// TimeInForce 美股 DAY|GTC（GTC 仅 LIMIT；碎股 GTC 必须配 EXTENDED/24H，486441/486442 族）。
+	TimeInForce string `json:"time_in_force,omitempty"`
+	// Notional 美股 MARKET BUY 的按金额下单额度（USD/USDC 计；禁与 price/quantity 同现）。
+	Notional float64 `json:"notional,omitempty"`
+	// QuoteAsset 美股计价币（缺省 USDC；由 BinanceExecutor 从 profile 回填）。
+	QuoteAsset string `json:"quote_asset,omitempty"`
 }
 
 // OrderResult 下单返回（网关 → 首尔）。

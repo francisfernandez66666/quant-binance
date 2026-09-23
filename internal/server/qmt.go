@@ -454,7 +454,7 @@ func (s *Server) handleExecuteAction(w http.ResponseWriter, r *http.Request) {
 		Name:      s.stockName(req.Code),
 		Strategy:  req.Strategy,
 		Side:      side,
-		PriceType: ctrl.Config().PriceType,
+		PriceType: ctrl.QMT().PriceType,
 		Price:     req.Price,
 		Qty:       float64(qty), // §P1-d 手动委托入口暂留 int（CN 整手语义）
 		Amount:    float64(qty) * req.Price,
@@ -575,11 +575,11 @@ type qmtReportEvent struct {
 	// 币安通道回报自带 market，positions 全量对账/成交/委托落库都按此盖章并做市场隔离删除。
 	// English: §BINANCE-P1c — market of this report; legacy QMT gateways omit it and the
 	// server normalizes the zero value to CN (byte-compatible), Binance channels send it explicitly.
-	Market    string               `json:"market"`
-	At        string               `json:"at"`
-	UserID    string               `json:"user_id"` // §GAP1.10 网关配置的归属账号
-	Broker    string               `json:"broker"`  // §QMT-DUAL 通道切换事件：目标通道
-	From      string               `json:"from"`    // §QMT-DUAL 通道切换事件：来源通道
+	Market string `json:"market"`
+	At     string `json:"at"`
+	UserID string `json:"user_id"` // §GAP1.10 网关配置的归属账号
+	Broker string `json:"broker"`  // §QMT-DUAL 通道切换事件：目标通道
+	From   string `json:"from"`    // §QMT-DUAL 通道切换事件：来源通道
 }
 
 // handleQMTReport 接收网关回报（POST /api/qmt/report，Bearer token 鉴权）。

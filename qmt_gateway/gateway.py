@@ -132,7 +132,11 @@ CONTRACT_CONSUMED_FIELDS = {
 }
 # §P1-e（2026-09-22）market：OrderRequest 新增的市场键（""/CN 时 Go omitempty 不上送，
 # 存量报文逐字节不变）；QMT 网关只服务 A 股账户，键出现即属分发错误 payload，网关不复算。
-CONTRACT_IGNORED_FIELDS = {"name", "strategy_id", "staleness_ms", "prev_close", "current_price", "market"}
+# §P2/§P3（2026-09-23）币安四字段 notional/quote_asset/time_in_force/trading_session：
+# 美股/现货执行器专属参数（BinanceExecutor 直连消费，同 market 一样绝不误派 QMT 通道）；
+# 进 ignored 声明集即 §A2 三点锁合法形态——漏声明 go test 红，漏进 golden pytest 红。
+CONTRACT_IGNORED_FIELDS = {"name", "strategy_id", "staleness_ms", "prev_close", "current_price", "market",
+                           "notional", "quote_asset", "time_in_force", "trading_session"}
 
 # §SIDEGATE-PY（2026-09-22 修复批，M-1 升级 H-5）下单方向白名单：网关接单的唯一合法取值集。
 # 与 Go internal/trading 的 SideBuy/SideSell、桥侧 BUY/SELL（\\u 转义）以及 handler 的方向

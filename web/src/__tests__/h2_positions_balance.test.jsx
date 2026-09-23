@@ -30,6 +30,7 @@ const { state } = vi.hoisted(() => ({
   },
 }))
 
+// §H2 余额链桩：保留 api/index.js 其余真实导出，只替换 updateHoldingsBalance 为可控 promise
 vi.mock('../api/index.js', async () => {
   const actual = await vi.importActual('../api/index.js')
   return {

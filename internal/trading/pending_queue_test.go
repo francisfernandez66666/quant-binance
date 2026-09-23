@@ -52,7 +52,7 @@ func TestApplyPendingConfig_DisabledStaysNoop(t *testing.T) {
 	if c.execIsClient() {
 		t.Fatalf("停用配置不得切换为网关客户端")
 	}
-	if c.Config().Enabled {
+	if c.QMT().Enabled {
 		t.Fatalf("应用后 cfg 应为停用语义")
 	}
 	if c.ApplyPendingConfig() {
@@ -76,7 +76,7 @@ func TestApplyPendingConfig_EnableSwitchesToClient(t *testing.T) {
 	if !c.execIsClient() {
 		t.Fatalf("开启配置应用后 executor 应切换为 QMTClient")
 	}
-	if got := c.Config(); got.Enabled != true || got.GatewayURL != "http://127.0.0.1:18789" {
+	if got := c.QMT(); got.Enabled != true || got.GatewayURL != "http://127.0.0.1:18789" {
 		t.Fatalf("应用后 cfg 未生效: enabled=%v url=%q", got.Enabled, got.GatewayURL)
 	}
 	// 停用配置入队 → 下一个交易时段回退 Noop。

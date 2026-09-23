@@ -23,6 +23,10 @@ import { dispatch as sseDispatch } from './sseBus.js'
 import { isNative, canNotify, requestPermission, notify as sendNotify, notifyThrottled } from './notify.js'
 import { showToast, showNotify } from './ui.jsx'
 import { sseOpsAlert, versionMismatchNotice } from './utils.js'
+// §BINANCE-P4（PLAN §11.2 全局）：市场维度——顶栏市场 Tab（全部|A股|美股|加密货币），
+// 当前市场经 MarketProvider 下发（?m= 持久化），持仓/量化等页据此过滤与格式化。
+// English: §BINANCE-P4 — global market switcher (All|CN|US|Crypto) with ?m= persistence.
+import { MarketProvider, MarketTabs } from './market.jsx'
 
 // §A7（20260918 审计批）本地构建指纹：vite define 在构建期把 __BUILD_COMMIT__ 文本替换为
 // git 短 SHA 字符串字面量（见 vite.config.js）。dev/undefined 走哨兵值不参与比对。
@@ -452,6 +456,7 @@ export default function App() {
   // 顶栏/侧栏/登录页仍在边界外。
   return (
     <ErrorBoundary>
+    <MarketProvider>
     <ConfigProvider>
       {/* 安全兜底：理论上进入主布局时 loggedIn 必为 true，此处保留登录页分支以防状态竞态 */}
       {/* 登录兜底分支：表单结构（服务器地址/账号/密码/登录按钮）与上方未登录视图一致，
@@ -501,6 +506,8 @@ export default function App() {
             <div style={{ display: 'flex', alignItems: 'center', gap: 12, fontSize: 13 }}>
               {/* 汉堡按钮：点击切换侧边栏显隐（移动端抽屉式） */}
               <div className="hamburger" onClick={() => setMenuOpen((o) => !o)}><span></span><span></span><span></span></div>
+              {/* §BINANCE-P4 市场切换 Tab：全站唯一入口，选中态经 ?m= 与 localStorage 双持久化 */}
+              <MarketTabs />
               {/* 量化活跃窗口指示：active=true 表示交易日 9:15-15:30（广州生产节点）引擎活跃；否则静默释放性能 */}
               <span>{activeWindow !== null && (activeWindow ? '🟢 量化活跃 9:15-15:30' : '🌙 静默释放')}</span>
               {/* 后端服务连通状态文字提示 */}
@@ -683,6 +690,7 @@ export default function App() {
       {/*
        * ConfigProvider 提供全局主题与组件上下文；ErrorBoundary 兜底任意渲染错误，避免白屏，下方标签逐一闭合 */}
     </ConfigProvider>
+    </MarketProvider>
     {/*
      * ErrorBoundary 收尾：主布局包裹层闭合 */}
     </ErrorBoundary>

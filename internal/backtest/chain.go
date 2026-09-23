@@ -117,6 +117,10 @@ type Options struct {
 	// 滑点 5bp 双边、卖出印花税 0.05%，与模拟盘/btreplay 同源）。零值时 Run 自动填充默认值。
 	// English: trading-cost model; Run fills the default when left zero-valued.
 	Cost CostModel
+	// Market §BINANCE-P4 回测市场维度（""/CN=存量 A 股链；US/CRYPTO 选择对应成本/代号口径）。
+	// 仅影响 Cost 缺省选形，其余链路（事件合成/评分）保持 CN 语义直至 Phase 3 数据源接线。
+	// English: backtest market key — selects the default cost model shape; "" = CN legacy identity.
+	Market string
 	// OnProgress 可选进度回调（已处理事件数/总事件数）。供 CLI/HTTP 上报回测进度，
 	// 前端据此渲染"全链路回测进度条"。nil 时不回调。
 	// English: optional progress callback (events done / total). Lets the CLI/HTTP layer report
@@ -174,8 +178,9 @@ func Run(db *store.DB, opts Options) (*ChainReport, error) {
 		opts.Rule.MinCover = 0.5
 	}
 	// B4 成本模型：未显式配置时使用与模拟盘/btreplay 同源的默认成本（佣金万2.5+最低5元、滑点5bp、印花税0.05%）。
+	// §BINANCE-P4：默认档按 opts.Market 选形（CN 与旧 DefaultCostModel 逐字节等价；US/CRYPTO 走 cost_market.go）。
 	if opts.Cost == (CostModel{}) {
-		opts.Cost = DefaultCostModel()
+		opts.Cost = CostModelForMarket(opts.Market)
 	}
 	maxH := 0
 	for _, h := range opts.Horizons {

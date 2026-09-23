@@ -108,6 +108,13 @@ const (
 	QuoteSourceEastMoney    = "eastmoney" // 降级链：东财末位兜底命中
 	QuoteSourceHithinkBatch = "同花顺（新）"    // fetcher 批量轮主导来源标注（中文，历史口径）
 	QuoteSourceQMTL1        = "QMT-L1"    // §ENH-5 Level-1 feed 合并注入
+	// §BINANCE-P3 多资产源名（Agent B 缺陷⑥收口）：BINANCE-SPOT/BINANCE-STK 曾以 var 悬在
+	// binance_quotes_feed.go 里绕开本枚举——/api/status 白名单巡检会把它判成枚举外源名。
+	// 定义必须留在本常量块且带字面量：quote_sources_contract_test.go 的 AST 扫描器只从
+	// **本包 const 块 + QuoteSource* 前缀 + BasicLit 字面量** 收集枚举，写入点右值同样
+	// 只认常量 Ident（动态表达式如 f.SourceTag() 会被判"绕开契约"）。
+	BinanceQuoteSourceSpot = "BINANCE-SPOT" // CRYPTO 现货快照源名（PLAN §7）
+	BinanceQuoteSourceUS   = "BINANCE-STK"  // US 美股快照源名（PLAN §7 的 BINANCE-STK）
 )
 
 // AllQuoteSources 返回全部合法的行情源名取值（golden 契约的 Go 侧镜像）。
@@ -123,6 +130,8 @@ func AllQuoteSources() []string {
 		QuoteSourceEastMoney,
 		QuoteSourceHithinkBatch,
 		QuoteSourceQMTL1,
+		BinanceQuoteSourceSpot,
+		BinanceQuoteSourceUS,
 	}
 }
 

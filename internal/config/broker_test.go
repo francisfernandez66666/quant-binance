@@ -6,8 +6,11 @@ import (
 	"testing"
 )
 
+// TestQMTConfigBrokerAccessors §P1-a BrokerConfig 接口锁：QMTConfig 逐键转发
+// （enabled/mode/halted/撤单秒/固定金额等）与视图方法必须与原直读字段口径一致——
+// Controller 泛化消费后，这里钉住「CN 行为字节不变」的配置面契约。
 func TestQMTConfigBrokerAccessors(t *testing.T) {
-	t1 := true
+	t1 := true // halted 显式置位样本（区分 false 零值与未设置）
 	q := QMTConfig{
 		Enabled:           true,
 		Mode:              "auto",

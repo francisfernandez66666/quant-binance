@@ -17,6 +17,8 @@
 #     + 二波（2026-09-22 当日续）：§M1 golden 源契约单源（见 38）+ §M2/§M3 降级报成功族（见 39）+ §M6/§TZ/§REJECT 数据管道 py 批（见 40）+ §M8 推送三通道内聚/EXPVAR 收权（见 41）+ §M9/§M10/M11 快照与落盘批（见 42）+ §M7 部署清单收编（见 43）+ §M12/§M13 前端与移动壳一致性 + researchd 冒烟（见 44）
 #     + C批（2026-09-22 晚间，owner 裁决清单四件套）：§XCHECK 价格复核闸接线/CrossCheckPrice 收编（见 45）+ §NATIVEAUTH 登录 token 迁原生加密存储（见 46）+ §ROOTQMT 根级死键防回潮 + §APPVER APK 服务端驱动强制更新（见 47））
 #   + 2026-09-22 §BINANCE Phase 1 多市场地基（PLAN_BINANCE_MULTI_ASSET：BrokerConfig/rules.binance/store 市场迁移/Qty float64/时段+风控 14 闸×3 市场矩阵，见 57）
+#     + 2026-09-23 §BINANCE Phase 2 执行/回报/隔离（BinanceExecutor 契约 golden 7 格/binance_report 三条腿/§15.2 ForMarket 隔离/运维端点 6 条，见 58）
+#     + 2026-09-23 §BINANCE Phase 3+4 行情/状态双 WS+StdWsDial（纯标准库 RFC6455）/§9 第 15 闸 market_halt 证据链/xasset 三腿/前端市场维度+历史K线（见 59）
 # ...
 # §全链路 UAT 修复批（2026-09-18 §UAT_FULLCHAIN_VERIFY）专项（见 11/11）：
 #   费用腿       ：成交回报 fee/stamp_tax 五路径透传（xt 回调/桥行/网关装配/mock/Go 落库），
@@ -1235,6 +1237,87 @@ grep -q 'func (g \*Gate) checkLotPrecision' internal/risk/gate.go || { echo "---
 # 契约三点锁的 Go 可见面：market 必须留在网关 ignored 声明（漏声明会被 §A2 双红，这里先给中文归因）。
 grep -q '"market"' qmt_gateway/contract/order_fields.json || { echo "--- FAIL: §BINANCE order_fields.json 缺 market 键声明"; exit 1; }
 echo "ok - §BINANCE Phase 1 专项守卫通过（行为锁 8 组 + 静态锁 9 道〔等值锁 2：qty INTEGER=2 豁免 / CN 短路=4 闸，余为正锁+定点锁〕）"
+
+echo "==> 58 §BINANCE Phase 2 执行/回报/隔离：契约 golden 双锁 + 回报三条腿 + §15.2 币种隔离 + 运维端点（2026-09-23 PLAN_BINANCE_MULTI_ASSET）..."
+# 背景：Phase 2 落地 BinanceExecutor（US/CRYPTO 真实下单）、binance_report.go（listenKey+WS+REST
+# 差分三条腿收敛到 ApplyOrderReportTx/ApplyRealFill 权威写口）、store/risk §15.2 币种隔离
+# （*ForMarket 聚合 + real_account (user_id,market) 复合主键惰性重建）、/api/binance/* 运维端点。
+# 本段把这些面的回退（参数面漂移/臆造终态/隔离漏改/端点裸奔）钉成静态+行为双守卫。
+# ---- 行为锁 ----
+go test -count=1 ./internal/trading/ -run 'TestBinanceOrderFieldsGolden|TestBinanceErrorCodesGolden|TestBinanceDefaultDisabled' 2>&1 | grep -E '^(--- FAIL|FAIL|ok)'
+go test -count=1 ./internal/trading/ -run 'TestBinanceStatusMapLock|TestReporter' 2>&1 | grep -E '^(--- FAIL|FAIL|ok)'
+go test -count=1 ./internal/store/ -run 'TestP2' 2>&1 | grep -E '^(--- FAIL|FAIL|ok)'
+go test -count=1 ./internal/backtest/ -run 'Cost|P4' 2>&1 | grep -E '^(--- FAIL|FAIL|ok)'
+go test -count=1 ./internal/server/ -run 'TestWriteRoutePerms|TestBinanceAPI' 2>&1 | grep -E '^(--- FAIL|FAIL|ok)'
+go test -count=1 ./internal/risk/ -run 'TestGateMarketMatrixP1E' 2>&1 | grep -E '^(--- FAIL|FAIL|ok)'
+# ---- 静态锁 ----
+# 契约 golden：order 参数面等值锁 7 格（§2.2 四格 + §2.6 现货三形），第 8 格出现即参数面扩张未过审。
+NF=$(python3 -c "import json;print(len(json.load(open('qmt_gateway/contract/binance_order_fields.json'))['cells']))")
+[ "$NF" -eq 7 ] || { echo "--- FAIL: §P2 契约 golden 格数=${NF}≠7（参数面增减必须显式过 PLAN §2.2/§2.6 对齐本锁）"; exit 1; }
+test -f qmt_gateway/contract/binance_error_codes.json || { echo "--- FAIL: §P2 错误码 golden 丢失"; exit 1; }
+# 回报腿：状态映射唯一权威表 + 落库必须复用 QMT 链同一套写口（自写 INSERT=秩守卫旁路，账本可被乱序回报写脏）。
+grep -q 'func mapBinanceReportStatus' internal/trading/binance_report.go || { echo "--- FAIL: §P2 回报状态映射表丢失"; exit 1; }
+grep -q 'ApplyOrderReportTx' internal/trading/binance_report.go || { echo "--- FAIL: §P2 回报腿绕过 ApplyOrderReportTx 权威写口"; exit 1; }
+grep -q '"ext:"' internal/trading/binance_report.go || { echo "--- FAIL: §P2 缺 §F5 ext: 占位信号键（手工/先到回报会撞 UNIQUE）"; exit 1; }
+# 负锁：回报腿绝不许直写 INSERT 旁路（必须走 store 权威写口，秩守卫/幂等判重都在那里）。
+if grep -q 'INSERT INTO orders\|INSERT INTO fills' internal/trading/binance_report.go; then echo "--- FAIL: §P2 回报腿直写 INSERT（必须走 store 权威写口）"; exit 1; fi
+# §15.2 隔离：ForMarket 聚合族在位 + real_account 复合主键（漏改=跨币种串账/账户行互相覆盖）。
+NG=$(grep -c 'func (d \*DB) .*ForMarket' internal/store/risk_gates.go)
+[ "$NG" -ge 5 ] || { echo "--- FAIL: §P2 ForMarket 聚合仅 $NG 处（<5，日亏/集中度/买入纪律族漏改）"; exit 1; }
+grep -q 'PRIMARY KEY (user_id, market)' internal/store/real_account.go || { echo "--- FAIL: §P2 real_account 复合主键迁移丢失"; exit 1; }
+# 运维端点普查：8 条=6×/api/binance（state/orders/exchange_info GET + cancel/halt/disclaimer POST）
+# + 2×/api/config/binance（GET/POST，§P1-b 契约前缀）；写端点裸挂由 §M-14 全量普查测试
+# （TestWriteRoutePerms）拦截，这里只钉数量回退。
+NB=$(grep -cE 'mux.HandleFunc\("[A-Z]* (/api/binance|/api/config/binance)' internal/server/server.go)
+[ "$NB" -ge 8 ] || { echo "--- FAIL: §P2 /api/binance(/config) 端点数=${NB}＜8（运维面被裁剪需对齐 PLAN §6.4 端点表）"; exit 1; }
+# 引擎装配锁：exchangeInfo→风控闸 + 回报器注册必须接进 registry（缺一条=闸拿不到真规则恒 fail-open / 回报链整体静默）。
+grep -q 'SetSymbolRulesSource' internal/engine/registry.go || { echo "--- FAIL: §P2 exchangeInfo→risk.Gate 规则源未接线"; exit 1; }
+grep -q 'RegisterReporter' internal/engine/registry.go || { echo "--- FAIL: §P2 回报接收器未接入引擎生命周期"; exit 1; }
+# 回测成本三市场：CostModelForMarket 已进 chain.Run 缺省路（漏接=CRYPTO 回测按 A 股印花税计价）。
+grep -q 'CostModelForMarket(opts.Market)' internal/backtest/chain.go || { echo "--- FAIL: §P2 全链回测缺省成本未走市场选择"; exit 1; }
+echo "ok - §BINANCE Phase 2 专项守卫通过（行为锁 6 组 + 静态锁 10 道〔等值锁 1：契约 7 格；余为正锁/定点锁/负锁〕）"
+
+echo "==> 59 §BINANCE Phase 3+4 行情/状态 WS + market_halt 证据闸 + xasset 战法 + 前端市场维度（2026-09-23 PLAN_BINANCE_MULTI_ASSET）..."
+# 背景：Phase 3 落地 BinanceWS 状态机 + StdWsDial（纯标准库 RFC6455 客户端，go.mod 零 websocket
+# 依赖）、现货/美股两条行情流 + 美股 tradingStatus/tradability 状态流、§9 第 15 道 market_halt
+# 证据闸（无证据≠可交易，GateSource→SetHaltEvidenceSource 接进 registry）、xasset 三腿战法
+# （MA 交叉/RSI 动量/新闻事件，信号自带 Market）。Phase 4 前端市场维度（utils.market.js/
+# market.jsx/BinanceConfigPanel/BinanceStatusCard）+ 历史 K 线 REST（BinanceRestClient.KLines）。
+# 本段把「分流大小写回潮、客户端依赖回潮、装配断链、源 golden 漂移」钉成静态+行为双守卫。
+# ---- 行为锁（全部实跑通过后才入册）----
+go test -count=1 ./internal/data/ -run 'TradingStatus|StatusFeed|QuoteFeed|SymbolRules' 2>&1 | grep -E '^(--- FAIL|FAIL|ok)'
+go test -count=1 ./internal/data/ -run 'TestStdWs|TestBinanceWS' 2>&1 | grep -E '^(--- FAIL|FAIL|ok)'
+go test -count=1 ./internal/data/ -run 'TestQuoteSources' 2>&1 | grep -E '^(--- FAIL|FAIL|ok)'
+go test -count=1 ./internal/strategies/xasset/ 2>&1 | grep -E '^(--- FAIL|FAIL|ok)'
+go test -count=1 ./internal/risk/ -run 'TestGateMarketHaltP3' 2>&1 | grep -E '^(--- FAIL|FAIL|ok)'
+go test -count=1 ./internal/trading/ -run 'Feed' 2>&1 | grep -E '^(--- FAIL|FAIL|ok)'
+# 前端市场维度 + M-10 轮询后到丢弃守卫（两条 vitest 文件级锁，非全量 npm test——全量在 -full 档）
+( cd web && npx vitest run src/__tests__/binance_market_p4.test.jsx src/__tests__/m10_stale_guard.test.jsx >/dev/null 2>&1 ) || { echo "--- FAIL: §P4 前端市场维度/staleGuard vitest 未通过"; exit 1; }
+# ---- 静态锁 ----
+# 缺陷①负锁：组合流分流比较必须走 LowerForm——混大小写直比 "@"+常量 的旧写法复活即红
+# （旧形态下 tradingStatus 分支永远不可达，闸恒"无证据"，US 单被 fail-close 全拒还是假绿全靠这条钉）。
+if grep -Fq '"@"+EquityStreamTradingStatus' internal/data/binance_trading_status_io.go; then echo "--- FAIL: §P3 状态分流大小写直比回潮（缺陷①）"; exit 1; fi
+# 依赖回潮负锁：WS 客户端必须留在纯标准库（引入 gorilla/nhooyr 等即违 PLAN §2.9 依赖面纪律）。
+if grep -qi 'websocket' go.mod; then echo "--- FAIL: §P3 go.mod 出现 websocket 依赖（必须走内建 StdWsDial）"; exit 1; fi
+grep -q 'func StdWsDial' internal/data/binance_ws_std.go || { echo "--- FAIL: §P3 StdWsDial 拨号器丢失"; exit 1; }
+grep -q 'func (f \*BinanceStatusFeed) GateSource' internal/data/binance_status_feed.go || { echo "--- FAIL: §P3 状态 feed 的 GateSource 注入面丢失"; exit 1; }
+# 装配链锁：feed 订阅/闸证据源/观测注册三条都必须在 registry 里（断一条=行情盲区或闸恒惰性）。
+grep -q 'data.StdWsDial' internal/engine/registry.go || { echo "--- FAIL: §P3 registry 未接 StdWsDial（feed 拨号断链）"; exit 1; }
+grep -q 'SetHaltEvidenceSource' internal/engine/registry.go || { echo "--- FAIL: §P3 market_halt 证据源未接进 registry（闸恒惰性）"; exit 1; }
+grep -q 'RegisterFeed' internal/engine/registry.go || { echo "--- FAIL: §P3 feed 观测未注册（/api/binance/state 盲区）"; exit 1; }
+grep -q 'StatusSymbols' internal/engine/registry.go || { echo "--- FAIL: §P3 状态流订阅池配置读取丢失"; exit 1; }
+grep -q 'out\["feeds"\]' internal/server/binance_api.go || { echo "--- FAIL: §P3 /api/binance/state 的 feeds 观测节丢失"; exit 1; }
+# 源 golden 等值锁：quote_sources.json 里 BINANCE-* 源恰好 2 个（SPOT/STK）——增删行情源
+# 必须显式过 §M1 契约测试再生成 golden，不允许"顺手多一源少一源"。
+NBS=$(python3 -c "import json;print(sum(1 for x in json.load(open('qmt_gateway/contract/quote_sources.json')) if x.startswith('BINANCE-')))")
+[ "$NBS" -eq 2 ] || { echo "--- FAIL: §P3 quote_sources golden BINANCE-* 计数=${NBS}≠2（源面增减需过 §M1 契约重生成）"; exit 1; }
+# xasset 信号族等值锁：三条新市场 SignalType 恰 3 个且 Market 章在位（缺腿=新市场只剩 CN 战法）。
+NX=$(grep -cE 'SignalType = "(ma_cross|rsi_momentum|news_xasset)"' internal/strategy/types.go)
+[ "$NX" -eq 3 ] || { echo "--- FAIL: §P3 xasset 信号族计数=${NX}≠3"; exit 1; }
+# 历史 K 线 + 前端市场维度文件在位（缺文件=Phase 4 面板/回测数据面整块蒸发）。
+grep -q 'func (c \*BinanceRestClient) KLines' internal/data/binance_kline.go || { echo "--- FAIL: §P4 BinanceRestClient.KLines 历史K线入口丢失"; exit 1; }
+test -f web/src/utils.market.js && test -f web/src/market.jsx || { echo "--- FAIL: §P4 前端市场维度模块丢失（utils.market.js/market.jsx）"; exit 1; }
+echo "ok - §BINANCE Phase 3+4 专项守卫通过（行为锁 7 组 + 静态锁 12 道〔等值锁 2：BINANCE 源=2 / xasset 信号=3；负锁 2：分流大小写 / websocket 依赖；余为正锁/定点锁〕）"
 
 echo ""
 echo "==> 全部通过"

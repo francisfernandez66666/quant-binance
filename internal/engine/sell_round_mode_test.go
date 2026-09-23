@@ -43,7 +43,7 @@ func flipSellMode(t *testing.T, e *Engine, mode string) {
 	if ctrl == nil {
 		t.Fatal("需要实盘控制器以承载配置翻转")
 	}
-	cfg := ctrl.Config()
+	cfg := ctrl.QMT()
 	cfg.SellUnifiedMode = mode
 	ctrl.UpdateConfig(cfg)
 	if got := e.sellUnifiedModeEngine(); got != mode {

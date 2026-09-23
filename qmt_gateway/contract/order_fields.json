@@ -1,14 +1,49 @@
 {
-  "source": "internal/trading/executor.go OrderRequest",
-  "updated": "2026-09-22",
-  "fields": [
-    "signal_id", "code", "name", "strategy", "strategy_id", "strategy_type",
-    "side", "price_type", "price", "qty", "amount", "created_at",
-    "staleness_ms", "prev_close", "current_price", "market"
-  ],
   "consumed_by_gateway": [
-    "signal_id", "code", "side", "price_type", "price", "qty",
-    "amount", "created_at", "strategy_type", "strategy"
+    "signal_id",
+    "code",
+    "side",
+    "price_type",
+    "price",
+    "qty",
+    "amount",
+    "created_at",
+    "strategy_type",
+    "strategy"
   ],
-  "ignored_by_gateway": ["name", "strategy_id", "staleness_ms", "prev_close", "current_price", "market"]
+  "fields": [
+    "amount",
+    "code",
+    "created_at",
+    "current_price",
+    "market",
+    "name",
+    "notional",
+    "prev_close",
+    "price",
+    "price_type",
+    "qty",
+    "quote_asset",
+    "side",
+    "signal_id",
+    "staleness_ms",
+    "strategy",
+    "strategy_id",
+    "strategy_type",
+    "time_in_force",
+    "trading_session"
+  ],
+  "ignored_by_gateway": [
+    "current_price",
+    "market",
+    "name",
+    "notional",
+    "prev_close",
+    "quote_asset",
+    "staleness_ms",
+    "strategy_id",
+    "time_in_force",
+    "trading_session"
+  ],
+  "source": "internal/trading/executor.go OrderRequest"
 }

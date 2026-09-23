@@ -33,7 +33,7 @@ func (s *Server) handleRiskGates(w http.ResponseWriter, r *http.Request) {
 	switches := map[string]bool{}
 	if u := s.operatorID(); u != "" {
 		if ctrl := s.qmtCtrlFor(u); ctrl != nil {
-			rg := ctrl.Config().RiskGate
+			rg := ctrl.QMT().RiskGate
 			switches["any_enabled"] = rg.AnyEnabled()
 			switches["day_loss"] = rg.DayLossLimitPct > 0
 			switches["concentration"] = rg.SingleStockValuePct > 0

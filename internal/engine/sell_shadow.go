@@ -98,7 +98,7 @@ func (e *Engine) runSellUnifiedJudge(
 		rows = append(rows, sellProbeRow{Code: p.TsCode, Name: p.Name, EntryPrice: p.CostPrice, HighPrice: p.HighestPrice})
 	}
 	feed := sellJudgeFeed{Scores: scores, D1Scores: d1Scores, BearReasons: bearReasons, PoolQuotes: exitQuotes, SnapQuotes: quotes}
-	verdicts := e.judgeSellPositions(signalctl.ChannelLive, account, rows, signalctl.Policy{Discipline: ctl.Config().Discipline}, feed, orDefault(mode, "shadow"))
+	verdicts := e.judgeSellPositions(signalctl.ChannelLive, account, rows, signalctl.Policy{Discipline: ctl.QMT().Discipline}, feed, orDefault(mode, "shadow"))
 	// 状态生命周期与持仓对齐（平仓即删，重新入场从零开始）。
 	held := make(map[string]bool, len(positions))
 	for _, p := range positions {
@@ -382,7 +382,7 @@ func (e *Engine) applyReportVerdicts(uid string, byCode map[string]report.ExecLo
 // 让 paper 并轨在实盘停用场景下同样可灰度。
 func (e *Engine) sellUnifiedModeEngine() string {
 	if ctrl := e.qmtCtrlRef(); ctrl != nil {
-		return sellUnifiedModeOf(ctrl.Config())
+		return sellUnifiedModeOf(ctrl.QMT()) // §P2 CN 控制器的 QMT 专属裁决字段
 	}
 	e.mu.RLock()
 	cm := e.cfgMgr
