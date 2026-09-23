@@ -13,6 +13,7 @@ import (
 	"quant-trading-v2/internal/store"
 )
 
+// paperTestDB 开临时库供纸面柜台落账（Cleanup 自动关连接，测试零残留）。
 func paperTestDB(t *testing.T) *store.DB {
 	t.Helper()
 	db, err := store.Open(filepath.Join(t.TempDir(), "paper.db"))
@@ -23,6 +24,7 @@ func paperTestDB(t *testing.T) *store.DB {
 	return db
 }
 
+// newPaper 按市场/初始资金/融券保证金率构造纸面执行器，构造失败直接 Fatal。
 func newPaper(t *testing.T, db *store.DB, market string, cash, marginRate float64) *BinancePaperExecutor {
 	t.Helper()
 	e, err := NewBinancePaperExecutor(BinancePaperOptions{

@@ -185,6 +185,8 @@ func (r *BinanceReporter) Stop() {
 	r.cancel, r.ws = nil, nil
 	r.mu.Unlock()
 
+	// 拆线在锁外执行（cancel/Stop 可能触发对端回调再取锁，锁内等待会自锁死）；
+	// wg.Wait 保证两个后台协程（listenKey 续期 + WS 读环）全部退出后 Stop 才返回。
 	if cancel != nil {
 		cancel()
 	}

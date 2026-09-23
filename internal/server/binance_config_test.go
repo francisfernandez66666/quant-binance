@@ -27,6 +27,7 @@ func newBinanceConfigServer(t *testing.T) *Server {
 	return &Server{cfg: config.NewManager(path)}
 }
 
+// binanceGet 直调 GET /api/config/binance 处理函数并解析响应；非 200 直接失败（帮助函数不吞错）。
 func binanceGet(t *testing.T, s *Server) map[string]interface{} {
 	t.Helper()
 	rr := httptest.NewRecorder()

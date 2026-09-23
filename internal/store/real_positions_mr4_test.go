@@ -7,6 +7,7 @@ import (
 	"testing"
 )
 
+// openMR4DB 为 §MR-4 持仓主键升级开临时库：迁移在建库时自动完成，用例只管断言形状。
 func openMR4DB(t *testing.T) *DB {
 	t.Helper()
 	db, err := Open(filepath.Join(t.TempDir(), "mr4.db"))

@@ -131,6 +131,7 @@ func fakeLLM(t *testing.T, contents []string) (*httptest.Server, *struct {
 	return srv, &st
 }
 
+// 打分器主流程：关键词基线分→过阈事件→产出多/空场外信号；LLM 缺席时零调用不报错。
 func TestXEventScorerFlow(t *testing.T) {
 	evs := []XEvent{
 		{Market: "CRYPTO", Symbol: "BTCUSDT", Title: "BTC quietly drifts", URL: "a"},

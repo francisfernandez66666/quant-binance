@@ -69,6 +69,7 @@ func (s *Server) handleBinanceKline(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// 根数解析：非法/非正数一律回落到默认根数（不因传参脏而报错，前端只读面容错优先）
 	count := binanceKlineDefaultCount
 	if raw := q.Get("count"); raw != "" {
 		if n, err := strconv.Atoi(raw); err == nil && n > 0 {

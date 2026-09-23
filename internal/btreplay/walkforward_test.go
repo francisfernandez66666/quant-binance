@@ -126,6 +126,7 @@ func TestWalkForwardSplitAndReplayX(t *testing.T) {
 	}
 }
 
+// 护栏负例：样本太短/无战法候选等病态载荷必须拒绝出推荐键，不得硬算 oos_ir。
 func TestWalkForwardGuardsX(t *testing.T) {
 	closes := make([]float64, 0, 120)
 	for i := 0; i < 120; i++ {

@@ -69,6 +69,8 @@ type DispatchReport struct {
 	Notes      []string `json:"notes,omitempty"`
 }
 
+// newBinanceDispatcher 构造派发核：配置/双库/路由/价格源/事件源/打分器全部构造期注入，
+// 测试以假件替换各依赖面；nil 依赖在轮次前置检查里逐条留痕拒跑，不 panic。
 func newBinanceDispatcher(cfgMgr *config.Manager, userID string, d1, real *store.DB, router *trading.BrokerRouter,
 	prices func(string, string) float64, events func(string) []data.XEvent, scorer *data.XEventScorer) *binanceDispatcher {
 	return &binanceDispatcher{
@@ -159,6 +161,8 @@ func (d *binanceDispatcher) tickMarket(market string, now time.Time) DispatchRep
 	if market == "CRYPTO" {
 		prof = cfg.Spot
 	}
+	// 组装本轮评估宇宙：取该市场档案监控池，去空白/转大写并按黑名单剔除；
+	// 空池=无宇宙，只留痕不发单（报告在案可查）。
 	codes := make([]string, 0, len(prof.QuoteSymbols))
 	for _, c := range prof.QuoteSymbols {
 		c = strings.ToUpper(strings.TrimSpace(c))
@@ -261,6 +265,8 @@ func (d *binanceDispatcher) tickMarket(market string, now time.Time) DispatchRep
 		if err != nil {
 			repo.Notes = append(repo.Notes, "持仓扫描失败: "+err.Error())
 		} else {
+			// 止盈止损退出腿：逐持仓按现价算浮动盈亏%（空头方向取反），命中 tp/sl 阈值才出退出单；
+			// 无价/市场未就绪/取整后数量为 0 一律跳过——退出与入场共用 place() 的幂等键与台账链。
 			for _, p := range positions {
 				if data.NormalizeMarketKey(p.Market) != market || p.Qty <= 0 || p.CostPrice <= 0 {
 					continue
@@ -274,6 +280,7 @@ func (d *binanceDispatcher) tickMarket(market string, now time.Time) DispatchRep
 				if isShort {
 					pnl = (p.CostPrice - px) / p.CostPrice * 100
 				}
+				// 触发归类：pnl 已是"持仓方向盈利%"（空头取反后同尺），只与各自阈值比较，不再分叉判向
 				class := ""
 				switch {
 				case disp.TakeProfitPct > 0 && pnl >= disp.TakeProfitPct:
@@ -284,6 +291,7 @@ func (d *binanceDispatcher) tickMarket(market string, now time.Time) DispatchRep
 				if class == "" || !marketReady {
 					continue
 				}
+				// 退出方向映射：多=卖出平仓、空=买回补仓（ShortCover）；数量按市场手数向下取整，不足一手跳过
 				side := trading.SideSell
 				if isShort {
 					side = trading.SideShortCover
@@ -469,6 +477,7 @@ func containsCI(list []string, code string) bool {
 	return false
 }
 
+// firstNonEmptyStr 返回首个去空白后非空的字符串（全空返回空串），供备注/台别等取值回落。
 func firstNonEmptyStr(vals ...string) string {
 	for _, v := range vals {
 		if strings.TrimSpace(v) != "" {

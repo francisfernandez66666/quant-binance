@@ -25,6 +25,8 @@ function makeSeries() {
   }
 }
 
+// lightweight-charts 全假实现：createChart/addSeries/panes 等调用逐参数记录进 calls，
+// 断言只看"组件让库做了什么"，不依赖真渲染（jsdom 无 canvas）。
 vi.mock('lightweight-charts', () => {
   const createChart = vi.fn((el, opts) => {
     calls.createChart.push({ el, opts })
@@ -58,6 +60,7 @@ vi.mock('../components/MinuteView.jsx', () => ({ default: ({ code }) => <div dat
 import XProChart, { toChartSeries, dateToUtcSeconds, priceFormatFor, DAY_SECONDS } from '../components/XProChart.jsx'
 import StockDetailDrawer from '../components/StockDetailDrawer.jsx'
 
+// 每个用例前清空调用捕获，断言只看当次挂载/更新的真实调用序列
 beforeEach(() => {
   calls.createChart.length = 0
   calls.addSeries.length = 0

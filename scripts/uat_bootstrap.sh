@@ -199,6 +199,16 @@ print("seeded snapshot_latest.json source=%s codes=%d" % (snap["Source"], len(st
 PY
 fi
 
+# ── 1c) §CN-MASTER（2026-09-23）：UAT 栈显式开启 A股装配总开关 ──────────────
+# 背景：CN 总开关出厂缺省 false（boot 冻结快照，热更不切）。全新数据目录若不写
+#   config.json，五条 A股腿（nanobot/实时采集/触发引擎/打分循环/会话主循环）整栈跳过，
+#   存量 UAT 用例（情绪/信号/撮合实时生效等）全部以「A股链在跑」为前提 → 必红。
+#   UAT 要同时测「开」语义（=改造前字节等价），故此处显式置 true。
+#   关态语义不在本栈测：由 Go 行为锁（cn_master_test.go 等）+ vitest 导航锁承担。
+# NewManager 以 DefaultRules 打底再叠加本文件，最小 JSON 只影响 rules.cn 一键。
+log "写入 UAT config.json（rules.cn.enabled=true，§CN-MASTER 开态口径）..."
+printf '{"rules":{"cn":{"enabled":true}}}\n' > "$DATA_DIR/config.json"
+
 # ── 2) 起 qmt-mock 假柜台（预置茅台持仓行情 + 1.5s 回报延迟）──────────────────
 log "启动 qmt-mock (:${MOCK_PORT})..."
 # §3.1-1：注入面参数按可用性拼接（golden 缺失时 MOCK_QUOTE_ARGS 为空数组 → 命令与旧版逐字一致）

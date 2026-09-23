@@ -659,6 +659,7 @@ func parseTHSQuote(body []byte, code string) (*StockInfo, error) {
 		return nil, fmt.Errorf("ths: no closing brace")
 	}
 
+	// 外层信封先解出 items 原始节（THS 响应为 JSON-in-JSON 形态，逐票字段延后再二次解析）
 	var raw struct {
 		Items map[string]interface{} `json:"items"`
 	}

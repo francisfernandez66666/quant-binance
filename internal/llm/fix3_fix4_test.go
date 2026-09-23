@@ -147,6 +147,7 @@ func TestStreamCtxCancelUnblocks(t *testing.T) {
 	}))
 	defer srv.Close()
 
+	// 流式客户端挂到假 SSE 服务：总时限放宽到 1h，让"空闲超时"成为唯一裁决腿
 	c := New(Config{APIKey: "k", APIURL: srv.URL, Streaming: true,
 		StreamIdleTimeout: 30 * time.Second, StreamTotalTimeout: time.Hour})
 	ctx, cancel := context.WithCancel(context.Background())

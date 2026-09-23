@@ -162,6 +162,7 @@ class TestM3OrderLegConfirmation(unittest.TestCase):
             def resolve_order_id(self, signal_id, pending_ref, req=None):
                 return pending_ref
 
+        # 把策略体的外部依赖全换成假件（trace/回报/去重/柜台），只留 _handle_cmd 真实分支
         stub = _Stub(confirmed_flag)
         bs._trace = lambda m: None
         bs._report = lambda payload: reports.append(payload)
@@ -174,7 +175,8 @@ class TestM3OrderLegConfirmation(unittest.TestCase):
         return handled, reports
 
     def test_handle_cmd_publishes_unconfirmed_flag(self):
-        """ORDER never seen -> order_result keeps ok=True (anchor) but says confirmed=False."""
+        """ORDER never seen -> order_result keeps ok=True (anchor) but says confirmed=False.
+        中文：未确认单不得翻转 ok（派发结算锚点），只把 confirmed=False 带进回报。"""
         handled, reports = self._run_handle_cmd(False, (True, "seq:5", ""))
         self.assertTrue(handled)
         self.assertEqual(len(reports), 1)

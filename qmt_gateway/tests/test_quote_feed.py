@@ -112,6 +112,7 @@ class TestQuoteFeedHTTP(unittest.TestCase):
         self.server.server_close()
 
     def _req(self, method, path, body=None, token="tk"):
+        """向假引擎打一条 JSON 请求（默认带 Bearer tk），返回 (status, 解析后 body)。"""
         url = "http://127.0.0.1:%d%s" % (self.port, path)
         data = json.dumps(body).encode("utf-8") if body is not None else None
         req = urllib.request.Request(url, data=data, method=method)

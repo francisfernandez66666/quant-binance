@@ -10,6 +10,7 @@ import (
 	"testing"
 )
 
+// newP2TestDB 在临时目录开全新库（含 market 列迁移），Cleanup 自动关连接、目录随用例结束回收。
 func newP2TestDB(t *testing.T) *DB {
 	t.Helper()
 	db, err := Open(filepath.Join(t.TempDir(), "p2.db"))

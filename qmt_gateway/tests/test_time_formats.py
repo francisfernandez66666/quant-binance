@@ -58,6 +58,7 @@ class TestGoldenFile(unittest.TestCase):
             self.golden = json.load(f)
 
     def test_formats_registered_and_self_consistent(self):
+        """golden 时间格式表逐项自检：格式串与 strptime 必须互相咬合，漂移即红。"""
         fmts = self.golden["formats"]
         iso = fmts["iso_beijing"]
         self.assertEqual(iso["format"], "YYYY-MM-DDTHH:MM:SS+08:00")
@@ -204,6 +205,7 @@ class TestNoBareStrftimeStaticLock(unittest.TestCase):
     PATTERN = re.compile(r'time\.strftime\([^)\n]*\+08:00')
 
     def test_production_files_clean(self):
+        """负锁：生产与测试 py 全树不得再手写 +08:00 字面 strftime——时间口径必须走统一工具。"""
         gdir = os.path.join(_ROOT, "qmt_gateway")
         targets = [(name, os.path.join(gdir, name))
                    for name in sorted(os.listdir(gdir)) if name.endswith(".py")]

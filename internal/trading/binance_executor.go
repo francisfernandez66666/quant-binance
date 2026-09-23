@@ -770,6 +770,7 @@ func trimNum(v float64) string {
 
 func round2(v float64) float64 { return math.Round(v*100) / 100 }
 
+// firstNonEmpty 返回首个去空白后非空的字符串（全空返回空串），供"多源字段取首个可用值"场景。
 func firstNonEmpty(vals ...string) string {
 	for _, v := range vals {
 		if strings.TrimSpace(v) != "" {
@@ -779,6 +780,7 @@ func firstNonEmpty(vals ...string) string {
 	return ""
 }
 
+// firstPositive 返回首个严格大于 0 的数值（全非正返回 0），供交易所回写字段的"缺数回落"链。
 func firstPositive(vals ...float64) float64 {
 	for _, v := range vals {
 		if v > 0 {

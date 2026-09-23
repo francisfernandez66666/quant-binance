@@ -153,6 +153,7 @@ type hostBodyTransport struct {
 	calls map[string]int
 }
 
+// RoundTrip 按目标主机名累计调用次数后透传给内层 transport，供"源切换顺序"断言。
 func (rt *hostBodyTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	host := req.URL.Hostname()
 	if rt.calls == nil {
@@ -449,6 +450,7 @@ type urlRecorderTransport struct {
 	urls []string
 }
 
+// RoundTrip 只记录请求 URL 并恒回 200 空体——用于验证"该不该发这个请求"，不验证响应。
 func (t *urlRecorderTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	t.urls = append(t.urls, req.URL.String())
 	return &http.Response{

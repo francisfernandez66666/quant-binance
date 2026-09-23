@@ -104,6 +104,8 @@ class QuoteFeed:
             return False
 
     def _loop(self):
+        """feed 线程主循环：可中断等待 poll_sec → 非交易时段跳过 → 单轮拉取；
+        任何异常只记日志不退出（行情故障绝不拖垮柜台进程）。"""
         from handler import is_active_trading_session
         while not self._stop.is_set():
             if self._stop.wait(self.poll_sec):
@@ -159,6 +161,7 @@ class QuoteFeed:
             except (TypeError, ValueError):
                 return 0.0
 
+        # /quotes 契约字段集：prevClose 取 xtdata 的 lastClose，缺失键一律以 0.0 兜底占位
         return {
             "lastPrice": f("lastPrice"),
             "open": f("open"),

@@ -10,6 +10,7 @@ import { createStaleGuard } from '../utils/staleGuard.js'
 
 const { state } = vi.hoisted(() => ({ state: { impl: {} } }))
 
+// 管理员正常态的空载荷表：壳层轮询端点全回零值，用例只覆盖自己要制造异常的那一个面
 function okPayloads() {
   return {
     isAdmin: () => false,
@@ -24,6 +25,7 @@ function okPayloads() {
   }
 }
 
+// 按 okPayloads 名单逐个造 vi.fn 转发到 state.impl——用例运行期改 impl 即热换响应
 vi.mock('../api/index.js', async () => {
   const actual = await vi.importActual('../api/index.js')
   const stubs = {}

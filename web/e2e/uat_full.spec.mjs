@@ -1296,3 +1296,124 @@ test.describe('权限硬锁 · §3.1-4 成员直连 API + §M13 轮询止血', (
     }
   })
 })
+
+// ─────────────────────────────────────────────────────────────────────────────
+// §MR-4 / 战法批 / CN-MASTER（2026-09-23 深夜批）UAT —— UAT-MR4 组
+// 覆盖今日落地的四条面：
+//   ① CN-MASTER：/api/status cn_master 布尔契约 + UAT 栈开态（scripts/uat_bootstrap.sh 步 1c
+//      显式写 rules.cn.enabled=true；boot 冻结、热更不切）。本组红=先查 1c 是否在位。
+//      关态语义不在本栈测：Go 行为锁（config/server cn_master 测试）+ vitest 导航静态锁承担。
+//   ② 战法派发配置：/api/config/binance dispatch 七键整档往返（改 min_confidence→回读→还原）
+//      + 三把密钥（api_secret/cryptopanic_token/llm_api_key）明文永不回显红线（只 *_masked+布尔）。
+//   ③ 派发观测面：/api/binance/state dispatch 节形状（per-market ok 布尔；ok=true 必有
+//      universe/signals/placed/rejected/exit_placed/desk 报告体）+ Quant 页「US/CRYPTO 派发」行渲染。
+//   ④ 前端交付：设置页币安卡三块（战法派发/事件源与大模型打分/纸面柜台）渲染。
+// 手法沿用本 spec 惯例：admin 会话（storageState）+「先记服务端基线 + finally API 直写还原」防污染。
+// ─────────────────────────────────────────────────────────────────────────────
+test.describe('§MR4 战法派发/CN-MASTER 批（今日开发）', () => {
+
+  // admin Bearer：storageState 会话已带登录态，从 localStorage 取 token 直打接口（同 MP-1 手法）
+  async function adminTok(page) {
+    await page.goto('/#/dashboard')
+    const tok = await page.evaluate(() => localStorage.getItem('liangzai_token'))
+    expect(tok, 'admin 会话应有 liangzai_token').toBeTruthy()
+    return tok
+  }
+
+  // MR4-1 §CN-MASTER：/api/status 必须下发布尔 cn_master；UAT 栈开态下恒 true
+  test('MR4-1 /api/status cn_master 布尔契约（UAT 栈=开态 true）', async ({ page }) => {
+    const tok = await adminTok(page)
+    const st = await (await page.request.get('/api/status', { headers: { Authorization: 'Bearer ' + tok } })).json()
+    expect(typeof st.cn_master, 'cn_master 必须是布尔（旧后端缺字段=此处 undefined）').toBe('boolean')
+    // UAT 栈由 bootstrap 步 1c 显式开启；若此断言红，先查 config.json 是否写入 rules.cn.enabled=true
+    expect(st.cn_master, 'UAT 栈应为 CN 开态（boot 冻结快照）').toBe(true)
+  })
+
+  // MR4-2 §CN-MASTER 前端联动：开态侧栏 A股入口在位（与 cn_master 旗标一致性；关态隐藏由 vitest 锁测）
+  test('MR4-2 cn_master=true：侧栏 A股入口（信号/自选/自动研究）可见', async ({ page }) => {
+    const tok = await adminTok(page)
+    const st = await (await page.request.get('/api/status', { headers: { Authorization: 'Bearer ' + tok } })).json()
+    test.skip(st.cn_master !== true, '本用例只钉开态；关态侧栏隐藏由 vitest cn_master_nav 静态锁承担')
+    const menu = page.locator('.t-menu__item')
+    for (const label of ['信号', '自选', '自动研究']) {
+      await expect(menu.locator(`text=${label}`).first(), `开态侧栏应含「${label}」`).toBeVisible({ timeout: 10000 })
+    }
+    await page.screenshot({ path: `${SHOT}/mr4-cn-nav-on.png`, fullPage: false })
+  })
+
+  // MR4-3 §战法批 契约：dispatch 七键整档回显 + 三把密钥明文永不回显红线
+  test('MR4-3 /api/config/binance：dispatch 七键 + 密钥只掩码', async ({ page }) => {
+    const tok = await adminTok(page)
+    const resp = await page.request.get('/api/config/binance', { headers: { Authorization: 'Bearer ' + tok } })
+    expect(resp.ok(), 'admin 读币安配置应 200').toBe(true)
+    const body = await resp.text()
+    const view = JSON.parse(body)
+    // 派发七键必须齐备（GET 无 omitempty 整档回显——前端表单按"无隐蔽键"往返，缺一键即丢配置）
+    for (const k of ['enabled', 'bear_enabled', 'min_confidence', 'take_profit_pct', 'stop_loss_pct', 'every_sec', 'max_live_orders']) {
+      expect(view.dispatch, `dispatch 应含键 ${k}`).toHaveProperty(k)
+    }
+    // 事件腿视图键（EDGAR UA 非密钥原样；两把 token 走 *_masked + has_* 布尔）
+    expect(view.events).toHaveProperty('edgar_user_agent')
+    expect(view.events).toHaveProperty('cryptopanic_token_masked')
+    expect(view.events).toHaveProperty('llm_api_key_masked')
+    // 红线负锁：任何明文密钥字段名都不得出现在响应里（只准 *_masked/has_* 形态）
+    for (const leak of ['"api_secret":', '"api_key":', '"cryptopanic_token":', '"llm_api_key":']) {
+      expect(body, `响应不得含明文密钥字段 ${leak}`).not.toContain(leak)
+    }
+  })
+
+  // MR4-4 §战法批 派发参数整档往返：改门槛→回读一致→finally 还原基线（出厂全关语义不动）
+  test('MR4-4 /api/config/binance：min_confidence 保存→回读→还原', async ({ page }) => {
+    const tok = await adminTok(page)
+    const H = { Authorization: 'Bearer ' + tok }
+    const base = (await (await page.request.get('/api/config/binance', { headers: H })).json()).dispatch
+    expect(base, '基线 dispatch 应可读取').toBeTruthy()
+    try {
+      const next = { ...base, min_confidence: 0.75 }
+      const save = await page.request.post('/api/config/binance', { headers: H, data: { dispatch: next } })
+      expect(save.status(), '派发参数保存应 200').toBe(200)
+      const back = (await (await page.request.get('/api/config/binance', { headers: H })).json()).dispatch
+      expect(Math.abs(back.min_confidence - 0.75), '回读门槛应为 0.75').toBeLessThan(1e-9)
+      expect(back.enabled, '往返不得顺带翻开派发总闸').toBe(base.enabled)
+    } finally {
+      // 还原基线（整档替换语义，防污染后续用例与共享盘）
+      await page.request.post('/api/config/binance', { headers: H, data: { dispatch: base } })
+    }
+  })
+
+  // MR4-5 §战法批 观测契约：/api/binance/state dispatch 节形状（无证据=ok=false，绝不代造报告）
+  test('MR4-5 /api/binance/state：dispatch 节按市场 ok 布尔、true 时报告体齐备', async ({ page }) => {
+    const tok = await adminTok(page)
+    const st = await (await page.request.get('/api/binance/state', { headers: { Authorization: 'Bearer ' + tok } })).json()
+    expect(st.dispatch, 'UAT 栈已装配派发闭包，state 应含 dispatch 节').toBeTruthy()
+    for (const m of ['US', 'CRYPTO']) {
+      expect(st.dispatch[m], `dispatch.${m} 应存在`).toBeTruthy()
+      expect(typeof st.dispatch[m].ok, `${m}.ok 必须是布尔`).toBe('boolean')
+      if (st.dispatch[m].ok) {
+        const r = st.dispatch[m].report
+        for (const k of ['universe', 'signals', 'placed', 'rejected', 'exit_placed']) {
+          expect(typeof r[k], `${m}.report.${k} 应为数字`).toBe('number')
+        }
+        expect(['live', 'paper', 'none'], `${m}.report.desk 只能是三台别`).toContain(r.desk)
+      }
+    }
+  })
+
+  // MR4-6 §战法批 前端：Quant 页币安状态卡「派发」摘要行渲染（从未派发呈「未派发过」不造假绿灯）
+  test('MR4-6 Quant 页：US/CRYPTO 派发行渲染', async ({ page }) => {
+    await page.goto('/#/quant')
+    const card = page.locator('.t-card', { hasText: 'US 派发' })
+    await expect(card.first(), '状态卡应含 US 派发行').toBeVisible({ timeout: 15000 })
+    await expect(card.first(), 'CRYPTO 派发行同卡').toContainText('CRYPTO 派发')
+    await page.screenshot({ path: `${SHOT}/mr4-quant-dispatch.png`, fullPage: false })
+  })
+
+  // MR4-7 §战法批 前端：设置页币安卡三块新表单渲染（派发参数/事件源与大模型打分/纸面柜台）
+  test('MR4-7 设置页：币安卡「战法派发/事件源打分/纸面柜台」三块可见', async ({ page }) => {
+    await page.goto('/#/settings')
+    for (const anchor of ['战法派发 dispatch', '事件源与大模型打分 events', '纸面柜台 paper']) {
+      await expect(page.locator(`text=${anchor}`).first(), `设置页应含「${anchor}」`).toBeVisible({ timeout: 15000 })
+    }
+    await page.screenshot({ path: `${SHOT}/mr4-settings-binance.png`, fullPage: true })
+  })
+})

@@ -12,6 +12,7 @@ import (
 
 func almost(a, b float64) bool { return math.Abs(a-b) < 1e-12 }
 
+// CN 等值锁：未知/空/小写市场一律回落默认成本模型——CN 老链成本口径逐字段不得漂移。
 func TestCostModelForMarketCNUnchanged(t *testing.T) {
 	want := DefaultCostModel()
 	for _, m := range []string{"CN", "cn", "", "UNKNOWN"} {

@@ -45,6 +45,7 @@ func TestMigrateMarketSchemaP1C(t *testing.T) {
 	}
 	raw.Close()
 
+	// 以旧 DDL 手工建出"史前库"后重开：验证 Open 的幂等迁移把 market/side 等列补齐
 	db, err := Open(path)
 	if err != nil {
 		t.Fatalf("Open legacy: %v", err)

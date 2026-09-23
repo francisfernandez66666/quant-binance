@@ -146,6 +146,7 @@ func ordersOf(t *testing.T, db *store.DB) []store.RealOrder {
 	return os
 }
 
+// fillsOf 读全库成交流水（回报落账的唯一物证），失败即 Fatal。
 func fillsOf(t *testing.T, db *store.DB) []store.RealFill {
 	t.Helper()
 	fs, err := db.RealFills()
@@ -282,6 +283,7 @@ func TestReporterRestDiffUSNoGuess(t *testing.T) {
 // fakeWsTransport 内存管道版 WsTransport：测试经 in 通道投帧，close 后读侧报错触发重连语义。
 type fakeWsTransport struct{ in chan []byte }
 
+// ReadMessage 阻塞取 in 通道帧；通道关闭即返回 Canceled——让"WS 断线"在内存管道上可脚本化。
 func (f *fakeWsTransport) ReadMessage() ([]byte, error) {
 	b, ok := <-f.in
 	if !ok {

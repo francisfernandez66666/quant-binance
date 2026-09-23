@@ -51,6 +51,7 @@ func TestHithinkStockMoneyFlowAssembly(t *testing.T) {
 	defer func() { HithinkBaseURL = old }()
 	t.Setenv(HithinkAPIKeyEnv, "test-key")
 
+	// 凭据经 env 注入即可构造客户端；随后打一次资金流请求验证 base URL 覆盖生效
 	c, err := NewHithinkClient()
 	if err != nil {
 		t.Fatal(err)

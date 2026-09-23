@@ -38,6 +38,7 @@ import XProChart, {
   toChartSeries, dateToUtcSeconds, priceFormatFor, DAY_SECONDS,
 } from '../components/XProChart.jsx'
 
+// 每个用例前复位假序列：按系列类型（candlestick/volume）路由到各自的 setData 捕获器
 beforeEach(() => {
   addSeries.mockReset()
   addSeries.mockImplementation((series) => ({

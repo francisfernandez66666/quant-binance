@@ -73,6 +73,7 @@ func TestFNGSnapshotStaleKickThrottled(t *testing.T) {
 	base := time.Date(2026, 9, 23, 12, 0, 0, 0, time.UTC)
 	nowNow.Store(base.Unix())
 
+	// 裸 Registry（无 HTTP 注入）也必须可挂 FNG 腿：attach 只建闭包模板，触网留到取数时
 	r := &Registry{}
 	r.attachFNG()
 	r.fngMu.Lock()

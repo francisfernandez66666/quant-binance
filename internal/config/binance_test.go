@@ -10,6 +10,7 @@ type fakeKV struct {
 	data map[string]map[string]string // userID → key → value
 }
 
+// SetConfig 实现 KVStore 写路径：按 userID→key 两级懒建 map 后覆盖写（与 auth 落盘语义同形）。
 func (f *fakeKV) SetConfig(userID, key, value string) error {
 	if f.data == nil {
 		f.data = map[string]map[string]string{}

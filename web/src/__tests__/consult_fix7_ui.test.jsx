@@ -18,6 +18,7 @@ const h = vi.hoisted(() => ({
   setLLMConfig: vi.fn(async () => ({ result: { applied: true } })),
 }))
 
+// API 层整体替身：所有网络出口转成可断言的 vi.fn，用例不触真后端
 vi.mock('../api/index.js', () => ({
   isAdmin: h.isAdmin,
   isForbidden: (e) => !!(e && e.status === 403),

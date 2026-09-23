@@ -5428,6 +5428,7 @@ func (e *Engine) sectorConstituentsDual(sectorCode, sectorName string, topN int)
 	emCode := e.emBoardCodes[sectorName] // 东财 BK 代码；未命中映射=东财无同名板块，第二源视为不可用
 	e.mu.RUnlock()
 
+	// 同花顺板块成分为第一源（可选，未注入=跳过），东财为第二源；两源各自独立取数再并集。
 	var thsList []data.StockInfo
 	var thsSet map[string]bool
 	var thsErr error

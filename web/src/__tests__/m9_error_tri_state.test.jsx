@@ -16,6 +16,7 @@ import { MemoryRouter } from 'react-router-dom'
 // 每页挂载触达的端点默认回「管理员正常空载荷」，用例只覆盖自己要制造异常的那一个面。
 const { state } = vi.hoisted(() => ({ state: {} }))
 
+// 三态渲染回归的载荷工厂：管理员正常空载荷，异常面由用例逐个覆盖
 function okPayloads() {
   return {
     isAdmin: () => false,
@@ -27,7 +28,7 @@ function okPayloads() {
     fetchPaperState: () => ({ enabled: false }),
     fetchShortStatus: () => ({ short_enabled: false }),
     fetchAlerts: () => [],
-    // Quant
+    // Quant 实盘页轮询端点
     fetchQMTConfig: () => ({ enabled: false, known_strategies: [], strategies: [] }),
     fetchQMTState: () => ({ enabled: false, tripped: false }),
     fetchQMTOrders: () => [],
@@ -36,7 +37,7 @@ function okPayloads() {
     fetchQMTSettleHistory: () => ({ diffs: [] }),
     fetchRiskGates: () => ({ gates: [], switches: {} }),
     fetchSignalVerdicts: () => ({ verdicts: [] }),
-    // Dashboard
+    // Dashboard 看板页轮询端点
     fetchNews: () => [],
     fetchSectorHot: () => [],
     fetchHotSnapshot: () => [],
@@ -50,6 +51,7 @@ function okPayloads() {
   }
 }
 
+// 名单内端点全部转发到 state.impl：用例运行期热换实现即可制造成功/失败/403 三态
 vi.mock('../api/index.js', async () => {
   const actual = await vi.importActual('../api/index.js')
   const stubs = {}

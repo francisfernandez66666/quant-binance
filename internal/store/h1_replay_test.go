@@ -23,6 +23,7 @@ func m12Order(t *testing.T, db *DB, uid, sid string) RealOrder {
 	return RealOrder{}
 }
 
+// mustOrders 读某账号全部实单，失败即 Fatal——用例内不做 err 分支，断言只聚焦行为。
 func mustOrders(t *testing.T, db *DB, uid string) []RealOrder {
 	t.Helper()
 	os, err := db.RealOrdersForUser(uid)

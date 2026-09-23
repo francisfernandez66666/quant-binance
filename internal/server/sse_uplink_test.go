@@ -157,6 +157,7 @@ func TestQMTReportSurvivesStuckSSELock(t *testing.T) {
 	// 必须带上下文用户：uid 为空时广播本身就是空操作，测不到"锁超预算"这条腿。
 	req = req.WithContext(context.WithValue(req.Context(), ctxUserKey{}, &auth.User{ID: "u_1"}))
 
+	// 计时窗口包住 handler 调用：断言"锁超预算"必须量的是 handler 自身耗时，不含建连噪声
 	start := time.Now()
 	res := make(chan int, 1)
 	go func() {

@@ -234,6 +234,7 @@ func paramOf(t *testing.T, raw, key string) string {
 	return vals.Get(key)
 }
 
+// parseQueryForTest 把 URL 编码串拆成键值表（与签名链共用 mapVals，避免测试引 net/url 造成口径分叉）。
 func parseQueryForTest(q string) (mapVals, error) {
 	out := mapVals{v: map[string]string{}}
 	for _, kv := range strings.Split(q, "&") {
