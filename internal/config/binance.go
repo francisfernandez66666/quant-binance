@@ -21,21 +21,35 @@ type BinanceConfig struct {
 	// 依据市场实际：美股/加密货币的行情与历史数据本就不需要钥匙，凭证只属于交易面。
 	// English: observation-plane switch — feeds/FNG/events/klines with zero credentials; the live
 	// executor still requires Enabled+APIKey, so orders are structurally impossible on this plane.
-	DataPlane          bool                 `json:"data_plane"`
-	Mode               string               `json:"mode"`        // auto | manual
-	Testnet            bool                 `json:"testnet"`     // true=testnet.binance.vision（仅现货有意义）
-	APIKey             string               `json:"api_key"`     // 行情/交易 API Key
-	APISecret          string               `json:"api_secret"`  // API Secret（per-user 落库，同 qmt.token 惯例）
-	TimeoutSec         int                  `json:"timeout_sec"` // REST 超时
-	MissHeartbeatSec   int                  `json:"miss_heartbeat_sec"`
-	Halted             bool                 `json:"halted"`                         // kill-switch（即时生效，不入待生效队列）
-	CancelStaleSec     int                  `json:"cancel_stale_sec"`               // 在途超时撤单（-1=关）
-	DisclaimerSignedAt string               `json:"disclaimer_signed_at,omitempty"` // 美股披露签署时间（启动探测回填）
-	QuoteAsset         string               `json:"quote_asset"`                    // 美股 quoteAsset 缺省（USDC）
-	Stock              BinanceMarketProfile `json:"stock"`                          // —— US 市场档案 ——
-	Spot               BinanceMarketProfile `json:"spot"`                           // —— CRYPTO 市场档案 ——
-	RiskGate           RiskGateConfig       `json:"risk_gate"`
-	PaperSeparate      bool                 `json:"paper_separate"` // 新市场纸面盘独立资金池（P2 接 paper）
+	DataPlane          bool   `json:"data_plane"`
+	Mode               string `json:"mode"`        // auto | manual
+	Testnet            bool   `json:"testnet"`     // true=testnet.binance.vision（仅现货有意义）
+	APIKey             string `json:"api_key"`     // 行情/交易 API Key
+	APISecret          string `json:"api_secret"`  // API Secret（per-user 落库，同 qmt.token 惯例）
+	TimeoutSec         int    `json:"timeout_sec"` // REST 超时
+	MissHeartbeatSec   int    `json:"miss_heartbeat_sec"`
+	Halted             bool   `json:"halted"`                         // kill-switch（即时生效，不入待生效队列）
+	CancelStaleSec     int    `json:"cancel_stale_sec"`               // 在途超时撤单（-1=关）
+	DisclaimerSignedAt string `json:"disclaimer_signed_at,omitempty"` // 美股披露签署时间（启动探测回填）
+	// LeverageAcknowledgedAt §MR-4B 杠杆确认签署时间（设计稿红线"enabled=true 且存在 leverage>1
+	// 配置须白名单例外"的落地形态）：本仓不做"账户白名单"这种运行时不可验证的概念，
+	// 改为显式人工确认位——交易面开启时任何 profile.leverage>1 都必须先落这个时间戳
+	// （与 disclaimer_signed_at 同族语义：人工在币安侧开过合约权限/理解爆仓风险后才签）。
+	// English: §MR-4B explicit human acknowledgement replacing the doc's "whitelist" idea —
+	// leverage>1 with trading enabled requires this timestamp, same family as disclaimer_signed_at.
+	LeverageAcknowledgedAt string               `json:"leverage_acknowledged_at,omitempty"`
+	QuoteAsset             string               `json:"quote_asset"` // 美股 quoteAsset 缺省（USDC）
+	Stock                  BinanceMarketProfile `json:"stock"`       // —— US 市场档案 ——
+	Spot                   BinanceMarketProfile `json:"spot"`        // —— CRYPTO 市场档案 ——
+	RiskGate               RiskGateConfig       `json:"risk_gate"`
+	// Dispatch §战法批（2026-09-23）xasset 派发总闸：新市场（US/CRYPTO）的
+	// 「K线→战法→信号→下单」自动链开关，出厂 false=零行为（信号只进观测面）。
+	// 纸面盘（profile.Paper）下派发只落本地账簿、结构上碰不到交易所；真交易面下
+	// 派发单与手动单走同一套控制器/风控闸，无旁路。
+	// English: §batch-xasset auto-dispatch switch for the new markets; factory-false keeps the
+	// chain observation-only, and paper-dispatch can structurally never reach the exchange.
+	Dispatch      BinanceDispatchConfig `json:"dispatch,omitempty"`
+	PaperSeparate bool                  `json:"paper_separate"` // 新市场纸面盘独立资金池（P2 接 paper）
 	// Events §ENH-A4/B8 事件血源腿（SEC EDGAR 8-K / CryptoPanic 热帖）的凭证与范围。
 	// 缺省零值=两腿全部不装配（"空配置=不装配"惯例）；token 属密钥，GET 侧只回掩码。
 	// English: §ENH-A4/B8 event-leg credentials (EDGAR UA / CryptoPanic key); zero value
@@ -55,6 +69,29 @@ type BinanceEventsConfig struct {
 	CryptoPanicToken string `json:"cryptopanic_token,omitempty"`
 	// CryptoPanicCurrencies 关注的币种列表（如 ["BTC","ETH"]）；空=客户端缺省集。
 	CryptoPanicCurrencies []string `json:"cryptopanic_currencies,omitempty"`
+	// —— §战法批 事件利多利空大模型打分（OpenAI 兼容 chat 面，DeepSeek/通义/GPT 均可）——
+	// 三键齐备才启用；任一缺席=打分器不装配=事件方向退回关键词基线（零配置零行为）。
+	// 币安官方无新闻 API（行情/交易面不含资讯），本层打分对象是 EDGAR/CryptoPanic 标题。
+	// English: optional LLM scorer for event sentiment (OpenAI-compatible); all three keys
+	// required, partial config keeps the keyword baseline. Binance has no news API — the scored
+	// corpus is EDGAR/CryptoPanic titles.
+	LLMBaseURL string `json:"llm_base_url,omitempty"` // 例 https://api.deepseek.com/v1
+	LLMApiKey  string `json:"llm_api_key,omitempty"`  // 密钥（GET 侧只回掩码，同 api_secret 惯例）
+	LLMModel   string `json:"llm_model,omitempty"`    // 例 deepseek-chat / qwen-plus / gpt-4o-mini
+	// LLMTimeoutSec 单次打分请求超时；0=缺省 15s（派发节拍远大于此，不拖主循环）。
+	LLMTimeoutSec int `json:"llm_timeout_sec,omitempty"`
+}
+
+// BinanceDispatchConfig §战法批 xasset 自动派发参数（US/CRYPTO 共享一份；标的池取各市场
+// 档案的 quote_symbols，纸面/真面同闸）。零值全部=关闭或缺省，出厂态派发链整体静默。
+type BinanceDispatchConfig struct {
+	Enabled       bool    `json:"enabled"`         // 派发总闸（出厂 false）
+	BearEnabled   bool    `json:"bear_enabled"`    // 空头腿开关：开=死叉/过热回落/利空可产 卖出开空 信号（借券闸仍然把关）
+	MinConfidence float64 `json:"min_confidence"`  // 信号置信度门槛（0=缺省 0.6；防弱信号烧预算）
+	TakeProfitPct float64 `json:"take_profit_pct"` // 持仓止盈 %（0=关退出腿）
+	StopLossPct   float64 `json:"stop_loss_pct"`   // 持仓止损 %（0=关）
+	EverySec      int     `json:"every_sec"`       // 节拍秒（0=缺省 600；下限 60 防抖）
+	MaxLiveOrders int     `json:"max_live_orders"` // 单轮最多派发的新单数（0=缺省 5，防事件风暴刷屏）
 }
 
 // BinanceMarketProfile 单市场档案（US/CRYPTO 共用形状）。Enabled 为子开关：
@@ -75,6 +112,30 @@ type BinanceMarketProfile struct {
 	// English: §P3 symbols whose tradingStatus evidence feeds risk gate 15 (US only; empty = feed
 	// never starts and the gate stays unwired/inert).
 	StatusSymbols []string `json:"status_symbols,omitempty"`
+	// §MR-4A 做空保证金率（融券/合约开空的权益冻结比例，0=禁做空，合法域 0 或 (0,1]）；
+	// 消费位点=risk.Gate 第 16 道闸 short_borrow。
+	ShortMarginRate float64 `json:"short_margin_rate,omitempty"`
+	// ProductType §MR-4B 产品线（仅 CRYPTO 档案有实际意义）："spot"（缺省/空，逐字节兼容
+	// 存量配置）| "umfutures"（USDT 本位永续，走 fapi 域名，凭证权限与现货分离）。
+	// English: §MR-4B product line for the CRYPTO profile; empty/spot keeps the existing chain
+	// byte-identical, umfutures forks orders/positions/streams onto fapi.binance.com.
+	ProductType string `json:"product_type,omitempty"`
+	// Leverage §MR-4B 名义杠杆（合约档专用；0/1=不加杠杆）。>1 受红线约束：
+	// 交易面 enabled=true 时必须先签 leverage_acknowledged_at（validateBinance 拦）。
+	Leverage int `json:"leverage,omitempty"`
+	// LiqDistMinPct §MR-4B 强平价距离下限（%）：开仓时 markPrice 与强平价距离小于该百分比
+	// 即拒单（第 17 道闸 liq_distance 的阈值；0=闸关闭，行为与旧配置一致）。
+	LiqDistMinPct float64 `json:"liq_dist_min_pct,omitempty"`
+	// Paper §战法批 本市场纸面成交柜台：交易面未激活（无钥匙/总开关关）且本键开时，
+	// 控制器执行器落纸面柜台（即时成交、只写本地账簿，结构上碰不到交易所）；
+	// 交易面激活时本键被忽略并打日志（真面优先，绝不静默把真单降级成假成交）。
+	// 与派发总闸（binance.dispatch.enabled）叠加：纸面盘可先跑通链、后换真枪。
+	// English: §batch-xasset per-market paper desk — used only while the trading plane is
+	// inactive (structurally impossible to reach the exchange); ignored (with a log) when the
+	// live plane is on, so a real profile never silently degrades to fake fills.
+	Paper bool `json:"paper,omitempty"`
+	// PaperCash 纸面账户初始资金（本市场计价币：US=USD、CRYPTO=USDT）；0=缺省 100000。
+	PaperCash float64 `json:"paper_cash,omitempty"`
 }
 
 // DefaultBinanceConfig 出厂默认（§4.1 逐键）：总开关关——发布闸要求缺省不接通。
@@ -206,9 +267,90 @@ func validateBinance(b *BinanceConfig) error {
 		if e.p.DailyBudgetAmount < 0 {
 			return fmt.Errorf("binance.%s.daily_budget_amount 不能为负（%.2f）", e.name, e.p.DailyBudgetAmount)
 		}
+		// §MR-4A 做空保证金率域校验：0=禁做空（出厂缺省）；启用必须落在 (0,1]。
+		// 负值=配置错误；>1=名义杠杆低于 1 倍（开 1 元首寸冻结超过 1 元权益），超出档案表达能力，拒。
+		if e.p.ShortMarginRate < 0 || e.p.ShortMarginRate > 1 {
+			return fmt.Errorf("binance.%s.short_margin_rate 仅允许 0（禁做空）或 0-1 之间的保证金率（实际 %.4f）", e.name, e.p.ShortMarginRate)
+		}
+		// §MR-4B 产品线枚举：空/spot=现货（存量配置逐字节兼容）；umfutures 仅 CRYPTO 档案可用
+		// （美股没有币安永续产品线，US 侧填 umfutures 属配置错位，直接拒）。
+		switch e.p.ProductType {
+		case "", "spot":
+		case "umfutures":
+			if e.name == "stock" {
+				return fmt.Errorf("binance.stock.product_type 不支持 umfutures（永续仅 CRYPTO 档案）")
+			}
+		default:
+			return fmt.Errorf("binance.%s.product_type 仅允许 spot/umfutures（实际 %q）", e.name, e.p.ProductType)
+		}
+		// §MR-4B 杠杆域：0/1=不加杠杆；上限 20 为本地硬帽（设计稿"白名单例外"的替代收口——
+		// 更高杠杆档位在币安侧本就有分级保证金限制，本仓不做超限配置面）。
+		if e.p.Leverage < 0 || e.p.Leverage > 20 {
+			return fmt.Errorf("binance.%s.leverage 超出范围 0-20（实际 %d）", e.name, e.p.Leverage)
+		}
+		if e.p.Leverage > 1 && e.p.ProductType != "umfutures" {
+			return fmt.Errorf("binance.%s.leverage>1 仅允许 product_type=umfutures（现货档无杠杆语义）", e.name)
+		}
+		// §MR-4B 强平距离闸阈值域（0=闸关；>100 无意义）。
+		if e.p.LiqDistMinPct < 0 || e.p.LiqDistMinPct > 100 {
+			return fmt.Errorf("binance.%s.liq_dist_min_pct 超出范围 0-100（实际 %.2f）", e.name, e.p.LiqDistMinPct)
+		}
+		// §战法批 纸面盘卫生：初始资金非负；paper=true 但市场子开关关=空配置（柜台根本不会装配）。
+		if e.p.PaperCash < 0 {
+			return fmt.Errorf("binance.%s.paper_cash 不能为负（%.2f）", e.name, e.p.PaperCash)
+		}
+		if e.p.Paper && !e.p.Enabled {
+			return fmt.Errorf("binance.%s.paper=true 但该市场子开关关闭（纸面柜台根本不会装配，配置错位）", e.name)
+		}
+		// §战法批-4 死配置闸：币安链装配门是 Enabled||DataPlane（registry），两平面全关时
+		// paper 配了也建不出柜台——与其静默无效，不如启动期就报错指点开数据面。
+		if e.p.Paper && !b.Enabled && !b.DataPlane {
+			return fmt.Errorf("binance.%s.paper=true 需开启币安链平面（data_plane=true 或 enabled=true）——平面全关时纸面柜台不会装配，本配置无效", e.name)
+		}
+	}
+	// §MR-4B 红线（设计稿 §4.2-M5）：交易面开启且存在 leverage>1 档案时，必须有显式人工确认
+	// （leverage_acknowledged_at 时间戳，替代不可运行时验证的"白名单"概念）。
+	// 关闭交易面允许预配杠杆参数（数据面/离线演练形态），但结构上不可能真下单。
+	// English: §MR-4B red line — enabled trading with any leverage>1 profile requires the
+	// explicit human acknowledgement timestamp; configuring leverage while disabled is allowed
+	// (orders are structurally impossible without Enabled).
+	if b.Enabled && b.LeverageAcknowledgedAt == "" && (b.Stock.Leverage > 1 || b.Spot.Leverage > 1) {
+		return fmt.Errorf("binance.enabled=true 且存在 leverage>1 档案，但未签 leverage_acknowledged_at（合约杠杆须人工确认后才能开交易面，§MR-4B 红线）")
 	}
 	if b.RiskGate.MaxOrderAmount < 0 {
 		return fmt.Errorf("binance.risk_gate.max_order_amount 不能为负（%.2f）", b.RiskGate.MaxOrderAmount)
+	}
+	// —— §战法批 派发与事件打分的域校验（缺省全零=链静默，不启用也不阻断启动）——
+	d := b.Dispatch
+	if d.MinConfidence < 0 || d.MinConfidence > 1 {
+		return fmt.Errorf("binance.dispatch.min_confidence 超出范围 0-1（实际 %.2f）", d.MinConfidence)
+	}
+	if d.TakeProfitPct < 0 || d.TakeProfitPct > 100 || d.StopLossPct < 0 || d.StopLossPct > 100 {
+		return fmt.Errorf("binance.dispatch 止盈/止损幅度超出范围 0-100（tp=%.2f sl=%.2f）", d.TakeProfitPct, d.StopLossPct)
+	}
+	if d.EverySec != 0 && d.EverySec < 60 {
+		return fmt.Errorf("binance.dispatch.every_sec 仅允许 0（缺省 600s）或 ≥60（实际 %d）", d.EverySec)
+	}
+	if d.MaxLiveOrders < 0 || d.MaxLiveOrders > 50 {
+		return fmt.Errorf("binance.dispatch.max_live_orders 超出范围 0-50（实际 %d）", d.MaxLiveOrders)
+	}
+	// 派发一致性（fail-loud）：开派发但既无真交易面（Enabled+凭证）也无任何纸面盘——
+	// 派发单会全部撞在 Noop 执行器上白烧信号，属配置错位，启动即拒而不是静默空转。
+	if d.Enabled {
+		live := b.Enabled && b.APIKey != "" && b.APISecret != ""
+		if !live && !(b.Stock.Enabled && b.Stock.Paper) && !(b.Spot.Enabled && b.Spot.Paper) {
+			return fmt.Errorf("binance.dispatch.enabled=true 但既无交易面（enabled+凭证）也无纸面盘（paper=true）——派发链无处成交")
+		}
+	}
+	// 事件 LLM 打分：三键部分配置=半截接线（打分器根本装不起来），拒；全空=关键词基线。
+	ev := b.Events
+	if ev.LLMBaseURL != "" || ev.LLMApiKey != "" || ev.LLMModel != "" {
+		if ev.LLMBaseURL == "" || ev.LLMApiKey == "" || ev.LLMModel == "" {
+			return fmt.Errorf("binance.events.llm_* 需 base_url/api_key/model 三键齐备（缺席键=打分器不装配，应整体留空回关键词基线）")
+		}
+	}
+	if ev.LLMTimeoutSec != 0 && (ev.LLMTimeoutSec < 5 || ev.LLMTimeoutSec > 120) {
+		return fmt.Errorf("binance.events.llm_timeout_sec 仅允许 0（缺省 15s）或 5-120（实际 %d）", ev.LLMTimeoutSec)
 	}
 	// §ENH-B7 滑点回灌比例帽同构域校验（0~0.05）。当前消费面=engine 自动挂价链
 	// （autoPlace/sellRealPosition 读 ctrl.QMT().RiskGate），binance 侧仅做输入卫生。
@@ -251,6 +393,22 @@ func (b BinanceConfig) EquityBaseURL() string {
 		return ""
 	}
 	return "https://api.binance.com"
+}
+
+// FuturesBaseURL §MR-4B USDT 本位永续（umfutures）REST 根地址：
+// 主网 fapi.binance.com；testnet=true 时走 testnet.binancefuture.com（现货 testnet 域名
+// 不承载合约 API）。凭证缺失返回空串（上层拒绝探活/装配，同 BaseURL 惯例）。
+// 域名与现货分离是市场实际：合约 API 需要在币安侧单独授权，Key 建议分开申请（§5 备忘）。
+// English: §MR-4B UM-futures REST root (fapi mainnet / testnet.binancefuture.com); empty
+// without credentials, mirroring BaseURL's refusal semantics.
+func (b BinanceConfig) FuturesBaseURL() string {
+	if b.APIKey == "" || b.APISecret == "" {
+		return ""
+	}
+	if b.Testnet {
+		return "https://testnet.binancefuture.com"
+	}
+	return "https://fapi.binance.com"
 }
 
 // —— per-user KV（PLAN §4.4）：账号级隔离，命名空间 binance_config_json_v1 ——
@@ -367,6 +525,65 @@ func (v BinanceBrokerView) BrokerInitialCapital() float64 { return 0 }
 func (v BinanceBrokerView) BrokerStrategies() []string     { return v.profile().Strategies }
 func (v BinanceBrokerView) BrokerBlacklist() []string      { return v.profile().Blacklist }
 func (v BinanceBrokerView) BrokerRiskGate() RiskGateConfig { return v.Cfg.RiskGate }
+
+// BrokerShortMarginRate §MR-4A 市场档案做空保证金率（0=禁做空）。刻意不入 BrokerConfig 接口：
+// 这是币安侧档案专属字段，风控闸内用 moneyOf 同姿势的类型断言取用，QMT 视图恒落 0=禁用。
+// English: per-market short margin rate (0=disabled); kept off the BrokerConfig interface
+// (binance-profile-only field, consumed via type assertion with the moneyOf pattern).
+func (v BinanceBrokerView) BrokerShortMarginRate() float64 { return v.profile().ShortMarginRate }
+
+// FuturesActive §MR-4B 本视图产品线是否为 USDT 本位永续：仅 CRYPTO 档案 + product_type=umfutures
+// 同时成立（US 档案 validate 已拒 umfutures，这里双保险再收一次）。执行器/回报/维护节拍
+// 的全部合约分叉以本方法为唯一判定点。
+// English: §MR-4B single decision point of the futures fork — CRYPTO view with the umfutures
+// product line; US views can never be futures (validate rejects it upstream).
+func (v BinanceBrokerView) FuturesActive() bool {
+	return v.Market == "CRYPTO" && v.profile().ProductType == "umfutures"
+}
+
+// BrokerLeverage / BrokerLiqDistMinPct §MR-4B 档案杠杆与强平距离阈值的对外读取口。
+func (v BinanceBrokerView) BrokerLeverage() int          { return v.profile().Leverage }
+func (v BinanceBrokerView) BrokerLiqDistMinPct() float64 { return v.profile().LiqDistMinPct }
+
+// PaperActive §战法批 纸面成交柜台装配判定：交易面未激活（总开关关）且市场子开关开且
+// profile.paper=true。交易面激活时恒 false——真面永远优先，配置了 paper 也只打日志不生效，
+// 绝不出现「开着真交易却静默假成交」的危险形态。
+// English: §batch-xasset paper desk predicate — only while the live trading plane is off;
+// with Enabled=true this always returns false so a real profile can never fake-fill.
+func (v BinanceBrokerView) PaperActive() bool {
+	return !v.Cfg.Enabled && v.profile().Enabled && v.profile().Paper
+}
+
+// DispatchLLMActive 事件打分器启用判定：三键齐备（validate 已保证半截配置进不来）。
+func (b BinanceConfig) DispatchLLMActive() bool {
+	return b.Events.LLMBaseURL != "" && b.Events.LLMApiKey != "" && b.Events.LLMModel != ""
+}
+
+// —— §战法批 派发参数缺省回填（消费侧使用；validate 已做域校验，这里只做 0→缺省）——
+
+// ConfidenceFloor 信号置信度门槛：0=缺省 0.6。
+func (d BinanceDispatchConfig) ConfidenceFloor() float64 {
+	if d.MinConfidence <= 0 {
+		return 0.6
+	}
+	return d.MinConfidence
+}
+
+// EverySecOr 派发节拍秒：0=缺省 600；validate 已挡 <60。
+func (d BinanceDispatchConfig) EverySecOr() int {
+	if d.EverySec == 0 {
+		return 600
+	}
+	return d.EverySec
+}
+
+// MaxNewOrdersPerRound 单轮新单上限：0=缺省 5。
+func (d BinanceDispatchConfig) MaxNewOrdersPerRound() int {
+	if d.MaxLiveOrders <= 0 {
+		return 5
+	}
+	return d.MaxLiveOrders
+}
 
 // BrokerEnforceT1 false：现货与美股均 T+0（币安 equity 结算规则见 disclaimer/API 契约，不走本闸）。
 func (v BinanceBrokerView) BrokerEnforceT1() bool { return false }

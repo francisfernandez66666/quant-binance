@@ -127,6 +127,7 @@
     "market",
     "name",
     "qty",
+    "side",
     "signal_id",
     "strategy",
     "ts_code",

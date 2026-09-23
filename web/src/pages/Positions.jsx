@@ -677,7 +677,8 @@ export default function Positions() {
 
   // 实盘持仓表格列定义：代码、名称、数量、成本/现价、持仓盈亏、最高价、建议标签与操作按钮
   const realColumns = [
-    { colKey: 'ts_code', title: '代码', width: 90, cell: ({ row }) => <span style={{ color: 'var(--app-accent)', fontFamily: 'monospace' }}>{row.ts_code}</span> },
+    // §MR-4A 方向徽标：short 行（美股/加密开空持仓）挂「空」标；CN 与存量行 side 缺省 long 不显示，零回归
+    { colKey: 'ts_code', title: '代码', width: 90, cell: ({ row }) => <span style={{ color: 'var(--app-accent)', fontFamily: 'monospace' }}>{row.ts_code}{row.side === 'short' ? <Tag size="small" theme="warning" style={{ marginLeft: 4 }}>空</Tag> : null}</span> },
     { colKey: 'name', title: '名称', width: 90, cell: ({ row }) => <span style={{ color: 'var(--app-faint)' }}>{row.name}</span> },
     { colKey: 'qty', title: '数量', width: 70, sorter: (a, b) => (a.qty || 0) - (b.qty || 0), cell: ({ row }) => <span title={rowMarket(row) === 'CRYPTO' ? '枚' : '股'}>{fmtQty(row.qty, rowMarket(row))}</span> },
     { colKey: 'cost_price', title: '成本价', width: 90, sorter: (a, b) => (a.cost_price || 0) - (b.cost_price || 0), cell: ({ row }) => (row.cost_price != null ? (rowMarket(row) === 'CN' ? '¥' + Number(row.cost_price).toFixed(3) : fmtMoneyM(row.cost_price, rowMarket(row))) : '-') },

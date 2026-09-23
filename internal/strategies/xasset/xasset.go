@@ -80,10 +80,14 @@ type Params struct {
 	SlowN  int     // MA 慢窗（缺省 20）
 	RSIN   int     // RSI 周期（缺省 14）
 	MinRsi float64 // RSI 超卖回升买点下沿（缺省 30）
-	MaxRsi float64 // RSI 过热不追顶闸值（缺省 70）
+	MaxRsi float64 // RSI 过热不追顶闸值（缺省 70，空头腿的破位基准）
+	// BearEnabled §战法批 空头腿开关：false=只产买入信号（与本批前逐字节等价的出厂态），
+	// true=MACross 死叉/RSIMomentum 过热破位可产 short_open。发布闸纪律：默认关。
+	BearEnabled bool
 }
 
 // withDefaults 缺省回填（"零值=未配置"惯例，同 NormalizeBinance）。
+// 此处不回填 BearEnabled——false 是有意的出厂态（空头腿默认关），不是"未配置"。
 func (p Params) withDefaults() Params {
 	if p.FastN <= 0 {
 		p.FastN = 5
@@ -105,8 +109,15 @@ func (p Params) withDefaults() Params {
 
 // *_XASSET_MA 均线交叉战法
 
-// MACross 均线交叉战法：快线上穿慢线（金叉）且慢线自身抬头才放行。
-// English: moving-average cross strategy — buy on fast-over-slow golden cross with a rising slow MA.
+// evalSideShort Evaluation.Details 的空头腿方向章键（>0=本次过闸是死叉/破位做空向）。
+// 借 Details 传递而不新增 Evaluation 字段：strategy.Evaluation 是 CN 链共用的冻结契约，
+// 本批只在 xasset 两家之内自产自销，不动公共结构。
+const evalSideShort = "side_short"
+
+// MACross 均线交叉战法：快线上穿慢线（金叉）且慢线自身抬头才放行做多；
+// §战法批 BearEnabled 开时对称产出死叉做空（快下穿慢且慢线走低）。
+// English: moving-average cross — buy on golden cross with rising slow MA; bear leg (opt-in)
+// mirrors to short_open on death cross with falling slow MA.
 type MACross struct {
 	market string
 	p      Params
@@ -132,7 +143,7 @@ func (s *MACross) Name() string { return "均线交叉·" + s.market }
 func (s *MACross) Type() strategy.SignalType { return strategy.SignalMACross }
 
 // Evaluate 金叉判定：本根 fast>slow 且上根 fast<=slow（穿越**事件**，不是位置关系——
-// 持续多头不误发新单），慢线斜率>=0 排除"下降途中反抽"。
+// 持续多头不误发新单），慢线斜率>=0 排除"下降途中反抽"；BearEnabled 开时死叉镜像产空头章。
 func (s *MACross) Evaluate(code string, raw interface{}) (*strategy.Evaluation, error) {
 	md, _ := raw.(*strategy_engine.StockMarketData)
 	closes := closesOf(md)
@@ -149,11 +160,19 @@ func (s *MACross) Evaluate(code string, raw interface{}) (*strategy.Evaluation, 
 	prevFast, prevSlow := sma(closes[:n-1], s.p.FastN), sma(closes[:n-1], s.p.SlowN)
 	prevSlowWin := sma(closes[:n-2], s.p.SlowN) // 慢线再前一窗（判抬头的基线）
 	golden := curFast > curSlow && prevFast <= prevSlow
+	death := curFast < curSlow && prevFast >= prevSlow
 	rising := curSlow >= prevSlowWin
-	pass := golden && rising
+	falling := curSlow <= prevSlowWin
+	longPass := golden && rising
+	// §战法批 空头腿=死叉镜像（同样是穿越事件而非位置关系；持续空头不误发新空单），
+	// 且要求慢线走低——上升途中的回踩不做空。BearEnabled=false 时此式恒假=旧行为。
+	shortPass := s.p.BearEnabled && death && falling
+	pass := longPass || shortPass
 	level := "fail"
-	if pass {
+	if longPass {
 		level = "full_chain"
+	} else if shortPass {
+		level = "full_chain_short"
 	}
 	reasons := map[string]string{
 		"cross": fmt.Sprintf("快线 %.4f（上根 %.4f）/ 慢线 %.4f（上根 %.4f）", curFast, prevFast, curSlow, prevSlowWin),
@@ -163,9 +182,16 @@ func (s *MACross) Evaluate(code string, raw interface{}) (*strategy.Evaluation, 
 	} else if !golden {
 		reasons["gate"] = "本根无金叉事件（位置关系不等于穿越）"
 	}
+	if shortPass {
+		reasons["leg"] = "空头腿：死叉且慢线走低（BearEnabled）"
+		delete(reasons, "gate")
+	}
 	conf := 0.0
 	if pass {
 		conf = 0.6 + 0.2*(curFast-curSlow)/curSlow // 穿越力度越大置信度越高（比值无单位依赖）
+		if shortPass {
+			conf = 0.6 + 0.2*(curSlow-curFast)/curSlow // 死叉取镜像幅度
+		}
 		if conf > 0.9 {
 			conf = 0.9
 		}
@@ -174,21 +200,30 @@ func (s *MACross) Evaluate(code string, raw interface{}) (*strategy.Evaluation, 
 	if pass {
 		score = 100
 	}
+	details := map[string]float64{"fast": curFast, "slow": curSlow, "prev_fast": prevFast, "prev_slow": prevSlow}
+	if shortPass {
+		details[evalSideShort] = 1 // 方向章：GenerateSignal 据此 fork 买/空
+	}
 	return &strategy.Evaluation{
 		TotalScore: score,
-		Details:    map[string]float64{"fast": curFast, "slow": curSlow, "prev_fast": prevFast, "prev_slow": prevSlow},
+		Details:    details,
 		Pass:       pass, Level: level, Confidence: conf, Reasons: reasons,
 	}, nil
 }
 
 // GenerateSignal 过闸才出信号；Market 章在此盖下（构造期锁定的市场键原样透传）。
+// §战法批：Details 带空头章时改产 short_open（开空信号），其余仍为买入。
 func (s *MACross) GenerateSignal(code string, eval *strategy.Evaluation) (*strategy.Signal, error) {
 	if eval == nil || !eval.Pass {
 		return nil, nil
 	}
+	action, reason := strategy.ActionBuy, "币安均线金叉（快上穿慢且慢线抬头）"
+	if eval.Details[evalSideShort] > 0 {
+		action, reason = strategy.ActionShortOpen, "币安均线死叉（快下穿慢且慢线走低）"
+	}
 	return &strategy.Signal{
-		Code: code, Type: s.Type(), Action: strategy.ActionBuy, Priority: strategy.P3,
-		Reason:     "币安均线金叉（快上穿慢且慢线抬头）",
+		Code: code, Type: s.Type(), Action: action, Priority: strategy.P3,
+		Reason:     reason,
 		Confidence: eval.Confidence, Timestamp: time.Now().Unix(),
 		StrategyName: s.Name(), Market: s.market,
 	}, nil
@@ -197,9 +232,10 @@ func (s *MACross) GenerateSignal(code string, eval *strategy.Evaluation) (*strat
 // *_XASSET_RSI RSI 动量战法
 
 // RSIMomentum RSI 动量战法：超卖区上穿回升买（前一根 < MinRsi、本根 ≥ MinRsi 且 < MaxRsi），
-// 过热不追顶。卖出腿交给持仓退出链（本包只产入场信号，与 CN 形态战法分工一致）。
-// English: RSI momentum — buy the breakout up out of oversold (prev < floor, now ≥ floor and < ceiling);
-// entry signals only, exits belong to the position-exit chain.
+// 过热不追顶。§战法批 BearEnabled 开时对称产出"过热破位"做空（前一根 ≥ MaxRsi、本根跌破）。
+// 持仓退出仍走退出链（本包入场信号为主，与 CN 形态战法分工一致）。
+// English: RSI momentum — buy the breakout up out of oversold; opt-in bear leg shorts the
+// break-down out of overbought. Position exits still belong to the exit chain.
 type RSIMomentum struct {
 	market string
 	p      Params
@@ -265,7 +301,8 @@ func rsiOf(avgG, avgL float64) float64 {
 	return 100 - 100/(1+avgG/avgL)
 }
 
-// Evaluate 超卖回升判定：末两根 RSI 穿越 MinRsi 上沿、且未过热。
+// Evaluate 超卖回升判定：末两根 RSI 穿越 MinRsi 上沿、且未过热；BearEnabled 开时
+// 过热破位（上根 ≥MaxRsi、本根跌破）镜像产空头章。
 func (s *RSIMomentum) Evaluate(code string, raw interface{}) (*strategy.Evaluation, error) {
 	md, _ := raw.(*strategy_engine.StockMarketData)
 	closes := closesOf(md)
@@ -276,9 +313,15 @@ func (s *RSIMomentum) Evaluate(code string, raw interface{}) (*strategy.Evaluati
 	}
 	prev, cur := series[len(series)-2], series[len(series)-1]
 	buy := prev < s.p.MinRsi && cur >= s.p.MinRsi && cur < s.p.MaxRsi
+	// §战法批 空头腿=过热破位镜像：上根仍在过热区（≥MaxRsi）、本根跌破=动能衰竭事件，
+	// 跌破后回升不追空（cur>=MaxRsi 时事件不成立）。BearEnabled=false 恒假=旧行为。
+	short := s.p.BearEnabled && prev >= s.p.MaxRsi && cur < s.p.MaxRsi
+	pass := buy || short
 	level := "fail"
 	if buy {
 		level = "full_chain"
+	} else if short {
+		level = "full_chain_short"
 	}
 	reasons := map[string]string{"rsi": fmt.Sprintf("上根 %.1f → 本根 %.1f（下沿 %.0f / 上沿 %.0f）", prev, cur, s.p.MinRsi, s.p.MaxRsi)}
 	if !buy {
@@ -289,30 +332,46 @@ func (s *RSIMomentum) Evaluate(code string, raw interface{}) (*strategy.Evaluati
 			reasons["gate"] = "回升直冲过热区：不追顶"
 		}
 	}
+	if short {
+		reasons["leg"] = "空头腿：过热破位（BearEnabled）"
+		delete(reasons, "gate")
+	}
 	conf := 0.0
 	score := 0.0
-	if buy {
+	if pass {
 		score = 100
-		conf = 0.55 + 0.25*(cur-s.p.MinRsi)/(s.p.MaxRsi-s.p.MinRsi) // 回升越深置信度越高，封顶 0.8
+		if buy {
+			conf = 0.55 + 0.25*(cur-s.p.MinRsi)/(s.p.MaxRsi-s.p.MinRsi) // 回升越深置信度越高，封顶 0.8
+		} else {
+			conf = 0.55 + 0.25*(prev-cur)/(s.p.MaxRsi-s.p.MinRsi) // 破位越深置信度越高，同封顶
+		}
 		if conf > 0.8 {
 			conf = 0.8
 		}
 	}
+	details := map[string]float64{"rsi": cur, "rsi_prev": prev}
+	if short {
+		details[evalSideShort] = 1
+	}
 	return &strategy.Evaluation{
 		TotalScore: score,
-		Details:    map[string]float64{"rsi": cur, "rsi_prev": prev},
-		Pass:       buy, Level: level, Confidence: conf, Reasons: reasons,
+		Details:    details,
+		Pass:       pass, Level: level, Confidence: conf, Reasons: reasons,
 	}, nil
 }
 
-// GenerateSignal 过闸才出信号，Market 章同 MACross。
+// GenerateSignal 过闸才出信号，Market 章同 MACross；空头章在=过热破位做空信号。
 func (s *RSIMomentum) GenerateSignal(code string, eval *strategy.Evaluation) (*strategy.Signal, error) {
 	if eval == nil || !eval.Pass {
 		return nil, nil
 	}
+	action, reason := strategy.ActionBuy, "币安 RSI 超卖回升（穿下沿且未过热）"
+	if eval.Details[evalSideShort] > 0 {
+		action, reason = strategy.ActionShortOpen, "币安 RSI 过热破位（跌破上沿，动能衰竭）"
+	}
 	return &strategy.Signal{
-		Code: code, Type: s.Type(), Action: strategy.ActionBuy, Priority: strategy.P3,
-		Reason:     "币安 RSI 超卖回升（穿下沿且未过热）",
+		Code: code, Type: s.Type(), Action: action, Priority: strategy.P3,
+		Reason:     reason,
 		Confidence: eval.Confidence, Timestamp: time.Now().Unix(),
 		StrategyName: s.Name(), Market: s.market,
 	}, nil

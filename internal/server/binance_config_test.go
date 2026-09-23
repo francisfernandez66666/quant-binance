@@ -132,3 +132,29 @@ func TestBinanceConfigDataPlane(t *testing.T) {
 		t.Fatal("400 路径不得落库")
 	}
 }
+
+// TestBinanceConfigShortMarginRate §MR-4A 做空档案写入面行为锁：
+// ①POST 带 stock.short_margin_rate=0.5 落库并从 GET 档案回显（整档替换腿零改动，字段随行）；
+// ②>1 与负值被 validateBinance 拒（400），且不落库（GET 仍是旧值）——0=禁做空的出厂缺省
+// 由发布闸测试覆盖（GET 缺省档案无该键=omitempty 零值=禁用）。
+func TestBinanceConfigShortMarginRate(t *testing.T) {
+	s := newBinanceConfigServer(t)
+	if rr := binancePost(t, s, `{"stock":{"enabled":true,"fixed_amount":500,"short_margin_rate":0.5}}`); rr.Code != 200 {
+		t.Fatalf("合法保证金率应 200: %d %s", rr.Code, rr.Body.String())
+	}
+	v := binanceGet(t, s)
+	stock, _ := v["stock"].(map[string]interface{})
+	if stock == nil || stock["short_margin_rate"] != 0.5 {
+		t.Fatalf("GET 应回显 short_margin_rate=0.5, got %v", v["stock"])
+	}
+	for _, bad := range []string{"1.5", "-0.1"} {
+		if rr := binancePost(t, s, `{"stock":{"enabled":true,"short_margin_rate":`+bad+`}}`); rr.Code != 400 {
+			t.Fatalf("非法保证金率 %s 必须 400, got %d", bad, rr.Code)
+		}
+	}
+	v = binanceGet(t, s)
+	stock, _ = v["stock"].(map[string]interface{})
+	if stock["short_margin_rate"] != 0.5 {
+		t.Fatalf("非法提交不得污染已落库值, got %v", stock["short_margin_rate"])
+	}
+}

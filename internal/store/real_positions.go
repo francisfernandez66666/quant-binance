@@ -33,8 +33,13 @@ type RealPosition struct {
 	// 空串按 CN 归一（存量网关回报零改动兼容）。json tag 进入回报契约 golden 反射面。
 	// English: §BINANCE-P1c — market/quote-currency legs; empty market normalizes to CN so
 	// existing QMT payloads are accepted unchanged. Both tags join the report contract golden.
-	Market       string  `json:"market"`
-	Currency     string  `json:"currency"`
+	Market   string `json:"market"`
+	Currency string `json:"currency"`
+	// Side §MR-4A 持仓方向 long|short，缺省 long：增量加列迁移（与 user_id/buy_date/market
+	// 同款 ALTER ADD COLUMN DEFAULT 模式，非破坏、存量行回填 long、主键不变）。
+	// 单向簿口径：一行一方向，反向成交事务内拒收（见 ApplyRealFill）。
+	// English: §MR-4A additive direction column; one-way book (opposite-direction fill rejected).
+	Side         string  `json:"side,omitempty"`
 	TsCode       string  `json:"ts_code"`       // TS代码
 	Name         string  `json:"name"`          // 名称
 	Qty          float64 `json:"qty"`           // 数量（§P1-d int→float64，支持加密小数）
@@ -469,7 +474,7 @@ func (d *DB) ReconcilePositionsForUser(userID, market string, pos []RealPosition
 // §P1c：带出 market/currency（COALESCE 兜底重建前的历史 NULL）。
 // （RealPositions returns every live position for the decision layer.）
 func (d *DB) RealPositions() ([]RealPosition, error) {
-	rows, err := d.db.Query(`SELECT COALESCE(market,'CN'), COALESCE(currency,''), ts_code, name, qty, cost_price, amount, highest_price,
+	rows, err := d.db.Query(`SELECT COALESCE(market,'CN'), COALESCE(currency,''), COALESCE(side,'long'), ts_code, name, qty, cost_price, amount, highest_price,
 		strategy, signal_id, updated_at, COALESCE(user_id,'') FROM real_positions ORDER BY market, ts_code`)
 	if err != nil {
 		return nil, err
@@ -478,7 +483,7 @@ func (d *DB) RealPositions() ([]RealPosition, error) {
 	var out []RealPosition
 	for rows.Next() {
 		var p RealPosition
-		if err := rows.Scan(&p.Market, &p.Currency, &p.TsCode, &p.Name, &p.Qty, &p.CostPrice, &p.Amount,
+		if err := rows.Scan(&p.Market, &p.Currency, &p.Side, &p.TsCode, &p.Name, &p.Qty, &p.CostPrice, &p.Amount,
 			&p.HighestPrice, &p.Strategy, &p.SignalID, &p.UpdatedAt, &p.UserID); err != nil {
 			return nil, err
 		}
@@ -493,7 +498,7 @@ func (d *DB) RealPositions() ([]RealPosition, error) {
 // across all markets (P1c); callers that need one market filter on p.Market.
 func (d *DB) RealPositionsForUser(userID string) ([]RealPosition, error) {
 	rows, err := d.db.Query(`SELECT COALESCE(market,'CN'), COALESCE(currency,''), ts_code, name, qty, cost_price, amount, highest_price,
-		strategy, signal_id, updated_at, COALESCE(user_id,''), COALESCE(buy_date,'') FROM real_positions
+		strategy, signal_id, updated_at, COALESCE(user_id,''), COALESCE(buy_date,''), COALESCE(side,'long') FROM real_positions
 		WHERE user_id = '' OR user_id = ? ORDER BY market, ts_code`, userID)
 	if err != nil {
 		return nil, err
@@ -503,7 +508,7 @@ func (d *DB) RealPositionsForUser(userID string) ([]RealPosition, error) {
 	for rows.Next() {
 		var p RealPosition
 		if err := rows.Scan(&p.Market, &p.Currency, &p.TsCode, &p.Name, &p.Qty, &p.CostPrice, &p.Amount,
-			&p.HighestPrice, &p.Strategy, &p.SignalID, &p.UpdatedAt, &p.UserID, &p.BuyDate); err != nil {
+			&p.HighestPrice, &p.Strategy, &p.SignalID, &p.UpdatedAt, &p.UserID, &p.BuyDate, &p.Side); err != nil {
 			return nil, err
 		}
 		out = append(out, p)
@@ -519,9 +524,9 @@ func (d *DB) RealPositionsForUser(userID string) ([]RealPosition, error) {
 func (d *DB) RealPositionByCode(code string) (RealPosition, error) {
 	var p RealPosition
 	err := d.db.QueryRow(`SELECT COALESCE(market,'CN'), COALESCE(currency,''), ts_code, name, qty, cost_price, amount, highest_price,
-		strategy, signal_id, updated_at, COALESCE(user_id,'') FROM real_positions WHERE ts_code=?`, code).
+		strategy, signal_id, updated_at, COALESCE(user_id,''), COALESCE(side,'long') FROM real_positions WHERE ts_code=?`, code).
 		Scan(&p.Market, &p.Currency, &p.TsCode, &p.Name, &p.Qty, &p.CostPrice, &p.Amount,
-			&p.HighestPrice, &p.Strategy, &p.SignalID, &p.UpdatedAt, &p.UserID)
+			&p.HighestPrice, &p.Strategy, &p.SignalID, &p.UpdatedAt, &p.UserID, &p.Side)
 	return p, err
 }
 
@@ -533,10 +538,10 @@ func (d *DB) RealPositionByCode(code string) (RealPosition, error) {
 func (d *DB) RealPositionByCodeForUser(userID, code string) (RealPosition, error) {
 	var p RealPosition
 	err := d.db.QueryRow(`SELECT COALESCE(market,'CN'), COALESCE(currency,''), ts_code, name, qty, cost_price, amount, highest_price,
-		strategy, signal_id, updated_at, COALESCE(user_id,'') FROM real_positions
+		strategy, signal_id, updated_at, COALESCE(user_id,''), COALESCE(side,'long') FROM real_positions
 		WHERE ts_code=? AND (user_id = '' OR user_id = ?)`, code, userID).
 		Scan(&p.Market, &p.Currency, &p.TsCode, &p.Name, &p.Qty, &p.CostPrice, &p.Amount,
-			&p.HighestPrice, &p.Strategy, &p.SignalID, &p.UpdatedAt, &p.UserID)
+			&p.HighestPrice, &p.Strategy, &p.SignalID, &p.UpdatedAt, &p.UserID, &p.Side)
 	return p, err
 }
 
@@ -551,6 +556,11 @@ func (d *DB) ApplyRealFill(f RealFill) error {
 	f.Market = normalizeMarket(f.Market)
 	if f.Currency == "" {
 		f.Currency = defaultCurrency(f.Market)
+	}
+	// §MR-4A 做空腿只活在 US/CRYPTO：CN（含未知市场归一后的 CN）收到开空/平空方向
+	// 一律事务前拒收（fail-close）。CN 链值域恒为 买入/卖出，此为负向锁的行为面。
+	if (f.Side == "卖出开空" || f.Side == "买入平仓") && f.Market != "US" && f.Market != "CRYPTO" {
+		return fmt.Errorf("apply fill %s: §MR-4A 做空方向 %q 不得出现在市场 %s（仅 US/CRYPTO）", f.Code, f.Side, f.Market)
 	}
 	tx, err := d.db.Begin()
 	if err != nil {
@@ -568,15 +578,28 @@ func (d *DB) ApplyRealFill(f RealFill) error {
 
 	var p RealPosition
 	err = tx.QueryRow(`SELECT ts_code, name, qty, cost_price, amount, highest_price,
-		strategy, signal_id, user_id FROM real_positions WHERE market=? AND ts_code=? AND (user_id='' OR user_id=?)`, f.Market, f.Code, f.UserID).
-		Scan(&p.TsCode, &p.Name, &p.Qty, &p.CostPrice, &p.Amount, &p.HighestPrice, &p.Strategy, &p.SignalID, &p.UserID)
+		strategy, signal_id, user_id, COALESCE(side,'long') FROM real_positions WHERE market=? AND ts_code=? AND (user_id='' OR user_id=?)`, f.Market, f.Code, f.UserID).
+		Scan(&p.TsCode, &p.Name, &p.Qty, &p.CostPrice, &p.Amount, &p.HighestPrice, &p.Strategy, &p.SignalID, &p.UserID, &p.Side)
 	switch {
 	case err == sql.ErrNoRows:
-		// 首次成交：建仓（卖出空仓视为 no-op，仅记录 fills，不建行）。
+		// §MR-4A 方向矩阵（单向簿，一行一方向；CN 链零行为变化的推导见函数头注释块）：
+		//   买入       无行=开多；   卖出 无行=no-op 只记 fills（存量行为）；
+		//   卖出开空   无行=开空；   买入平仓 无行=拒（平不存在空头=方向错，不伪造行）。
+		// 首次成交建仓（卖出空仓视为 no-op，仅记录 fills，不建行）。
 		// §实盘账户隔离：INSERT 必须写入 user_id，将该持仓归属到来源成交的账号，
 		// 否则该持仓会落入 user_id='' 的遗留全局行，对所有账号可见，造成跨账号持仓泄漏。
 		err = nil
-		if f.Side == "买入" {
+		// §MR-4A 开向判定：买入→多头开仓；卖出开空→空头开仓；其余无行不动账。
+		var openSide string
+		switch f.Side {
+		case "买入":
+			openSide = "long"
+		case "卖出开空":
+			openSide = "short"
+		case "买入平仓":
+			return fmt.Errorf("apply fill %s %s: §MR-4A 无空头持仓可平（不伪造行）", f.Code, f.Side)
+		}
+		if openSide != "" {
 			// §修复 R8（2026-08-29）：建仓时回填成交携带的 name（此前硬编码空串，
 			// 导致实盘持仓页个股名称为空）。
 			// §WS-A T+1：建仓记录买入交易日 buy_date（北京时，T+1 可卖量判定用）。
@@ -585,6 +608,7 @@ func (d *DB) ApplyRealFill(f RealFill) error {
 			// 与 paper 口径 `p.Cost += cost + fee`（paper.go:1480）对齐——旧实现成本只含
 			// 成交均价，费用腿被凭空抹掉，实盘账面系统性偏乐观、settlement_diff.fee_diff
 			// 永不收敛。印花税为卖出环节税费，不摊买入成本。
+			// §MR-4A 空头开仓同口径含费（做空成本基准=含费开空均价，浮盈=基准−现价）。
 			buyCostPerShare := f.Price
 			amountWithFee := f.Price * float64(f.Qty)
 			if f.Qty > 0 {
@@ -592,9 +616,9 @@ func (d *DB) ApplyRealFill(f RealFill) error {
 				buyCostPerShare = amountWithFee / float64(f.Qty)
 			}
 			_, err = tx.Exec(`INSERT INTO real_positions
-				(market, currency, ts_code, name, qty, cost_price, amount, highest_price, strategy, signal_id, updated_at, user_id, buy_date)
-				VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-				f.Market, f.Currency, f.Code, f.Name, f.Qty, buyCostPerShare, amountWithFee, f.Price, "", f.SignalID,
+				(market, currency, side, ts_code, name, qty, cost_price, amount, highest_price, strategy, signal_id, updated_at, user_id, buy_date)
+				VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+				f.Market, f.Currency, openSide, f.Code, f.Name, f.Qty, buyCostPerShare, amountWithFee, f.Price, "", f.SignalID,
 				time.Now().Format("2006-01-02 15:04:05"), f.UserID, buyDate)
 		}
 	case err == nil:
@@ -604,7 +628,17 @@ func (d *DB) ApplyRealFill(f RealFill) error {
 		if ownerID == "" {
 			ownerID = p.UserID
 		}
-		if f.Side == "买入" {
+		// §MR-4A 方向合法性：成交方向必须与行方向同侧（买入/卖出=多头侧；
+		// 卖出开空/买入平仓=空头侧）。异侧一律事务内拒收（回滚、fills 不落）——
+		// 多头行上被做空、空头行上被做多都是方向错，绝不静默翻转或对冲。
+		rowShort := p.Side == "short"
+		fillShort := f.Side == "卖出开空" || f.Side == "买入平仓"
+		if rowShort != fillShort {
+			return fmt.Errorf("apply fill %s %s: §MR-4A 方向冲突（持仓行 side=%s，成交方向 %q 不同侧，拒绝入簿）",
+				f.Code, f.Side, p.Side, f.Side)
+		}
+		if f.Side == "买入" || f.Side == "卖出开空" {
+			// 加仓（多头=买入加仓；空头=卖出开空加仓）：含费加权平均成本同一公式。
 			newQty := p.Qty + f.Qty
 			var newCost float64
 			if newQty > 0 {
@@ -624,6 +658,7 @@ func (d *DB) ApplyRealFill(f RealFill) error {
 				WHERE market=? AND ts_code=? AND (user_id='' OR user_id=?)`,
 				newQty, newCost, newCost*float64(newQty), hi, now, ownerID, f.Name, f.Market, f.Code, f.UserID)
 		} else {
+			// 减仓（多头=卖出减仓；空头=买入平仓减仓）：qty 记正数，清出靠下方 qty<=0 清扫。
 			newQty := p.Qty - f.Qty
 			if newQty < 0 {
 				newQty = 0
@@ -797,7 +832,7 @@ func (d *DB) SweepStaleBuyOrders(userID, beforeDay, market string) (int64, error
 		market = "CN" // 空市场键按 CN 归一（与 UpsertRealOrder 的 normalizeMarket 同口径）
 	}
 	res, err := d.db.Exec(`UPDATE orders SET status='废单'
-		WHERE user_id=? AND market=? AND side='买入' AND status IN ('已报','部成')
+		WHERE user_id=? AND market=? AND side IN ('买入','买入平仓') AND status IN ('已报','部成')
 		AND substr(created_at,1,10) <> '' AND substr(created_at,1,10) < ?`,
 		userID, market, beforeDay)
 	if err != nil {

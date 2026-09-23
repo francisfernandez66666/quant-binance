@@ -108,6 +108,23 @@ type Rules struct {
 	// English: signal-controller rollout knobs — shadow-observation for newly enforced gates
 	// (blacklists on the signal side); strategy whitelist is always hard, unaffected.
 	SignalCtl SignalCtlConfig `json:"signal_ctl"`
+	// §CN-MASTER A股总开关（cn 段）：装配级闸门，关闭时 CN 采集/新闻/触发/打分/主时段循环
+	// 在启动期整体不装配，进程只跑 HTTP 服务 + 币安链节拍。
+	// 出厂缺省 enabled=false（用户指令：默认关闭 A股相关东西）；改后需重启生效
+	// （boot-frozen，与 binance.data_plane 同口径——热轮换循环装配属另一量级工程）。
+	// English: §CN-MASTER — assembly-level gate for all A-share (CN) chains. Off by default per
+	// the operator's request; takes effect at boot only (no hot-swap), same doctrine as data_plane.
+	CN CNConfig `json:"cn,omitempty"`
+}
+
+// CNConfig §CN-MASTER A股总开关配置段。
+// （Config section for the CN/A-share master assembly switch.）
+type CNConfig struct {
+	// Enabled A股链总开关：true=全部 CN 循环照常（与开关诞生前字节等价）；
+	// false（缺省）=CN 装配腿在启动期跳过，仅保留日志与"已停用"宣告。
+	// 注意：只关装配循环，不删任何端点/前端页面——CN 路由自然降级为无数据源可服务的
+	// 空响应，鉴权/健康等共享面零波及。
+	Enabled bool `json:"enabled"`
 }
 
 // AppReleaseConfig §APPVER 2026-09-22 C批：APK 版本发布单，经公开端点

@@ -315,6 +315,21 @@ func (c *Controller) SetHaltEvidenceSource(fn func(symbol string) (hasEvidence, 
 	c.gate.SetHaltEvidenceSource(fn)
 }
 
+// SetShortBorrowEvidenceSource §MR-4A 为风控第 16 道闸（short_borrow）注入借券/做空可得性
+// 证据源（委托透传同前）。装配纪律：未装配=闸 fail-close 拒一切开空——模拟链由纸面执行器
+// 注入恒真源，实盘链等有真实借券/合约可得性查询后再注入（发布闸口径）。
+// English: wires the borrow-availability evidence into risk gate 16; unwired = short-opens rejected (fail-close).
+func (c *Controller) SetShortBorrowEvidenceSource(fn func(market, code string) (available bool, detail string)) {
+	c.gate.SetShortBorrowEvidenceSource(fn)
+}
+
+// SetLiqDistanceEvidenceSource §MR-4B 为风控第 17 道闸（liq_distance）注入合约强平距离
+// 证据源（仅合约视图装配；现货/美股不接=闸保持跳过，数据闸缺省姿势）。
+// English: wires the futures liquidation-distance evidence into risk gate 17 (futures views only).
+func (c *Controller) SetLiqDistanceEvidenceSource(fn func(market, code string) (ok bool, detail string)) {
+	c.gate.SetLiqDistanceEvidenceSource(fn)
+}
+
 // StateSnapshot 互通健康快照：下行（首尔探测网关）+ 上行（网关回报到首尔）两侧状态，
 // 供 /api/qmt/state、仪表盘系统行与量化交易页消费。零值时间表示"从未发生"。
 // English: connectivity snapshot for the dashboard/system row and quant page — downlink probe
@@ -719,9 +734,12 @@ func (c *Controller) placeOrder(req OrderRequest) (*OrderResult, error) {
 	}
 
 	var res *OrderResult
-	if req.Side == SideSell {
+	// §MR-4A 卖向路由扩集：卖出开空与卖出同走 PlaceSell（执行器按 req.Side 映射 API 侧向，
+	// QMT 网关永远收不到 卖出开空——CN 方向值域由风控 side 闸先行拒收，此处零波及）。
+	if req.Side == SideSell || req.Side == SideShortOpen {
 		res, err = c.execRef().PlaceSell(req)
 	} else {
+		// 买入/买入平仓 → PlaceBuy（平仓单带专用向，账簿侧见 store.ApplyRealFill 方向矩阵）
 		res, err = c.execRef().PlaceBuy(req)
 	}
 	if err != nil {

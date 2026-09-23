@@ -52,6 +52,15 @@ func (s *Server) SetXEventsSource(fn func(market string) (events []map[string]an
 	s.xeventsSource = fn
 }
 
+// SetDispatchSource §战法批-5 注入派发摘要闭包（装配层=main.go，按账号读引擎 DispatchReports）。
+// nil=未注入时 /api/binance/state 不含 "dispatch" 节（零配置零行为，同 fng/events 惯例）；
+// 注入后每市场各成一小节，从未派发过呈 {"ok":false}——无记录≠在派发，绝不渲染假绿灯。
+// English: injects the per-account dispatch-report closure; nil omits the "dispatch" node,
+// markets with no tick yet report ok=false.
+func (s *Server) SetDispatchSource(fn func(userID, market string) (any, bool)) {
+	s.dispatchSource = fn
+}
+
 // handleBinanceState GET /api/binance/state：双市场控制器快照 + 执行器/接收器健康度。
 // 前端 BinanceStatusCard 消费；只读、零副作用。
 func (s *Server) handleBinanceState(w http.ResponseWriter, r *http.Request) {
@@ -116,6 +125,20 @@ func (s *Server) handleBinanceState(w http.ResponseWriter, r *http.Request) {
 			node[m] = entry
 		}
 		out["events"] = node
+	}
+	// §战法批-5 派发摘要节：每市场最近一轮 DispatchReport（universe/signals/placed/rejected/
+	// exit_placed/desk/notes）。闭包未注入=整节省略；该市场从未派发过呈 {"ok":false}。
+	if s.dispatchSource != nil {
+		dnode := map[string]any{}
+		for _, m := range []string{"US", "CRYPTO"} {
+			rep, ok := s.dispatchSource(uid, m)
+			entry := map[string]any{"ok": ok}
+			if ok {
+				entry["report"] = rep
+			}
+			dnode[m] = entry
+		}
+		out["dispatch"] = dnode
 	}
 	writeJSON(w, 200, out)
 }

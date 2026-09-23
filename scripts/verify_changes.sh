@@ -1420,5 +1420,43 @@ go test -count=1 ./internal/data/ -run 'TestEdgarISO8859CharsetDecode' 2>&1 | gr
 grep -q 'dec.CharsetReader = latin1ToUTF8Reader' internal/data/edgar.go || { echo "--- FAIL: §MR-EDGAR-ENC CharsetReader 注入丢失（xml.Unmarshal 裸奔=US 事件腿全灭复活）"; exit 1; }
 echo "ok - §MR 市场实际改造批专项守卫通过（行为回归 5 组 + 静态锁 17 道〔含 MR-1 执行器误用负锁〕）"
 
+echo "==> 62 §MR-4/战法批/CN-MASTER：做空+合约四链派发、纸面柜台、EDGAR 映射、A股总开关（2026-09-23 PLAN_MARKET_REALITY §MR-4A/4B + §战法批 + §CN-MASTER）..."
+# 背景：本批把「战法→信号→下单」在做多/做空 × 现货/合约四链全线打通（无密钥纸面柜台承载），
+# 加 EDGAR CIK→ticker 映射兜底、派发摘要进状态端点/设置页，并以 rules.cn.enabled（缺省关）
+# 把 A股装配腿做成总开关。行为锁按包分组跑本批测试族；静态锁钉死"门在位且没把币安链关进门里"。
+# ---- 行为锁①：§CN-MASTER 配置默认关 + /api/status 双向旗标 ----
+go test -count=1 ./internal/config/ -run 'TestCNMaster' 2>&1 | grep -q '^ok' || { echo "--- FAIL: §CN-MASTER 配置出厂默认关回归未过"; exit 1; }
+go test -count=1 ./internal/server/ -run 'TestStatusCNMaster' 2>&1 | grep -q '^ok' || { echo "--- FAIL: §CN-MASTER 状态旗标回归未过"; exit 1; }
+# ---- 行为锁②：§MR-4B/§战法批-1 配置域（合约 URL/派发校验/纸面卫生/打分键全有或全无）----
+go test -count=1 ./internal/config/ -run 'TestFutures|TestValidateMR4BMatrix|TestValidateDispatch|TestValidatePaperHygiene|TestValidateLLMKeys|TestPaperActive|TestDispatchEffective' 2>&1 | grep -q '^ok' || { echo "--- FAIL: §MR-4/战法批 配置域回归未过"; exit 1; }
+# ---- 行为锁③：§战法批-4 派发核四链（多/空×现货/合约+止盈止损+关闸零发+幂等键）----
+go test -count=1 ./internal/engine/ -run 'TestDispatch|TestAsyncDispatcher' 2>&1 | grep -q '^ok' || { echo "--- FAIL: §战法批-4 派发链回归未过"; exit 1; }
+# ---- 行为锁④：§战法批-2 无密钥纸面柜台四方向 + §MR-4B 资金费/合约回报 ----
+go test -count=1 ./internal/trading/ -run 'TestPaper' 2>&1 | grep -q '^ok' || { echo "--- FAIL: §战法批-2 纸面柜台回归未过"; exit 1; }
+go test -count=1 ./internal/trading/ -run 'TestReporterFutures|TestReporterFunding|TestFuturesForkNegativeLocks|TestBinanceSideMR4|TestReporterMR4' 2>&1 | grep -q '^ok' || { echo "--- FAIL: §MR-4B 合约回报/方向映射回归未过"; exit 1; }
+# ---- 行为锁⑤：§MR-4A 风控做空闸 + 账本短向 + §战法批-3 事件打分/空头腿 + EDGAR 映射 ----
+go test -count=1 ./internal/risk/ -run 'TestGateMR4' 2>&1 | grep -q '^ok' || { echo "--- FAIL: §MR-4A/4B 风控闸回归未过"; exit 1; }
+go test -count=1 ./internal/store/ -run 'TestMR4|TestMR4BFunding' 2>&1 | grep -q '^ok' || { echo "--- FAIL: §MR-4 账本/资金费回归未过"; exit 1; }
+go test -count=1 ./internal/data/ -run 'TestScoreXEvent|TestParseSentimentJSON|TestXEventScorer|TestXEventLLMClient' 2>&1 | grep -q '^ok' || { echo "--- FAIL: §战法批-3 事件打分器回归未过"; exit 1; }
+go test -count=1 ./internal/data/ -run 'TestEdgarTicker|TestEdgarPaddedCIKKey' 2>&1 | grep -q '^ok' || { echo "--- FAIL: §MR-EDGAR-TKR CIK→ticker 映射回归未过"; exit 1; }
+go test -count=1 ./internal/strategies/xasset/ -run 'Bear' 2>&1 | grep -q '^ok' || { echo "--- FAIL: §战法批-3 xasset 空头腿回归未过"; exit 1; }
+# ---- 行为锁⑥：§战法批-5 状态端点 dispatch 节（缺省省略/形状/按账号）----
+go test -count=1 ./internal/server/ -run 'TestBinanceStateDispatch' 2>&1 | grep -q '^ok' || { echo "--- FAIL: §战法批-5 dispatch 节回归未过"; exit 1; }
+# ---- 静态锁：§CN-MASTER 装配门五处包裹 + 币安节拍不在门内（红线）----
+grep -q 'cnEnabled := cfgMgr.Rules.CN.Enabled' cmd/quant/main.go || { echo "--- FAIL: §CN-MASTER boot 快照丢失"; exit 1; }
+grep -q 'srv.SetCNMaster(cnEnabled)' cmd/quant/main.go || { echo "--- FAIL: §CN-MASTER 旗标未注入 server"; exit 1; }
+grep -qE '"cn_master":[[:space:]]+s\.cnMaster' internal/server/handlers_fix.go || { echo "--- FAIL: §CN-MASTER /api/status 字段丢失"; exit 1; }
+grep -q 'A股主时段循环未启动' cmd/quant/main.go || { echo "--- FAIL: §CN-MASTER 常驻待命腿丢失（关链时进程会直接退出）"; exit 1; }
+grep -q 'registry.GetOrCreate(authMgr.AdminID())' cmd/quant/main.go || { echo "--- FAIL: §CN-MASTER 关链时运营引擎预建丢失（重启后派发停摆）"; exit 1; }
+# 红线负锁：币安维护/派发 tick 两行必须裸挂在 bnMaint 循环里——被 cnEnabled 包住=关 A股连带杀币安链
+if awk '/bnMaint := time.NewTicker/,/^\t\}\(\)$/' cmd/quant/main.go | grep -q 'cnEnabled'; then echo "--- FAIL: §CN-MASTER 币安 7×24 节拍被总开关误包（红锁）"; exit 1; fi
+# ---- 静态锁：§战法批 派发接线 + 前端往返 + EDGAR 映射锚 ----
+grep -q 'func (e \*Engine) DispatchBinanceOnce' internal/engine/binance_dispatch.go || { echo "--- FAIL: §战法批-4 派发单次入口丢失"; exit 1; }
+grep -q 'e.DispatchBinanceOnce(time.Now())' cmd/quant/main.go || { echo "--- FAIL: §战法批-4 维护节拍未挂派发"; exit 1; }
+grep -q 'body.dispatch = {' web/src/components/BinanceConfigPanel.jsx || { echo "--- FAIL: §战法批-5 设置页不再提交 dispatch 七键"; exit 1; }
+grep -q '未派发过' web/src/components/BinanceStatusCard.jsx || { echo "--- FAIL: §战法批-5 状态卡「从未派发」如实呈现丢失"; exit 1; }
+grep -q 'EDGARTickersPath = "/files/company_tickers.json"' internal/data/edgar_tickers.go || { echo "--- FAIL: §MR-EDGAR-TKR 映射表路径丢失"; exit 1; }
+echo "ok - §MR-4/战法批/CN-MASTER 专项守卫通过（行为回归 12 组 + 静态锁 12 道〔含币安节拍误包负锁〕）"
+
 echo ""
 echo "==> 全部通过"

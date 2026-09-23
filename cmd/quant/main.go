@@ -140,6 +140,21 @@ func main() {
 	// §P1-6 配置热重载：每分钟轮询 config.json，内容变更自动重载（无需重启）。
 	cfgMgr.Watch(context.Background(), 60*time.Second)
 
+	// §CN-MASTER A股总开关（boot-frozen 快照）：rules.cn.enabled，出厂缺省 false=关闭。
+	// 关闭时 CN 装配腿（新闻代理常驻/行情采集循环/实时触发引擎/近实时打分循环/主时段循环）
+	// 在启动期整体跳过——进程只跑 HTTP 服务 + 币安链 7×24 节拍。刻意取启动期快照而非
+	// 每轮读 cfgMgr.Rules：热轮换正在跑的循环族属另一量级工程，改配置后重启生效，
+	// 与 binance.data_plane 的口径一致。开启时所有门包裹的原代码与开关诞生前字节等价。
+	// English: §CN-MASTER — boot-frozen snapshot of rules.cn.enabled (default false). Off skips the
+	// whole CN assembly (news agent, quote fetcher loop, trigger engine, scoring loop, session main
+	// loop); on keeps every wrapped branch byte-identical to the pre-switch behavior.
+	cnEnabled := cfgMgr.Rules.CN.Enabled
+	if cnEnabled {
+		log.Printf("[main] §CN-MASTER A股总开关=开：CN 链照常装配")
+	} else {
+		log.Printf("[main] §CN-MASTER A股总开关=关（缺省）：跳过 CN 装配腿，进程仅服务 HTTP + 币安链")
+	}
+
 	// §数据源路由装配（§HITHINK_DATA_SOURCE_PLAN）：primary_source=hithink 时回测取数优先 ths_ 表。
 	// 两个包级开关是回测/存储层读取数据源的路由信号，由 config.json 的 rules.data 段驱动。
 	store.PrimarySourceThsDaily = strings.EqualFold(cfgMgr.Rules.Data.PrimarySource, "hithink")
@@ -174,8 +189,12 @@ func main() {
 	cleaner := data.NewStockCleaner(marketAPI)
 
 	// 新闻代理：聚合新闻 + LLM 归因分析，后台常驻运行
+	// §CN-MASTER：开关关闭时不 Start（Stop 仍注册 defer——newsagent.Stop 只落 tracker，
+	// 未启动也安全；对象照常构造，供 registry 模板引用，零 nil 传播风险）。
 	nAgent := newsagent.New(marketAPI, llmClient, cleaner, dataDir)
-	nAgent.Start()
+	if cnEnabled {
+		nAgent.Start()
+	}
 	defer nAgent.Stop()
 
 	// 策略引擎：注册四大战法策略（龙头/双响炮/N形/龙回头）
@@ -348,8 +367,12 @@ func main() {
 			log.Printf("[main] 行情快照流录制已开启: %s", filepath.Join(dataDir, "quote_stream.jsonl"))
 		}
 	}
-	go fetcher.Start()
-	defer fetcher.Stop()
+	// §CN-MASTER：开关关闭时采集循环不启动（Fetcher 对象仍在位——快照/降级链调用方
+	// 全部走既有的"无数据即空"分支；构造器把 stopCh 预置为已关闭态，未启动也 Stop 安全）。
+	if cnEnabled {
+		go fetcher.Start()
+		defer fetcher.Stop()
+	}
 	// §ENH-5 批E：QMT Level-1 全推行情 feed（默认关，生产决策机开启）。
 	// 命中代码合并覆盖快照 Source=QMT-L1；任何失败静默——5s 新浪链照常兜底，
 	// Staleness 自然增长，交易熔断判定（/health ok&&broker_connected）不含行情态。
@@ -371,7 +394,12 @@ func main() {
 	srv.SetFetcher(fetcher)   // 报价接口优先读 5s 快照，缺失再降级拉取
 	srv.SetCoordinator(dc)    // HTTP 展示层统一走该降级链，保证跨页价格一致
 	srv.SetNotifier(notifier) // §C9-清扫：/api/notify-test 升级为逐通道真实探测，需注入全局通知器
-	log.Printf("[main] 实时行情采集已启动: 监控 %d 只(自选+持仓), 5s 轮询", len(baseStocks))
+	if cnEnabled {
+		log.Printf("[main] 实时行情采集已启动: 监控 %d 只(自选+持仓), 5s 轮询", len(baseStocks))
+	} else {
+		// §CN-MASTER：如实宣告停用（旧日志在开关关闭时会谎称"采集已启动"，改为分流文案）。
+		log.Printf("[main] §CN-MASTER 实时行情采集未启动（A股总开关关闭）")
+	}
 
 	// 板块→个股成分股覆盖数（默认20）：扩大同板块强势股进打分池，避免只覆盖龙头前10漏选
 	// English: per-sector constituent coverage (default 20) — widen same-sector leaders into the pool
@@ -425,6 +453,17 @@ func main() {
 	srv.SetXEventsSource(func(market string) ([]map[string]any, int64, bool) {
 		return registry.XEventsJSON(market)
 	})
+	// §战法批-5 派发摘要闭包：/api/binance/state 的 "dispatch" 节按（账号,市场）读该引擎
+	// 最近一轮派发报告。只读内存快照零外呼；引擎未建/派发器未装配/该市场从未跑过 → ok=false，
+	// 节点如实报"无记录"（state 端点入口的 binanceLive 已懒加载过引擎，此处不新增构建成本）。
+	srv.SetDispatchSource(func(uid, market string) (any, bool) {
+		e := registry.GetOrCreate(uid)
+		if e == nil {
+			return nil, false
+		}
+		rep, ok := e.DispatchReports()[market]
+		return rep, ok
+	})
 
 	// §R6 P1-1 部署漂移自检：启动阶段汇总高影响配置的"声明态 vs 实际生效态"，与二进制指纹一并
 	// 落到 opslog + 启动日志，早期暴露 2026-09-01 三类线上事故（旧二进制缺修复 / LLM key 拼写/
@@ -452,6 +491,17 @@ func main() {
 	registry.SetDayCloseExport(func(userID string, pe *paper.Engine) {
 		srv.ExportPaperToResearch(userID, pe)
 	})
+	// §CN-MASTER：关链时"有人访问才建引擎"的懒加载失去了主要驱动（CN 循环不再遍历注册表，
+	// 币安 7×24 维护/派发节拍只吃 registry.All()）——重启后若无人打开页面，派发会停摆。
+	// 关闭分支在启动期显式预建运营（admin）引擎补位；开启分支零改动仍为纯懒加载
+	// （与开关诞生前字节等价）。其他成员引擎照旧懒加载，开页即建、建后归节拍管。
+	// English: on the CN-off path the operator engine is primed at boot so the 7x24 binance
+	// heartbeat has its subject with zero HTTP traffic; the CN-on path stays lazy-load only.
+	if !cnEnabled {
+		if e := registry.GetOrCreate(authMgr.AdminID()); e != nil {
+			log.Printf("[main] §CN-MASTER 运营引擎已预建（账号 %s），币安维护/派发节拍就位", authMgr.AdminID())
+		}
+	}
 
 	// 前端修改 LLM 配置时热重建客户端，避免重启进程。§UI-AUTHORITATIVE 修复：改走
 	// Registry.SetLLMClient 统一分发——同时更新注册表模板（覆盖之后懒加载新建的引擎）、
@@ -490,10 +540,17 @@ func main() {
 		int(llmCfg.Timeout/time.Second), llmCfg.Streaming, llmCfg.BatchConcurrency, llmCfg.ClassifierModel)
 
 	// 实时触发引擎（daban式放量急拉检测，SSE 推送）
+	// §CN-MASTER：开关关闭时不启动 Run（对象与 ctx 保持在位，Stop 链零变化）。
 	trigCtx, trigCancel := context.WithCancel(context.Background())
 	defer trigCancel()
 	triggerEngine := trigger.New(fetcher, srv.GetSSE(), trigger.DefaultConfig())
-	go triggerEngine.Run(trigCtx)
+	if cnEnabled {
+		go triggerEngine.Run(trigCtx)
+	}
+	// §CN-MASTER 状态旗标：把 boot 快照下发给 /api/status（cn_master 字段），前端导航据此
+	// 隐藏 CN 专属入口。用快照而非每请求读 Rules——热轮换不改装配，展示口径必须与
+	// 进程实际在跑的循环一致，否则出现"导航藏着但循环在跑/反之"的错帧。
+	srv.SetCNMaster(cnEnabled)
 
 	// 启动 HTTP 服务：地址可用 QUANT_ADDR 覆盖。
 	// 端口占用自动顺延：绑定失败时依次尝试下一个端口（最多 20 个），
@@ -583,13 +640,22 @@ func main() {
 			case <-ctx.Done():
 				return
 			case <-bnMaint.C:
+				// §战法批-4 同拍挂载派发：维护之后跑一轮信号→委托（派发器自带开关/节流，
+				// 未装配或 dispatch.enabled=false 的引擎零行为）。
 				for _, e := range registry.All() {
 					e.MaintenanceBinanceOnce(time.Now())
+					e.DispatchBinanceOnce(time.Now())
 				}
 			}
 		}
 	}()
 	go func() {
+		// §CN-MASTER：开关关闭时打分循环整体不跑（RunScoringLoopOnce/盘后滚动/复盘/覆盖
+		// 断言都是 CN 决策链节拍；币安维护循环是独立 goroutine，不在此门内）。
+		if !cnEnabled {
+			log.Println("[main] §CN-MASTER 近实时打分循环未启动（A股总开关关闭）")
+			return
+		}
 		// §A+B 近实时节拍可配置（默认 5s）：降低以加快信号翻转检出与下单；非交易时段仍休眠。
 		// English: A+B — configurable near-realtime cadence (default 5s); off-hours still hibernated.
 		scoringTick := 5 * time.Second
@@ -652,6 +718,13 @@ func main() {
 	// 盘前（8:30-9:15）"跑完即排下一轮"：等待异步引擎完成后立即触发下一轮，最大化新闻归因轮次，
 	// 让昨夜晚间新闻在开盘前尽可能完成 LLM 归因（配合未归因队列失败重试）；
 	// 其他时段按 5 分钟节奏推进，asyncBusy 忙锁防并发重入。
+	// §CN-MASTER：本循环原本是进程的生命线（永不返回），开关关闭时以等价位的常驻待命
+	// 替代——select{} 只挂住主 goroutine，HTTP 服务/币安 7×24 节拍/优雅停机
+	// （SIGTERM→os.Exit）全部照常；不会触发 runtime 死锁告警（存活 goroutine 与计时器在场）。
+	if !cnEnabled {
+		log.Println("[main] §CN-MASTER A股主时段循环未启动，进入常驻待命（币安链与 HTTP 服务照常）")
+		select {}
+	}
 	for {
 		now := time.Now()
 		session := data.CurrentSession(now)

@@ -14,10 +14,23 @@ import (
 
 // OrderSide 下单方向。
 // （OrderSide is the order direction.）
+// §MR-4A 做空侧扩集：**只增不改**——买入/卖出两常量及 CN 链路全部判断保持原语义；
+// 卖出开空/买入平仓是 Binance（US Stocks / 合约）专用的方向对，出现在任何 Market=CN
+// 请求上都会被风控 side 闸拒收（负向锁见 verify §MR4）。
+// English: §MR-4A extends the side set with short-open / short-cover for Binance markets only;
+// the legacy CN pair is untouched and CN requests carrying the new sides are rejected upstream.
 const (
-	SideBuy  = "买入"
-	SideSell = "卖出"
+	SideBuy        = "买入"
+	SideSell       = "卖出"
+	SideShortOpen  = "卖出开空" // §MR-4A 融券/合约开空（仅 US/CRYPTO；CN 拒收）
+	SideShortCover = "买入平仓" // §MR-4A 平空（仅 US/CRYPTO；CN 拒收）
 )
+
+// IsShortSide 判定方向串是否属于做空腿专用侧（风控闸/账簿分派共用口径）。
+// English: reports whether a side token belongs to the short leg vocabulary.
+func IsShortSide(side string) bool {
+	return side == SideShortOpen || side == SideShortCover
+}
 
 // OrderRequest 下单请求（首尔 → 网关 /order）。
 // English: order request (Seoul → gateway /order).

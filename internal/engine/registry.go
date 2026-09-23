@@ -929,19 +929,59 @@ func (r *Registry) build(userID string) *Engine {
 		// §MR-1 装配闸＝任一平面开（交易面 Enabled 或数据面 DataPlane）——行情/feed/FNG/事件腿
 		// 是公开数据，不再被凭证闸卡死；下面的真执行器仍只认 TradingActive+凭证，数据面恒 Noop。
 		if (bnCfg.Enabled || bnCfg.DataPlane) && !opts.ShadowExec {
+			// bnFeeds 逐市场捕获行情 feed（§战法批-4）：派发核与纸面柜台的实时价源——
+			// feed 是 build 期局部变量，此前没有任何出口能被派发侧拿到。
+			bnFeeds := map[string]*data.BinanceQuoteFeed{}
 			for _, mkt := range []string{"US", "CRYPTO"} {
 				view := config.BinanceBrokerView{Cfg: bnCfg, Market: mkt}
 				if !view.BrokerEnabled() {
 					continue // 子市场开关关：不装配
 				}
+				prof := bnCfg.Spot
+				if mkt == "US" {
+					prof = bnCfg.Stock
+				}
 				var bexec trading.Executor = trading.NoopExecutor{}
+				isPaper := false
 				// 真执行器硬条件=交易面活跃+凭证齐（§MR-1）：数据面即使误配钥匙也构造不出真单通道。
-				if view.TradingActive() && view.Cfg.APIKey != "" && view.Cfg.APISecret != "" {
+				switch {
+				case view.TradingActive() && view.Cfg.APIKey != "" && view.Cfg.APISecret != "":
 					bexec = trading.NewBinanceExecutor(view)
-				} else {
+				case view.PaperActive():
+					// §战法批-2/4 纸面柜台：交易面未激活且 profile.paper=true 时执行器落纸面盘
+					// （即时成交、只写本地账簿，结构上碰不到交易所）；合约腿费率按 taker 万五口径。
+					pfee := 0.0
+					if view.FuturesActive() {
+						pfee = 0.0005
+					}
+					pe, perr := trading.NewBinancePaperExecutor(trading.BinancePaperOptions{
+						DB: opts.RealStore, UserID: userID, Market: mkt,
+						InitialCash: prof.PaperCash, FeeRate: pfee, ShortMarginRate: prof.ShortMarginRate,
+						GetPrice: func(code string) float64 { return bnQuotePrice(bnFeeds, mkt, code) },
+					})
+					if perr != nil {
+						log.Printf("[engine] 账号 %s 币安 %s 纸面柜台构造失败（executor 落 Noop）: %v", userID, mkt, perr)
+					} else {
+						bexec = pe
+						isPaper = true
+						effFee := pfee
+						if effFee <= 0 {
+							effFee = 0.001 // 柜台缺省单边费率（与 NewBinancePaperExecutor 回填同值，仅日志口径）
+						}
+						log.Printf("[engine] 账号 %s 币安 %s 纸面柜台装配完成 (paper_cash=%.0f fee_rate=%.4f)", userID, mkt, prof.PaperCash, effFee)
+					}
+				default:
 					log.Printf("[engine] 账号 %s 币安 %s 平面装配但交易面未激活（数据面或凭证缺失），executor 落 Noop（记账不真下）", userID, mkt)
 				}
 				bctrl := trading.NewController(bexec, opts.RealStore, userID, view, onAlert, "binance")
+				// §战法批-4 纸面盘借券证据腿：第 16 闸对"无证据源"的默认姿势是拒全部开空——
+				// 纸面盘没有真实借券池可查，注入模拟恒可借源让做空链跑通；真交易面永不走这支，
+				// 实钱的无证据拒单姿态分毫未动。
+				if isPaper {
+					bctrl.SetShortBorrowEvidenceSource(func(market, code string) (bool, string) {
+						return true, "纸面模拟借券（paper 柜台，非真实融券池）"
+					})
+				}
 				if opts.Coordinator != nil {
 					bctrl.SetCrossPriceSource(opts.Coordinator.CrossCheckPrice) // §XCHECK 同 CN 接线
 				}
@@ -952,7 +992,15 @@ func (r *Registry) build(userID string) *Engine {
 				//     WS 快腿随装配层 dialer 注入升级；凭证热变更需重启引擎重建，边界与 QMT 网关同源）。
 				if bnExec, isReal := bexec.(*trading.BinanceExecutor); isReal {
 					bctrl.SetSymbolRulesSource(func(symbol string) (risk.SymbolRules, error) {
-						rules, ok := bnExec.SpotRules(symbol)
+						// §MR-4B 合约视图的规则腿换 fapi exchangeInfo：同 symbol 的合约 tick/步长
+						// 与现货可以不同，min_notional/lot_precision 复核的必须是实际下单产品线的规则。
+						var rules risk.SymbolRules
+						var ok bool
+						if bnExec.View().FuturesActive() {
+							rules, ok = bnExec.FuturesRules(symbol)
+						} else {
+							rules, ok = bnExec.SpotRules(symbol)
+						}
 						if !ok {
 							return risk.SymbolRules{}, fmt.Errorf("币安 exchangeInfo 规则不可得 %s", symbol)
 						}
@@ -967,6 +1015,11 @@ func (r *Registry) build(userID string) *Engine {
 					} else {
 						liveRouter.RegisterReporter(mkt, rep)
 					}
+					// §MR-4B 第 17 闸数据腿：仅合约视图注入强平距离证据源（现货/美股不装配
+					// =闸保持跳过）；阈值另一重保险在档案侧（liq_dist_min_pct 出厂 0=不生效）。
+					if bnExec.View().FuturesActive() {
+						bctrl.SetLiqDistanceEvidenceSource(bnExec.LiqEvidence)
+					}
 				}
 				// §P3 行情/状态 feed 装配（PLAN §2.4 + §9 market_halt 数据腿；与凭证无关——
 				// Noop 控制器照样需要行情观测，闸证据更不许因为"没配 APIKey"就消失）：
@@ -974,10 +1027,6 @@ func (r *Registry) build(userID string) *Engine {
 				//     go.mod 零 ws 依赖）；观测闭包注册进路由，/api/binance/state 直接呈现；
 				//  ② 状态 feed（仅 US）：status_symbols 非空才起流，GateSource 注入控制器第 15 闸；
 				//     空档=不装配=闸惰性（零配置零行为，出厂默认不变）。
-				prof := bnCfg.Spot
-				if mkt == "US" {
-					prof = bnCfg.Stock
-				}
 				if len(prof.QuoteSymbols) > 0 {
 					qfeed, qerr := data.NewBinanceQuoteFeed(data.BinanceQuoteFeedOptions{
 						Market: mkt, Symbols: prof.QuoteSymbols, Dial: data.StdWsDial,
@@ -986,6 +1035,7 @@ func (r *Registry) build(userID string) *Engine {
 						log.Printf("[engine] 账号 %s 币安 %s 行情 feed 构造失败（该市场无实时快照）: %v", userID, mkt, qerr)
 					} else {
 						qfeed.Start()
+						bnFeeds[mkt] = qfeed // §战法批-4 派发/纸面柜台的实时价源
 						liveRouter.RegisterFeedWithStop("quotes-"+strings.ToLower(mkt), mkt, func() trading.FeedStat {
 							recv, _, _, _ := qfeed.Stats()
 							return trading.FeedStat{Name: "quotes-" + strings.ToLower(mkt), Market: mkt,
@@ -1033,6 +1083,21 @@ func (r *Registry) build(userID string) *Engine {
 				}
 				log.Printf("[engine] 账号 %s 币安 %s 实盘控制器装配完成 (mode=%s testnet=%v)", userID, mkt, view.BrokerMode(), bnCfg.Testnet)
 			}
+			// §战法批-4 派发核装配（一账号一份，tick 期现读配置——装配后热改 dispatch.enabled
+			// 无需重启）：价源=已在位行情 feed 快照，事件源=registry 事件腿快照，
+			// 打分器出厂纯关键词（LLM 三键在位时 tick 内热换，见 ensureLLM）。
+			e.SetBinanceDispatcher(newBinanceDispatcher(
+				opts.CfgMgr, userID, opts.D1Store, opts.RealStore, liveRouter,
+				func(market, code string) float64 { return bnQuotePrice(bnFeeds, market, code) },
+				func(market string) []data.XEvent {
+					evs, _, ok := r.xeventsSnapshot(market)
+					if !ok {
+						return nil
+					}
+					return evs
+				},
+				data.NewXEventScorer(nil),
+			))
 		}
 		e.SetLiveRouter(liveRouter)
 		// 回报接收器随引擎启动（进程级生命周期，与引擎共存亡；单腿失败内部降级不阻塞）。

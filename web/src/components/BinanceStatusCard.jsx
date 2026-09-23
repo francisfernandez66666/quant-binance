@@ -1,7 +1,8 @@
 // ── 币安链路状态卡 BinanceStatusCard.jsx ──
 // 文件职责（PLAN §11.2 Quant 执行路径卡扩）：与 QMT 链路状态卡并列的 Binance 状态双卡之一，
 // 展示 GET /api/binance/state 实发契约：controllers（各市场快照/执行器/披露位）、
-// reporters（回报三条腿健康度）、feeds（§P3 行情/状态 WS 观测位）。
+// reporters（回报三条腿健康度）、feeds（§P3 行情/状态 WS 观测位）、
+// dispatch（§战法批-5 每市场最近一轮派发摘要：台别/评估数/信号/受理/拒单/退出单）。
 // fail-soft 约定：端点未上线（404/网络错）不炸页——卡片降级为"未接入"占位并保留重试按钮。
 // English: Binance chain-status card beside the QMT one; fail-soft placeholder; consumes the
 // real state contract (controllers/reporters/feeds), never renders a fake green light.
@@ -64,6 +65,9 @@ export default function BinanceStatusCard() {
   const ctl = (state && state.controllers) || {}
   const reps = (state && state.reporters) || {}
   const feeds = (state && state.feeds) || []
+  // §战法批-5 派发摘要节：后端未注入闭包时整节缺席（零配置零行为）；市场从未派发过呈 ok=false
+  // ——无记录≠在派发，绝不渲染假绿灯。
+  const dsp = (state && state.dispatch) || null
   const mkts = ['US', 'CRYPTO'].filter((m) => ctl[m])
   const wired = mkts.length > 0
 
@@ -85,11 +89,33 @@ export default function BinanceStatusCard() {
       {mkts.map((m) => row(m === 'US' ? '美股通道' : '加密通道', (() => {
         const c = ctl[m] || {}
         const snap = c.snapshot || {}
-        if (!c.executor) return 'Noop（凭证缺失，记账不真下）'
+        const desk = dsp && dsp[m] && dsp[m].ok ? ((dsp[m].report || {}).desk || '') : ''
+        if (!c.executor) return desk === 'paper' ? '纸面柜台（模拟成交，无密钥四方向）' : 'Noop（凭证缺失，记账不真下）'
         if (snap.tripped) return `熔断中（${snap.trip_reason || '原因未记录'}）`
         return snap.last_probe_ok ? '探测正常 ●' : '探测未成 ○'
       })()))}
       {mkts.map((m) => reps[m] && row(`${m} 回报腿`, reps[m].ws ? (reps[m].ws_healthy ? 'WS 健康 ●' : 'WS 静默/断线 ○') : 'REST 轮询（无 WS 腿）'))}
+      {/* §战法批-5 派发摘要：最近一轮（评估数→信号→受理/拒单/退出单）+ 台别徽标。
+          desk=none 表示本轮无台可开火（凭证缺失且未开纸面），只出报告不发单。 */}
+      {dsp && ['US', 'CRYPTO'].map((m) => {
+        if (!dsp[m]) return null
+        const v = (() => {
+          if (!dsp[m].ok) return <Tag size="small" theme="default">未派发过</Tag>
+          const r = dsp[m].report || {}
+          const deskTag = { live: ['真面', 'success'], paper: ['纸面', 'primary'], none: ['无台', 'warning'] }[r.desk] || ['未知', 'default']
+          return (
+            <span style={{ fontSize: 13 }}>
+              <Tag size="small" theme={deskTag[1]}>{deskTag[0]}</Tag>{' '}
+              <span style={{ color: 'var(--app-muted-2)' }}>{r.at ? String(r.at).slice(11, 19) : '-'}</span>{' '}
+              评估 {r.universe ?? 0} · 信号 {r.signals ?? 0} · 受理 {r.placed ?? 0} · 拒单 {r.rejected ?? 0} · 退出 {r.exit_placed ?? 0}
+              {(r.notes || []).length > 0 && (
+                <span title={(r.notes || []).join('\n')} style={{ color: 'var(--app-muted)', marginLeft: 6 }}>备注 {r.notes.length}</span>
+              )}
+            </span>
+          )
+        })()
+        return row(`${m} 派发`, v)
+      })}
       {feeds.length > 0 && row('WS feed', feeds.map((f) => (
         <span key={f.name} style={{ marginRight: 10 }}>
           {f.name}:{f.healthy ? '●' : '○'}

@@ -67,10 +67,15 @@ type BinanceExecutor struct {
 
 	spot   *binanceSigner // 现货签名器（base = testnet/主网切换由 BaseURL() 裁决）
 	equity *binanceSigner // 美股签名器（base 恒主网，无 testnet，PLAN §2.2）
+	// futures §MR-4B 合约签名器（fapi 域；base 空=无凭证，FuturesActive 分叉下 fail-close 拒单）。
+	futures *binanceSigner
 
 	// rules exchangeInfo 规则缓存（symbol→步长/最小名义额），mu 保护；惰性拉取 + TTL 刷新。
 	mu    sync.Mutex
 	rules map[string]*spotRule
+	// frules/leverageSet §MR-4B 合约侧同类缓存（fapi exchangeInfo + 已设定的杠杆），共用 mu。
+	frules      map[string]*spotRule
+	leverageSet map[string]int
 
 	// eqWindow 美股下单滑窗（200/min UID 频率帽的本地闸门），超限时本地拒发不发请求。
 	eqMu     sync.Mutex
@@ -112,7 +117,12 @@ func NewBinanceExecutor(view config.BinanceBrokerView) *BinanceExecutor {
 		httpc:  httpc,
 		spot:   newBinanceSigner(view.Cfg.BaseURL(), view.Cfg.APIKey, view.Cfg.APISecret, httpc),
 		equity: newBinanceSigner(view.Cfg.EquityBaseURL(), view.Cfg.APIKey, view.Cfg.APISecret, httpc),
-		rules:  map[string]*spotRule{},
+		// futures base 由 FuturesBaseURL() 裁决（无凭证=空串）；分叉只在 FuturesActive() 生效，
+		// 现货视图即使构造了此签名器也永远不会被用到（零回归锚点见 binance_futures.go 文件头）。
+		futures:     newBinanceSigner(view.Cfg.FuturesBaseURL(), view.Cfg.APIKey, view.Cfg.APISecret, httpc),
+		rules:       map[string]*spotRule{},
+		frules:      map[string]*spotRule{},
+		leverageSet: map[string]int{},
 	}
 }
 
@@ -177,6 +187,11 @@ func (e *BinanceExecutor) place(req OrderRequest) (*OrderResult, error) {
 			return &OrderResult{OK: false, Err: err.Error()}, nil
 		}
 		return e.signedRequest(e.equity, http.MethodPost, "/sapi/v1/equity/order", params, "US")
+	}
+	// §MR-4B 合约分叉（唯一判定点 view.FuturesActive()=CRYPTO+product_type=umfutures）：
+	// fapi 链独立构参与签名，现货路径保持逐字节原样（分叉在判定点之下、判定点之上零改动）。
+	if e.view.FuturesActive() {
+		return e.placeFutures(req)
 	}
 	params, err := e.spotParams(req)
 	if err != nil {
@@ -474,6 +489,10 @@ func (e *BinanceExecutor) Cancel(orderID string) error {
 		_, err := e.rawSigned(e.equity, http.MethodPost, "/sapi/v1/equity/cancel", params)
 		return err
 	}
+	// §MR-4B 合约撤单分叉：同 "SYMBOL:orderId" 约定，端点换 fapi（binance_futures.go）。
+	if e.view.FuturesActive() {
+		return e.cancelFutures(orderID)
+	}
 	symbol, id, ok := strings.Cut(orderID, ":")
 	if !ok {
 		return fmt.Errorf("现货撤单需要 SYMBOL:orderId 复合格式（收到 %q）", orderID)
@@ -497,6 +516,11 @@ func (e *BinanceExecutor) Cancel(orderID string) error {
 func (e *BinanceExecutor) State() (*GatewayState, error) {
 	if e.Market() == "US" {
 		return &GatewayState{Connected: false, Account: maskKey(e.view.Cfg.APIKey)}, nil
+	}
+	// §MR-4B 合约对账分叉：positionRisk 直给方向/开仓价（现货余额链没有的信息），
+	// 空快照禁止清账守卫沿用 Controller 侧同款语义（详见 stateFutures）。
+	if e.view.FuturesActive() {
+		return e.stateFutures()
 	}
 	body, err := e.rawSigned(e.spot, http.MethodGet, "/api/v3/account", url.Values{})
 	if err != nil {
@@ -546,6 +570,11 @@ func (e *BinanceExecutor) Health() (bool, error) {
 func (e *BinanceExecutor) healthOnce() (bool, error) {
 	if e.Market() == "US" {
 		_, err := e.equityOpenOrders()
+		return err == nil, err
+	}
+	// §MR-4B 健康探测分叉：合约走在 /fapi/v1/account（最轻的签名读端点）。
+	if e.view.FuturesActive() {
+		_, err := e.rawSigned(e.futures, http.MethodGet, "/fapi/v1/account", url.Values{})
 		return err == nil, err
 	}
 	_, err := e.rawSigned(e.spot, http.MethodGet, "/api/v3/account", url.Values{})
@@ -676,11 +705,17 @@ func spotClientOrderID(signalID string) string {
 }
 
 // binanceSide 中文方向 → Binance BUY/SELL。
+// §MR-4A：币安现货链上没有独立的"借券"动作——开空在交易所侧就是一笔真实 SELL、平空是一笔 BUY，
+// 空头语义由账本侧承载（占位委托行存真实方向 + ApplyRealFill 按方向落空头行）。本映射把空头
+// 两个中文方向折叠到同名 REST 值；请求的真实方向沿 SignalID→委托行链路保留，不在此处丢失。
+// English: §MR-4A — on the wire a spot short-open IS a SELL and a cover IS a BUY; short semantics
+// live in the ledger (placeholder order row keeps the true side), so this map folds the short sides
+// onto the same REST values without losing the request's real direction upstream.
 func binanceSide(side string) (string, error) {
 	switch side {
-	case SideBuy, "buy", "BUY":
+	case SideBuy, SideShortCover, "buy", "BUY":
 		return "BUY", nil
-	case SideSell, "sell", "SELL":
+	case SideSell, SideShortOpen, "sell", "SELL":
 		return "SELL", nil
 	}
 	return "", fmt.Errorf("未知下单方向 %q", side)

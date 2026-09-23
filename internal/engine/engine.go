@@ -220,8 +220,10 @@ type Engine struct {
 	// breaking and auto-orders each 5s cycle.
 	qmtCtrl    *trading.Controller   // QMT 执行控制器（下单/熔断/健康探测，可空=未启用）
 	liveRouter *trading.BrokerRouter // §P2 实盘路由（CN+US+CRYPTO 控制器扇出；可空=未接入币安，CN 单通道旧语义）
-	realStore  *store.DB             // 实盘账本库（live.db：real_positions/orders/fills 存取）
-	d1Store    *store.DB             // D1 评分历史库（trading.db：d1_scores 落库，与研究数据同库）
+	// bnDispatch §战法批-4 币安链派发核（xasset 信号→US/CRYPTO 控制器委托；nil=该引擎没接币安链=零行为）。
+	bnDispatch *binanceDispatcher
+	realStore  *store.DB // 实盘账本库（live.db：real_positions/orders/fills 存取）
+	d1Store    *store.DB // D1 评分历史库（trading.db：d1_scores 落库，与研究数据同库）
 
 	// §SIGNAL_CONTROLLER 20260917：实盘买入确认状态机（原 buyConfirmReal + realBuyConfirmPass）
 	// 已迁到信号控制器（internal/signalctl）live 通道——战法白名单/黑名单/个股/板块黑名单/持续性
@@ -1064,6 +1066,14 @@ func (e *Engine) LiveRouter() *trading.BrokerRouter {
 	e.mu.RLock()
 	defer e.mu.RUnlock()
 	return e.liveRouter
+}
+
+// SetBinanceDispatcher §战法批-4 注入币安链派发核（registry 装配尾段调用；nil=该引擎不派发）。
+// 与 SetLiveRouter 同时序：路由先建、派发器后建，派发器内部再按市场取 Controller。
+func (e *Engine) SetBinanceDispatcher(d *binanceDispatcher) {
+	e.mu.Lock()
+	e.bnDispatch = d
+	e.mu.Unlock()
 }
 
 // MaintenanceBinanceOnce §MR-2 币安链维护的单次入口——供 main.go 的 7×24 独立节拍 goroutine

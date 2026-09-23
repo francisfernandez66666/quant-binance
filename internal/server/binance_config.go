@@ -33,6 +33,11 @@ func binanceConfigView(cfg *config.BinanceConfig) map[string]interface{} {
 	if cfg.Events.CryptoPanicToken != "" {
 		cryptoPanicMasked = maskSecret(cfg.Events.CryptoPanicToken)
 	}
+	// §战法批 事件 LLM 打分 key 同红线（第三把密钥，同样只回掩码+已配置布尔）。
+	llmKeyMasked := ""
+	if cfg.Events.LLMApiKey != "" {
+		llmKeyMasked = maskSecret(cfg.Events.LLMApiKey)
+	}
 	return map[string]interface{}{
 		"enabled":              cfg.Enabled,
 		"data_plane":           cfg.DataPlane, // §MR-1 数据面开关（免凭证观测，结构上不可真下单）
@@ -51,12 +56,19 @@ func binanceConfigView(cfg *config.BinanceConfig) map[string]interface{} {
 		"spot":                 cfg.Spot,
 		"risk_gate":            cfg.RiskGate,
 		"paper_separate":       cfg.PaperSeparate,
+		"dispatch":             cfg.Dispatch, // §战法批 派发参数（无密钥字段，整档回显；paper 在 stock/spot 档案内自动流转）
 		// §ENH-A4/B8 事件腿对外形状：UA（含联系邮箱，非密钥）原样回显供核对，token 只回掩码。
 		"events": map[string]interface{}{
 			"edgar_user_agent":         cfg.Events.EdgarUserAgent,
 			"cryptopanic_token_masked": cryptoPanicMasked,
 			"has_cryptopanic_token":    cfg.Events.CryptoPanicToken != "",
 			"cryptopanic_currencies":   cfg.Events.CryptoPanicCurrencies,
+			// §战法批 大模型打分面：base/model/timeout 非密钥原样回显供核对，key 只回掩码。
+			"llm_base_url":       cfg.Events.LLMBaseURL,
+			"llm_model":          cfg.Events.LLMModel,
+			"llm_timeout_sec":    cfg.Events.LLMTimeoutSec,
+			"llm_api_key_masked": llmKeyMasked,
+			"has_llm_api_key":    cfg.Events.LLMApiKey != "",
 		},
 	}
 }
@@ -80,6 +92,8 @@ type setBinanceConfigReq struct {
 	Spot               *config.BinanceMarketProfile `json:"spot"`
 	RiskGate           *config.RiskGateConfig       `json:"risk_gate"`
 	PaperSeparate      *bool                        `json:"paper_separate"`
+	// Dispatch §战法批 派发参数整档替换（指针 nil=不动；结构里无密钥，可整档往返）。
+	Dispatch *config.BinanceDispatchConfig `json:"dispatch"`
 	// Events §ENH-A4/B8 POST 写入面（GET 视图已加 events 节，此处为配套的请求字段+合并逻辑）：
 	// 指针整档替换，nil=不动；token 空串/掩码哨兵不回写覆盖真值（同 api_key 惯例）。
 	Events *config.BinanceEventsConfig `json:"events"`
@@ -120,6 +134,8 @@ func (s *Server) handleSetBinanceConfig(w http.ResponseWriter, r *http.Request) 
 	if req.APISecret != nil && *req.APISecret != "" && !isMaskedSecret(*req.APISecret) {
 		cfg.APISecret = strings.TrimSpace(*req.APISecret)
 	}
+	// 以下为标量键逐指针合并段（nil=本次不动，同 setQMTConfigReq 局部更新契约）：
+	// 时钟/停止开关直写，枚举已在各自分支前置拦截。
 	if req.TimeoutSec != nil {
 		cfg.TimeoutSec = *req.TimeoutSec
 	}
@@ -138,6 +154,8 @@ func (s *Server) handleSetBinanceConfig(w http.ResponseWriter, r *http.Request) 
 	if req.QuoteAsset != nil {
 		cfg.QuoteAsset = strings.TrimSpace(*req.QuoteAsset)
 	}
+	// 市场档案（stock/spot）与风控闸为整档替换：前端表单总是回传完整三段，
+	// §MR-4A 的 short_margin_rate 等新字段随档案结构自动流转，端点零改动。
 	if req.Stock != nil {
 		cfg.Stock = *req.Stock
 	}
@@ -149,6 +167,9 @@ func (s *Server) handleSetBinanceConfig(w http.ResponseWriter, r *http.Request) 
 	}
 	if req.PaperSeparate != nil {
 		cfg.PaperSeparate = *req.PaperSeparate
+	}
+	if req.Dispatch != nil {
+		cfg.Dispatch = *req.Dispatch // §战法批 派发参数整档替换（域校验统一交给下方 ValidateBinance）
 	}
 	mergeBinanceEvents(&cfg, &req)
 
@@ -175,6 +196,12 @@ func mergeBinanceEvents(cfg *config.BinanceConfig, req *setBinanceConfigReq) con
 		ev.CryptoPanicToken = cfg.Events.CryptoPanicToken
 	} else {
 		ev.CryptoPanicToken = strings.TrimSpace(ev.CryptoPanicToken)
+	}
+	// §战法批 大模型 key 同口径：空串/掩码哨兵不回写覆盖真值（前端回显的是掩码）。
+	if ev.LLMApiKey == "" || isMaskedSecret(ev.LLMApiKey) {
+		ev.LLMApiKey = cfg.Events.LLMApiKey
+	} else {
+		ev.LLMApiKey = strings.TrimSpace(ev.LLMApiKey)
 	}
 	cfg.Events = ev
 	return ev

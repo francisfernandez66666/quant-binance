@@ -42,13 +42,18 @@ type mockBinance struct {
 	// §P2 回报腿：listenKey 响应体与现货在途集合覆写（空=缺省形状）。
 	listenKeyBody  string
 	spotOpenOrders string
+	// §MR-4B fapi 桩面：path→响应体覆写（空=内置缺省 fixture）+ path→强制 HTTP 状态码
+	// （拒单/杠杆失败用例用）。缺省 fixture 覆盖下单/杠杆/规则/持仓/收益/在途/listenKey
+	// 七端点，与真 fapi 的字段形状对齐（orderId 大整数、字符串数值族）。
+	fapiBodies map[string]string
+	fapiStatus map[string]int
 }
 
 // newMockBinance 起一个 httptest 假币安网关：按路径族可编程响应 + 逐路径调用计数，
 // 覆盖下单/撤单/查询/exchangeInfo/disclaimer 面（golden 断言与错误码映射都吃这个桩）。
 func newMockBinance(t *testing.T) *mockBinance {
 	t.Helper()
-	m := &mockBinance{calls: map[string][]string{}}
+	m := &mockBinance{calls: map[string][]string{}, fapiBodies: map[string]string{}, fapiStatus: map[string]int{}}
 	mux := http.NewServeMux()
 	record := func(path, rawQuery string) {
 		m.mu.Lock()
@@ -139,6 +144,39 @@ func newMockBinance(t *testing.T) *mockBinance {
 		}
 		fmt.Fprint(w, `[]`)
 	})
+	// §MR-4B 合约假柜台七端点：统一走 fapi 助手（record + 覆写体 + 强制状态码三段式）。
+	fapi := func(path, def string) http.HandlerFunc {
+		return func(w http.ResponseWriter, r *http.Request) {
+			record(path, r.URL.RawQuery)
+			if st := m.fapiStatus[path]; st != 0 {
+				w.WriteHeader(st)
+			}
+			if b, ok := m.fapiBodies[path]; ok {
+				fmt.Fprint(w, b)
+				return
+			}
+			fmt.Fprint(w, def)
+		}
+	}
+	mux.HandleFunc("/fapi/v1/order", fapi("/fapi/v1/order",
+		`{"orderId":9007199254740993,"clientOrderId":"qt-f","status":"ACCEPTED"}`))
+	mux.HandleFunc("/fapi/v1/leverage", fapi("/fapi/v1/leverage",
+		`{"leverage":1,"marginType":"isolated","symbol":"BTCUSDT"}`))
+	mux.HandleFunc("/fapi/v1/exchangeInfo", fapi("/fapi/v1/exchangeInfo",
+		`{"symbols":[{"filters":[
+			{"filterType":"PRICE_FILTER","tickSize":"0.10"},
+			{"filterType":"LOT_SIZE","stepSize":"0.001"}]}]}`))
+	// 缺省持仓 fixture：BTCUSDT 空 0.5（entry 60000/mark 61000/liq 62000）、
+	// ETHUSDT 无仓、BNBUSDT 多 2（entry 300）——覆盖方向映射与零仓跳过两支。
+	mux.HandleFunc("/fapi/v2/positionRisk", fapi("/fapi/v2/positionRisk",
+		`[{"symbol":"BTCUSDT","positionAmt":"-0.5","entryPrice":"60000","markPrice":"61000","liquidationPrice":"62000"},
+		  {"symbol":"ETHUSDT","positionAmt":"0","entryPrice":"0","markPrice":"3000","liquidationPrice":"0"},
+		  {"symbol":"BNBUSDT","positionAmt":"2","entryPrice":"300","markPrice":"310","liquidationPrice":"0"}]`))
+	mux.HandleFunc("/fapi/v1/account", fapi("/fapi/v1/account", `{"totalWalletBalance":"1000"}`))
+	mux.HandleFunc("/fapi/v1/openOrders", fapi("/fapi/v1/openOrders", `[]`))
+	mux.HandleFunc("/fapi/v1/listenKey", fapi("/fapi/v1/listenKey", `{"listenKey":"LK-FUT"}`))
+	mux.HandleFunc("/fapi/v1/income", fapi("/fapi/v1/income", `[]`))
+	mux.HandleFunc("/fapi/v1/time", fapi("/fapi/v1/time", `{"serverTime":0}`))
 	m.srv = httptest.NewServer(mux)
 	t.Cleanup(m.srv.Close)
 	return m
@@ -215,6 +253,215 @@ func (m mapVals) Has(k string) bool   { _, ok := m.v[k]; return ok }
 
 // TestSpotLimitOrderParams 现货 LIMIT 参数面：type/timeInForce/quantity/price + newClientOrderId
 // 幂等键（"qt"+sha1(signal_id) hex[:34]）+ 签名三件套齐备。
+// futuresExecutorFor 构建指向假柜台的合约执行器（§MR-4B 分叉形态）：
+// spot 档案切到 umfutures（FuturesActive=true），三个 signer 的 base 全部钉到 httptest。
+// tune 回调可继续改凭证面之外的档案字段（杠杆/阈值/保证金率）。
+func futuresExecutorFor(t *testing.T, m *mockBinance, tune func(*config.BinanceConfig)) *BinanceExecutor {
+	t.Helper()
+	cfg := config.DefaultBinanceConfig()
+	cfg.Enabled = true
+	cfg.APIKey = "test-api-key"
+	cfg.APISecret = "test-api-secret"
+	cfg.Spot.Enabled = true
+	cfg.Spot.ProductType = "umfutures"
+	if tune != nil {
+		tune(&cfg)
+	}
+	e := NewBinanceExecutor(config.BinanceBrokerView{Cfg: cfg, Market: "CRYPTO"})
+	e.spot.base = m.srv.URL
+	e.equity.base = m.srv.URL
+	e.futures.base = m.srv.URL
+	return e
+}
+
+// TestFuturesPlaceLimitShortOpen 卖出开空 LIMIT 全链：杠杆预设先行（缺省档案=1x 最保守）、
+// fapi 参数面（side=SELL 折叠、开空无 reduceOnly、GTC、按 fapi 步长截断）、幂等键复用。
+func TestFuturesPlaceLimitShortOpen(t *testing.T) {
+	m := newMockBinance(t)
+	e := futuresExecutorFor(t, m, nil)
+	res, err := e.PlaceSell(OrderRequest{
+		Side: SideShortOpen, Code: "BTCUSDT", Market: "CRYPTO",
+		PriceType: "limit", Price: 61000.07, Qty: 0.56789, SignalID: "sig-f1",
+	})
+	if err != nil || !res.OK {
+		t.Fatalf("开空下单应成功: %+v %v", res, err)
+	}
+	if res.OrderID != "9007199254740993" {
+		t.Fatalf("orderId 大整数精度丢失: %q", res.OrderID)
+	}
+	// 杠杆预设：首单前恰好一次（缺省 leverage=0→按 1x 设定）。
+	lev := m.queries("/fapi/v1/leverage")
+	if len(lev) != 1 {
+		t.Fatalf("杠杆预设应 1 次，实际 %d", len(lev))
+	}
+	mustParam(t, lev[0], "symbol", "BTCUSDT")
+	mustParam(t, lev[0], "leverage", "1")
+	q := m.queries("/fapi/v1/order")[0]
+	mustParam(t, q, "symbol", "BTCUSDT")
+	mustParam(t, q, "side", "SELL")
+	mustParam(t, q, "type", "LIMIT")
+	mustParam(t, q, "timeInForce", "GTC")
+	mustParam(t, q, "quantity", "0.567")      // stepSize 0.001 截断
+	mustParam(t, q, "price", "61000")         // trimNum 去尾零：61000.0 截 tick 后落串 61000       // tickSize 0.10 截断
+	mustParam(t, q, "reduceOnly", "<absent>") // 开空侧禁带 reduceOnly
+	mustParam(t, q, "newClientOrderId", spotClientOrderID("sig-f1"))
+}
+
+// TestFuturesCoverReduceOnly 平仓两侧（卖出平多/买入平仓平空）必须带 reduceOnly=true——
+// 单向持仓模式下这是"只减不加"的线上唯一表达，缺一次就可能把平仓打成反向开仓。
+func TestFuturesCoverReduceOnly(t *testing.T) {
+	for _, c := range []struct {
+		side, wantWire string
+	}{
+		{SideSell, "SELL"},      // 多头平仓
+		{SideShortCover, "BUY"}, // 空头平仓
+	} {
+		m := newMockBinance(t)
+		e := futuresExecutorFor(t, m, nil)
+		res, err := e.place(OrderRequest{
+			Side: c.side, Code: "BTCUSDT", Market: "CRYPTO", Qty: 0.4, SignalID: "sig-f2",
+		})
+		if err != nil || !res.OK {
+			t.Fatalf("%s 平仓下单应成功: %+v %v", c.side, res, err)
+		}
+		q := m.queries("/fapi/v1/order")[0]
+		mustParam(t, q, "side", c.wantWire)
+		mustParam(t, q, "type", "MARKET")
+		mustParam(t, q, "reduceOnly", "true")
+		mustParam(t, q, "quantity", "0.4")
+	}
+}
+
+// TestFuturesMarketBuyNeedsQty 合约无 quoteOrderQty：只有金额的市价买单必须本地拒
+// （不烧请求配额），并把换算指引写进拒因。
+func TestFuturesMarketBuyNeedsQty(t *testing.T) {
+	m := newMockBinance(t)
+	e := futuresExecutorFor(t, m, nil)
+	res, err := e.PlaceBuy(OrderRequest{Side: SideBuy, Code: "BTCUSDT", Market: "CRYPTO", Amount: 500})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.OK || !strings.Contains(res.Err, "quoteOrderQty") {
+		t.Fatalf("按金额市价应被拒且带指引: %+v", res)
+	}
+	if n := len(m.queries("/fapi/v1/order")); n != 0 {
+		t.Fatalf("本地拒单不得发请求，实际 %d 发", n)
+	}
+}
+
+// TestFuturesLeveragePresetCacheAndFailClose 杠杆 per-symbol 缓存（同 symbol 两单只设一次；
+// 换 symbol 再设一次）；杠杆设定失败=fail-close 不发单（传输错误上抛让 controller 标发送失败）。
+func TestFuturesLeveragePresetCacheAndFailClose(t *testing.T) {
+	m := newMockBinance(t)
+	e := futuresExecutorFor(t, m, func(c *config.BinanceConfig) { c.Spot.Leverage = 3 })
+	for i := 0; i < 2; i++ {
+		if _, err := e.PlaceBuy(OrderRequest{Side: SideBuy, Code: "BTCUSDT", Market: "CRYPTO", Qty: 0.1, SignalID: fmt.Sprintf("sig-l%d", i)}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := e.PlaceBuy(OrderRequest{Side: SideBuy, Code: "ETHUSDT", Market: "CRYPTO", Qty: 1, SignalID: "sig-l2"}); err != nil {
+		t.Fatal(err)
+	}
+	lev := m.queries("/fapi/v1/leverage")
+	if len(lev) != 2 {
+		t.Fatalf("杠杆预设应 2 次（BTC/ETH 各一），实际 %d", len(lev))
+	}
+	mustParam(t, lev[0], "leverage", "3")
+	// 杠杆端点炸（-4028 形态）：下一单（新 symbol）fail-close，order 端点不涨。
+	m.fapiStatus["/fapi/v1/leverage"] = http.StatusBadRequest
+	m.fapiBodies["/fapi/v1/leverage"] = `{"code":-4028,"msg":"Leverage is invalid"}`
+	before := len(m.queries("/fapi/v1/order"))
+	_, err := e.PlaceBuy(OrderRequest{Side: SideBuy, Code: "SOLUSDT", Market: "CRYPTO", Qty: 1, SignalID: "sig-l3"})
+	if err == nil || !strings.Contains(err.Error(), "杠杆预设失败") {
+		t.Fatalf("杠杆失败必须 fail-close 上抛: %v", err)
+	}
+	if len(m.queries("/fapi/v1/order")) != before {
+		t.Fatal("杠杆预设失败时不得发出委托")
+	}
+}
+
+// TestFuturesForkIsolation 分叉负锁①：product_type 空（现货档案）时 /fapi 端点零调用；
+// 负锁②：FuturesActive 但 fapi base 缺失（无凭证装配错位）→ 本地 fail-close 拒单不外发。
+func TestFuturesForkIsolation(t *testing.T) {
+	m := newMockBinance(t)
+	spotExec := executorFor(t, m, "CRYPTO")
+	if _, err := spotExec.PlaceBuy(OrderRequest{Side: SideBuy, Code: "BTCUSDT", Market: "CRYPTO", Qty: 0.1}); err != nil {
+		t.Fatal(err)
+	}
+	if n := len(m.queries("/fapi/v1/order")); n != 0 {
+		t.Fatalf("现货视图不得触达 fapi，实际 %d 发", n)
+	}
+	e := futuresExecutorFor(t, m, nil)
+	e.futures.base = ""
+	res, err := e.PlaceBuy(OrderRequest{Side: SideBuy, Code: "BTCUSDT", Market: "CRYPTO", Qty: 0.1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.OK || !strings.Contains(res.Err, "fail-close") {
+		t.Fatalf("fapi base 缺失应本地拒: %+v", res)
+	}
+}
+
+// TestFuturesStateAndCancel 合约对账与撤单：positionRisk→持仓行（方向/成本/计价币/零仓跳过）、
+// 撤单走 fapi 复合单号、裸单号本地拒。
+func TestFuturesStateAndCancel(t *testing.T) {
+	m := newMockBinance(t)
+	e := futuresExecutorFor(t, m, nil)
+	st, err := e.State()
+	if err != nil || !st.Connected {
+		t.Fatalf("合约 State 应连通: %+v %v", st, err)
+	}
+	if len(st.Positions) != 2 {
+		t.Fatalf("零仓符号必须跳过，应 2 行，实际 %d", len(st.Positions))
+	}
+	btc := st.Positions[0]
+	if btc.TsCode != "BTCUSDT" || btc.Side != "short" || btc.Qty != 0.5 || btc.Currency != "USDT" || btc.CostPrice != 60000 {
+		t.Fatalf("空头持仓映射错: %+v", btc)
+	}
+	bnb := st.Positions[1]
+	if bnb.TsCode != "BNBUSDT" || bnb.Side != "long" || bnb.Qty != 2 || bnb.CostPrice != 300 {
+		t.Fatalf("多头持仓映射错: %+v", bnb)
+	}
+	if err := e.Cancel("BTCUSDT:123"); err != nil {
+		t.Fatal(err)
+	}
+	q := m.queries("/fapi/v1/order")
+	last := q[len(q)-1]
+	if !strings.Contains(last, "symbol=BTCUSDT") || !strings.Contains(last, "orderId=123") {
+		t.Fatalf("撤单参数错: %s", last)
+	}
+	if err := e.Cancel("123"); err == nil {
+		t.Fatal("裸单号撤单必须拒（无法定位 symbol）")
+	}
+	if ok, err := e.Health(); !ok || err != nil {
+		t.Fatalf("健康探测应过: %v %v", ok, err)
+	}
+	if n := len(m.queries("/fapi/v1/account")); n == 0 {
+		t.Fatal("合约健康探测必须走 fapi account")
+	}
+}
+
+// TestLiqEvidence liq_distance 证据源三形态：距离跌破阈值=拦（带数字理由）、
+// 达标=放行、无既有空头=放行（新开仓尚无强平价）。
+func TestLiqEvidence(t *testing.T) {
+	m := newMockBinance(t)
+	e := futuresExecutorFor(t, m, func(c *config.BinanceConfig) { c.Spot.LiqDistMinPct = 5 })
+	// mark 61000 / liq 62000 → 距离 1.64% < 5% → 拦。
+	ok, detail := e.LiqEvidence("CRYPTO", "BTCUSDT")
+	if ok || !strings.Contains(detail, "距强平") {
+		t.Fatalf("距离不足应拦: %v %s", ok, detail)
+	}
+	// 阈值调到 1%：达标放行。
+	e2 := futuresExecutorFor(t, m, func(c *config.BinanceConfig) { c.Spot.LiqDistMinPct = 1 })
+	if ok2, _ := e2.LiqEvidence("CRYPTO", "BTCUSDT"); !ok2 {
+		t.Fatal("距离达标应放行")
+	}
+	// 无空头持仓的符号：放行（新开仓无强平价可证）。
+	if ok3, d3 := e.LiqEvidence("CRYPTO", "SOLUSDT"); !ok3 || !strings.Contains(d3, "无既有仓位") {
+		t.Fatalf("无仓位应放行并给原因: %v %s", ok3, d3)
+	}
+}
+
 func TestSpotLimitOrderParams(t *testing.T) {
 	m := newMockBinance(t)
 	e := executorFor(t, m, "CRYPTO")

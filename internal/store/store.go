@@ -365,6 +365,7 @@ func (d *DB) migrate() error {
 		`CREATE TABLE IF NOT EXISTS real_positions (
 			market TEXT NOT NULL DEFAULT 'CN',
 			currency TEXT NOT NULL DEFAULT 'CNY',
+			side TEXT NOT NULL DEFAULT 'long',
 			ts_code TEXT NOT NULL,
 			name TEXT DEFAULT '',
 			qty REAL NOT NULL DEFAULT 0,
@@ -456,6 +457,20 @@ func (d *DB) migrate() error {
 			UNIQUE(user_id, trade_date, gate)
 		)`,
 		`CREATE INDEX IF NOT EXISTS idx_risk_gates_day ON risk_gates(trade_date)`,
+		// §MR-4B 资金费台账（USDT 本位永续 8h 结算）：tran_id 是交易所 income 流水的
+		// 全局唯一 ID——落账幂等锚。重启后 24h 回看窗重放同一批流水时，INSERT OR IGNORE
+		// 命中即跳过，成本价绝不被二次调整（资金费窗漏记/重记都直接污染多空盈亏基线）。
+		// amount 记交易所原值：负=支出（多数情形）、正=收取（持仓方向与市场费率相反）。
+		`CREATE TABLE IF NOT EXISTS funding_fees (
+			tran_id INTEGER PRIMARY KEY,
+			user_id TEXT NOT NULL,
+			market TEXT NOT NULL,
+			ts_code TEXT NOT NULL,
+			amount REAL NOT NULL,
+			income_time INTEGER NOT NULL,
+			applied_at TEXT DEFAULT ''
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_funding_user ON funding_fees(user_id, market, ts_code)`,
 		// §WS-G Shadow 执行器落账：staging 影子引擎只记录决策不真下（signal_id 幂等，同键去重）。
 		// §BINANCE-P1c：market 列（影子决策跨市场回放时的归属维度；缺省 CN=存量语义）。
 		`CREATE TABLE IF NOT EXISTS shadow_orders (
@@ -635,6 +650,9 @@ func (d *DB) migrate() error {
 		// CN/CNY so the QMT chain keeps byte-identical semantics. The PK rebuild runs after ALTERs.
 		{"real_positions", "market", "ALTER TABLE real_positions ADD COLUMN market TEXT NOT NULL DEFAULT 'CN'"},
 		{"real_positions", "currency", "ALTER TABLE real_positions ADD COLUMN currency TEXT NOT NULL DEFAULT 'CNY'"},
+		// §MR-4A 做空方向列：存量行全部回填 'long'（DEFAULT 即回填值），CN/QMT 链零行为变化；
+		// 读侧仍以 COALESCE 兜底更早的史前库，双保险。
+		{"real_positions", "side", "ALTER TABLE real_positions ADD COLUMN side TEXT NOT NULL DEFAULT 'long'"},
 		{"orders", "market", "ALTER TABLE orders ADD COLUMN market TEXT NOT NULL DEFAULT 'CN'"},
 		{"orders", "currency", "ALTER TABLE orders ADD COLUMN currency TEXT NOT NULL DEFAULT 'CNY'"},
 		{"fills", "market", "ALTER TABLE fills ADD COLUMN market TEXT NOT NULL DEFAULT 'CN'"},
@@ -962,12 +980,13 @@ func (d *DB) migrateRealPositionsPK() error {
 				buy_date TEXT DEFAULT '',
 				market TEXT NOT NULL DEFAULT 'CN',
 				currency TEXT NOT NULL DEFAULT 'CNY',
+				side TEXT NOT NULL DEFAULT 'long',
 				PRIMARY KEY (ts_code, user_id)
 			);
 			INSERT OR REPLACE INTO real_positions_new
-				(ts_code, name, qty, cost_price, amount, highest_price, strategy, signal_id, updated_at, user_id, buy_date, market, currency)
+				(ts_code, name, qty, cost_price, amount, highest_price, strategy, signal_id, updated_at, user_id, buy_date, market, currency, side)
 			SELECT ts_code, name, qty, cost_price, amount, highest_price, strategy, signal_id, updated_at, COALESCE(user_id, ''),
-				COALESCE(buy_date, ''), COALESCE(market, 'CN'), COALESCE(currency, 'CNY')
+				COALESCE(buy_date, ''), COALESCE(market, 'CN'), COALESCE(currency, 'CNY'), COALESCE(side, 'long')
 			FROM real_positions;
 			DROP TABLE real_positions;
 			ALTER TABLE real_positions_new RENAME TO real_positions;
@@ -1016,12 +1035,13 @@ func (d *DB) migrateRealPositionsMarketPK() error {
 			updated_at TEXT NOT NULL,
 			user_id TEXT DEFAULT '',
 			buy_date TEXT DEFAULT '',
+			side TEXT NOT NULL DEFAULT 'long',
 			PRIMARY KEY (market, ts_code, user_id)
 		);
 		INSERT OR REPLACE INTO real_positions_market_new
-			(market, currency, ts_code, name, qty, cost_price, amount, highest_price, strategy, signal_id, updated_at, user_id, buy_date)
+			(market, currency, ts_code, name, qty, cost_price, amount, highest_price, strategy, signal_id, updated_at, user_id, buy_date, side)
 		SELECT COALESCE(market, 'CN'), COALESCE(currency, 'CNY'), ts_code, name, qty, cost_price, amount, highest_price,
-			strategy, signal_id, updated_at, COALESCE(user_id, ''), COALESCE(buy_date, '')
+			strategy, signal_id, updated_at, COALESCE(user_id, ''), COALESCE(buy_date, ''), COALESCE(side, 'long')
 		FROM real_positions;
 		DROP TABLE real_positions;
 		ALTER TABLE real_positions_market_new RENAME TO real_positions;

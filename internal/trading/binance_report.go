@@ -53,6 +53,13 @@ type BinanceReportEvent struct {
 	Source  string  `json:"source"`   // "ws" / "rest"，用于区分三条腿
 }
 
+// §MR-4B 合约 user-data 流域名（USDT-M fstream）；testnet 域未实测（Phase 0 合约 Q 项），
+// 与 FuturesBaseURL 的 testnet 裁决同源同风格：主网恒先，Testnet=true 才切。
+const (
+	binanceFuturesWSProd    = "wss://fstream.binance.com"
+	binanceFuturesWSTestnet = "wss://fstream.binancefuture.com"
+)
+
 // binanceStatusMap §8.2 固定映射表（唯一权威，未知键绝不入库）。
 var binanceStatusMap = map[string]string{
 	"NEW":              "已报",
@@ -103,6 +110,9 @@ type BinanceReporter struct {
 	ignored       atomic.Int64 // 累计忽略（未知状态/无法归一）
 	restDiffs     atomic.Int64 // REST 差分补投数
 	unknownLog    atomic.Int64 // 未知状态告警节流戳（unix 秒）
+	// §MR-4B 合约腿4（资金费）专属状态：拉取窗游标（毫秒，0=首轮走 24h 回看）与入账计数。
+	fundingCursorMs atomic.Int64
+	fundingApplied  atomic.Int64
 }
 
 // NewBinanceReporter 构造接收器；必填项缺失或 Market 非 US/CRYPTO 直接返回 error
@@ -120,10 +130,14 @@ func NewBinanceReporter(opt BinanceReporterOptions) (*BinanceReporter, error) {
 		opt.PollEvery = 60 * time.Second
 	}
 	if opt.RenewEvery <= 0 {
-		// 按 TTL 固定比例续期：现货 30min TTL→25min，美股 60min→45min。
-		if m == "CRYPTO" {
+		// 按 TTL 固定比例续期：现货 30min TTL→25min，美股 60min→45min；
+		// §MR-4B 合约 listenKey TTL 3h、官方要求 30min keepalive 一次（PUT /fapi/v1/listenKey）。
+		switch {
+		case m == "CRYPTO" && opt.Exec.view.FuturesActive():
+			opt.RenewEvery = 30 * time.Minute
+		case m == "CRYPTO":
 			opt.RenewEvery = 25 * time.Minute
-		} else {
+		default:
 			opt.RenewEvery = 45 * time.Minute
 		}
 	}
@@ -149,6 +163,12 @@ func (r *BinanceReporter) Start() error {
 	r.wg.Add(2)
 	go r.keyLoop(ctx)  // 腿1+2：listenKey 取/续 + WS 起停
 	go r.pollLoop(ctx) // 腿3：REST 差分兜底
+	// §MR-4B 腿4（仅合约视图）：资金费 income 轮询入账——现货/美股没有 funding 概念，
+	// 判定点不成立时整条协程不存在，两市行为逐字节不变。
+	if r.opt.Market == "CRYPTO" && r.opt.Exec.view.FuturesActive() {
+		r.wg.Add(1)
+		go r.fundingLoop(ctx)
+	}
 	return nil
 }
 
@@ -248,6 +268,15 @@ func (r *BinanceReporter) userStreamURL(key string) string {
 	if r.opt.WsURL != "" {
 		return r.opt.WsURL
 	}
+	// §MR-4B 合约 user 流走 fstream 域（裸 listenKey，无 @ 后缀）；
+	// testnet 域属 Q 类未实测项（testnet 实链时首验），错了只影响 WS 腿（REST 差分/资金费兜底仍在）。
+	if r.opt.Market == "CRYPTO" && r.opt.Exec.view.FuturesActive() {
+		base := binanceFuturesWSProd
+		if r.opt.Exec.view.Cfg.Testnet {
+			base = binanceFuturesWSTestnet
+		}
+		return data.UserStreamURLBare(base, key, "")
+	}
 	if r.opt.Market == "CRYPTO" {
 		base := data.BinanceSpotWSProd
 		if r.opt.Exec.view.Cfg.Testnet {
@@ -267,8 +296,13 @@ func (r *BinanceReporter) listenKey(ctx context.Context, renew bool) (string, er
 		method = http.MethodPut
 	}
 	if r.opt.Market == "CRYPTO" {
-		s := r.opt.Exec.spot
-		req, err := http.NewRequestWithContext(ctx, method, s.base+"/api/v3/userDataStream", nil)
+		// §MR-4B 合约 listenKey 与现货同族免签头部面，只是端点换 /fapi/v1/listenKey；
+		// 签名面调用会直接被交易所 -2015 拒（两套形状差异契约基线，同 §8.1 现货/美股分裂先例）。
+		s, path := r.opt.Exec.spot, "/api/v3/userDataStream"
+		if r.opt.Exec.view.FuturesActive() {
+			s, path = r.opt.Exec.futures, "/fapi/v1/listenKey"
+		}
+		req, err := http.NewRequestWithContext(ctx, method, s.base+path, nil)
 		if err != nil {
 			return "", err
 		}
@@ -353,10 +387,72 @@ func (r *BinanceReporter) handleFrame(payload []byte) {
 //
 // 由调用方计数留痕，等实测后收紧）。
 func (r *BinanceReporter) parseReportEvent(obj map[string]any) (BinanceReportEvent, bool) {
+	// §MR-4B 合约帧是 ORDER_TRADE_UPDATE（外层信封 + "o" 内层），与现货 executionReport
+	// 平铺形状不同族，必须独立解析器；内层字段字母表同源（i/X/x/S/l/n/T），复用工具函数。
+	if r.opt.Market == "CRYPTO" && r.opt.Exec.view.FuturesActive() {
+		return r.parseFuturesOrderTradeUpdate(obj)
+	}
 	if r.opt.Market == "CRYPTO" {
 		return r.parseSpotExecutionReport(obj)
 	}
 	return r.parseEquityOrderReport(obj)
+}
+
+// parseFuturesOrderTradeUpdate 合约委托回报帧解析（fapi user stream）。三条硬约定：
+//   - 事件类型必须 ORDER_TRADE_UPDATE（ACCOUNT_CONFIG_UPDATE/MARGIN_CALL 等只计数不入库）；
+//   - 单向持仓模式下 positionSide 恒 BOTH——一旦看到 LONG/SHORT 说明账户被外部改成对冲模式，
+//     BUY/SELL 不再唯一决定净头寸方向，该帧拒收并告警（fail-close，错方向的成交绝不允许入账）；
+//   - 成交价优先 L（逐笔最新价，部分响应缺省），退回 ap（累计均价）——市价单帧里 p 是
+//     强平/触发价语义，绝不当成交价用（合约 executionReport 的老坑）。
+func (r *BinanceReporter) parseFuturesOrderTradeUpdate(obj map[string]any) (BinanceReportEvent, bool) {
+	if ev := mapStr(obj, "e"); ev != "" && ev != "ORDER_TRADE_UPDATE" {
+		return BinanceReportEvent{}, false // 非委托回报事件
+	}
+	o, ok := obj["o"].(map[string]any)
+	if !ok {
+		return BinanceReportEvent{}, false // 无 "o" 内层：不是本模式认识的帧形
+	}
+	if ps := strings.ToUpper(mapStr(o, "po")); ps != "" && ps != "BOTH" {
+		r.alert("error", "币安合约账户疑似切换对冲模式",
+			fmt.Sprintf("回报 positionSide=%q（单向模式应为 BOTH），该帧已拒收入库", ps))
+		return BinanceReportEvent{}, false
+	}
+	rawStatus := mapStr(o, "X")
+	status, ok := mapBinanceReportStatus(rawStatus)
+	if !ok {
+		r.logUnknown(rawStatus)
+		return BinanceReportEvent{}, false
+	}
+	orderID := jsonString(o["i"])
+	if orderID == "" || orderID == "<nil>" {
+		return BinanceReportEvent{}, false // 无主键回报无法幂等（§F5 语义）
+	}
+	e := BinanceReportEvent{
+		Market:  "CRYPTO",
+		OrderID: orderID,
+		Symbol:  mapStr(o, "s"),
+		Status:  status,
+		Raw:     rawStatus,
+		Price:   mapFloat(o, "p"),
+		Qty:     mapFloat(o, "q"),
+		TimeMs:  int64(mapFloat(obj, "T")),
+		Source:  "ws",
+	}
+	switch strings.ToUpper(mapStr(o, "S")) {
+	case "BUY":
+		e.Side = SideBuy
+	case "SELL":
+		e.Side = SideSell
+	}
+	if strings.EqualFold(mapStr(o, "x"), "TRADE") {
+		e.FillQty = mapFloat(o, "l")
+		e.FillPx = mapFloat(o, "L", "ap")
+		e.Fee = mapFloat(o, "n")
+		if t := jsonString(o["t"]); t != "" && t != "<nil>" && t != "0" {
+			e.TradeID = e.Symbol + ":" + t // §M4 判重精确锚（与现货同派生式）
+		}
+	}
+	return e, e.Side != ""
 }
 
 // parseSpotExecutionReport 现货 executionReport（§8.2/§8.3 契约键）。
@@ -463,10 +559,26 @@ func (r *BinanceReporter) applyReport(e BinanceReportEvent) {
 	if local != nil {
 		signalID, code = local.SignalID, local.Code
 	}
+	// §MR-4A 方向还原：交易所回报只有 BUY/SELL，空头单的真实方向存在本地占位委托行里
+	// （placeOrder 落库 Side=卖出开空/买入平仓）。按单号找到本地行后把线方向折叠回真实方向，
+	// 成交腿才会在 ApplyRealFill 走对空头分支（开空加空仓 / 平空减空仓）；本地无行（回报先到）
+	// 保持线方向——CN 同款竞态，REST 差分兜底重投时会带上已回填的本地行。
+	// English: §MR-4A — the exchange only reports BUY/SELL; the true short direction lives in the
+	// local placeholder order row. Fold the wire side back to 卖出开空/买入平仓 before the fill leg,
+	// so ApplyRealFill hits the short branch; report-first races keep the wire side (REST diff re-applies).
+	side := e.Side
+	if local != nil && IsShortSide(local.Side) {
+		if e.Side == SideSell && local.Side == SideShortOpen {
+			side = SideShortOpen
+		}
+		if e.Side == SideBuy && local.Side == SideShortCover {
+			side = SideShortCover
+		}
+	}
 	at := r.eventTimeStr(e)
 	action, err := r.opt.DB.ApplyOrderReportTx(store.RealOrder{
 		OrderID: e.OrderID, SignalID: signalID, Code: code,
-		Side: e.Side, Status: e.Status, Price: e.Price, Qty: e.Qty,
+		Side: side, Status: e.Status, Price: e.Price, Qty: e.Qty,
 		CreatedAt: at, UserID: r.opt.UserID, Market: e.Market,
 		// 补插路径（回报先于下单回填）也打计价币章：与成交腿同源 currencyForSymbol，
 		// 避免 orders 行留空、fills 行却带 USDT 的口径分裂。
@@ -487,7 +599,7 @@ func (r *BinanceReporter) applyReport(e BinanceReportEvent) {
 		return
 	}
 	if err := r.opt.DB.ApplyRealFill(store.RealFill{
-		OrderID: e.OrderID, Code: code, Side: e.Side,
+		OrderID: e.OrderID, Code: code, Side: side,
 		Price: e.FillPx, Qty: e.FillQty, Amount: e.FillQty * e.FillPx,
 		TradedAt: at, SignalID: signalID, TradeID: e.TradeID,
 		// name=交易对原文：建仓回填腿（positions 表以 code+name 落账），CN 链路由回报
@@ -500,7 +612,7 @@ func (r *BinanceReporter) applyReport(e BinanceReportEvent) {
 		return
 	}
 	log.Printf("[binance] 成交入账 %s %s %s %.8f@%.8f fee=%v (order=%s 腿=%s)",
-		e.Market, e.Side, code, e.FillQty, e.FillPx, e.Fee, e.OrderID, e.Source)
+		e.Market, side, code, e.FillQty, e.FillPx, e.Fee, e.OrderID, e.Source)
 }
 
 // localOrderFor 按币安 order_id 找本地委托行（取 signal_id/code 归属）；没有返回 nil。
@@ -565,6 +677,29 @@ func (r *BinanceReporter) pollOnce(ctx context.Context) {
 		return
 	}
 	open := map[string]bool{}
+	// §MR-4B 合约差分：/fapi/v1/openOrders 在途集合 + 消失单逐笔 /fapi/v1/order 明细
+	// （明细需要 symbol——fapi 查明细不带 symbol 会 -1119；本地委托行 Code 即 symbol）。
+	if r.opt.Market == "CRYPTO" && r.opt.Exec.view.FuturesActive() {
+		body, err := r.opt.Exec.rawSigned(r.opt.Exec.futures, http.MethodGet, "/fapi/v1/openOrders", url.Values{})
+		if err != nil {
+			log.Printf("[binance] REST 差分拉合约 openOrders 失败: %v", err)
+			return
+		}
+		var arr []map[string]any
+		if binanceUnmarshal(body, &arr) != nil {
+			return
+		}
+		for _, o := range arr {
+			open[jsonString(o["orderId"])] = true
+		}
+		for _, o := range pending {
+			if open[o.OrderID] {
+				continue
+			}
+			r.diffFuturesOrder(ctx, o.OrderID, o.Code)
+		}
+		return
+	}
 	if r.opt.Market == "CRYPTO" {
 		body, err := r.opt.Exec.rawSigned(r.opt.Exec.spot, http.MethodGet, "/api/v3/openOrders", url.Values{})
 		if err != nil {
@@ -653,23 +788,77 @@ func (r *BinanceReporter) diffSpotOrder(ctx context.Context, orderID string) {
 	r.applyReport(ev)
 }
 
+// diffFuturesOrder 合约单笔明细补投：GET /fapi/v1/order?symbol=&orderId=。
+// 明细里 executedQty/cumQty 是累计量（与现货差分同款近似），秩守卫吸收重复；
+// 成交价优先 avgPrice（交易所给的成交均价），缺时退委托价。
+func (r *BinanceReporter) diffFuturesOrder(ctx context.Context, orderID, symbol string) {
+	params := url.Values{"orderId": {orderID}}
+	if symbol != "" {
+		params.Set("symbol", strings.ToUpper(symbol))
+	}
+	body, err := r.opt.Exec.rawSigned(r.opt.Exec.futures, http.MethodGet, "/fapi/v1/order", params)
+	if err != nil {
+		log.Printf("[binance] REST 差分查合约明细 %s 失败: %v", orderID, err)
+		return
+	}
+	var obj map[string]any
+	if binanceUnmarshal(body, &obj) != nil {
+		return
+	}
+	rawStatus := mapStr(obj, "status")
+	status, ok := mapBinanceReportStatus(rawStatus)
+	if !ok {
+		r.logUnknown(rawStatus)
+		return
+	}
+	ev := BinanceReportEvent{
+		Market:  "CRYPTO",
+		OrderID: firstNonEmpty(jsonString(obj["orderId"]), orderID),
+		Symbol:  firstNonEmpty(mapStr(obj, "symbol"), symbol),
+		Status:  status,
+		Raw:     rawStatus,
+		Price:   mapFloat(obj, "price"),
+		Qty:     mapFloat(obj, "origQty"),
+		TimeMs:  int64(mapFloat(obj, "updateTime")),
+		Source:  "rest",
+	}
+	switch strings.ToUpper(mapStr(obj, "side")) {
+	case "BUY":
+		ev.Side = SideBuy
+	case "SELL":
+		ev.Side = SideSell
+	}
+	if q := mapFloat(obj, "executedQty"); q > 0 {
+		ev.FillQty = q
+		if pv := mapFloat(obj, "cumQuote", "cumQty"); pv > 0 {
+			ev.FillPx = pv / q
+		} else {
+			ev.FillPx = mapFloat(obj, "avgPrice", "price")
+		}
+	}
+	r.restDiffs.Add(1)
+	r.applyReport(ev)
+}
+
 // Stats 三条腿健康度快照（/api/binance/state 消费；只读计数，不加写路径锁）。
 func (r *BinanceReporter) Stats() map[string]any {
 	r.mu.Lock()
 	ws, key := r.ws, r.key
 	r.mu.Unlock()
 	out := map[string]any{
-		"market":        r.opt.Market,
-		"listen_key":    key != "",          // listenKey 是否在握（false=REST-only 降级）
-		"ws":            ws != nil,          // WS 腿是否装配
-		"events":        r.events.Load(),    // 累计应用
-		"ignored":       r.ignored.Load(),   // 累计忽略（未知状态/坏帧/落库失败）
-		"rest_diffs":    r.restDiffs.Load(), // REST 差分补投数
-		"last_event":    r.lastEventUnix.Load(),
-		"ws_reconnects": int64(0),
-		"ws_messages":   int64(0),
-		"ws_healthy":    false,
-		"ws_connected":  false,
+		"market":     r.opt.Market,
+		"listen_key": key != "",          // listenKey 是否在握（false=REST-only 降级）
+		"ws":         ws != nil,          // WS 腿是否装配
+		"events":     r.events.Load(),    // 累计应用
+		"ignored":    r.ignored.Load(),   // 累计忽略（未知状态/坏帧/落库失败）
+		"rest_diffs": r.restDiffs.Load(), // REST 差分补投数
+		// §MR-4B 合约腿4健康度（现货/美股视图恒 0——判定点不成立时协程不存在）。
+		"funding_applied": r.fundingApplied.Load(),
+		"last_event":      r.lastEventUnix.Load(),
+		"ws_reconnects":   int64(0),
+		"ws_messages":     int64(0),
+		"ws_healthy":      false,
+		"ws_connected":    false,
 	}
 	if ws != nil {
 		out["ws_healthy"] = ws.Healthy()
@@ -678,6 +867,19 @@ func (r *BinanceReporter) Stats() map[string]any {
 		out["ws_messages"] = ws.MessageCount()
 	}
 	return out
+}
+
+// fundingCursor 当前 income 拉取窗起点（毫秒）：0=尚未跑过，首轮按 24h 回看补齐重启缺口。
+func (r *BinanceReporter) fundingCursor() int64 {
+	if c := r.fundingCursorMs.Load(); c > 0 {
+		return c
+	}
+	return r.opt.Now().Add(-fundingFirstRunLookback).UnixMilli()
+}
+
+// setFundingCursor 推进拉取窗游标（仅在整窗消化完毕后调用；失败轮不推进=下轮重放）。
+func (r *BinanceReporter) setFundingCursor(ms int64) {
+	r.fundingCursorMs.Store(ms)
 }
 
 // alert 运维告警出口（OnAlert 注入；nil 时退化为日志），回报链的任何"活不正常"都走这里。

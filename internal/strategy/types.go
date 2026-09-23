@@ -42,11 +42,16 @@ const (
 type TradeAction string
 
 // 交易动作类型取值。
+// §MR-4A 做空扩集：short_open/short_cover 仅由 xasset（US/CRYPTO）战法产出，
+// CN 战法零产出（派发/风控侧按 Market 拒收，负向锁在 verify §MR4）。
+// English: §MR-4A adds short-open/short-cover actions, produced only by xasset strategies.
 const (
-	ActionBuy   TradeAction = "buy"   // 买入（Buy）
-	ActionSell  TradeAction = "sell"  // 卖出（Sell）
-	ActionHold  TradeAction = "hold"  // 持仓（Hold）
-	ActionWatch TradeAction = "watch" // 观察（Watch）
+	ActionBuy        TradeAction = "buy"         // 买入（Buy）
+	ActionSell       TradeAction = "sell"        // 卖出（Sell）
+	ActionHold       TradeAction = "hold"        // 持仓（Hold）
+	ActionWatch      TradeAction = "watch"       // 观察（Watch）
+	ActionShortOpen  TradeAction = "short_open"  // 卖出开空（§MR-4A，US/CRYPTO 专用）
+	ActionShortCover TradeAction = "short_cover" // 买入平仓（§MR-4A，US/CRYPTO 专用）
 )
 
 // Priority 信号优先级（1 最高，5 最低）。（Priority is the signal priority, 1 highest to 5 lowest.）

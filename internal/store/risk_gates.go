@@ -167,10 +167,13 @@ func (d *DB) TodayRealizedPnl(userID, day string) (float64, error) {
 }
 
 // TodayRealizedPnlForMarket §BINANCE-P2（PLAN §15.2）市场作用域已实现盈亏：
-// 只汇总该市场当日卖出成交（注意 day 需为「该市场记账时区」的 yyyy-MM-dd，
+// 只汇总该市场当日成交（注意 day 需为「该市场记账时区」的 yyyy-MM-dd，
 // 与 gate.marketToday 同口径——CRYPTO=UTC 日、US=纽约日、CN=北京日）。
 // 成本回落查持仓按代号互斥形态直接命中（CN 六位+.SH/.SZ、US 字母、CRYPTO 资产对不撞码）。
+// §MR-4A：空头侧平仓腿=买入平仓，实现盈亏=(开空均价−平仓价)×数量，成本基准走空头行/
+// 当日开空成交均价；多头腿（卖出）口径逐字节不变。
 // English: market-scoped realized P&L; day must be the market-local date (same key as gate.marketToday).
+// §MR-4A adds the short leg: a 买入平仓 fill realizes (short-cost − cover-price) × qty.
 func (d *DB) TodayRealizedPnlForMarket(userID, day, market string) (float64, error) {
 	m := NormalizeMarket(market)
 	rows, err := d.db.Query(`SELECT code, side, price, qty FROM fills
@@ -186,23 +189,39 @@ func (d *DB) TodayRealizedPnlForMarket(userID, day, market string) (float64, err
 		if err := rows.Scan(&code, &side, &price, &qty); err != nil {
 			return 0, err
 		}
-		if side != "卖出" || qty <= 0 {
-			continue
+		switch side {
+		case "卖出":
+			if qty <= 0 {
+				continue
+			}
+			cost := d.costBasisFor(userID, code, day)
+			if cost <= 0 {
+				continue // fail-open：成本不可知不计入
+			}
+			pnl += (price - cost) * qty
+		case "买入平仓": // §MR-4A 空头平仓腿：开空均价高于平仓价才是盈利（方向与多头相反）
+			if qty <= 0 {
+				continue
+			}
+			cost := d.costBasisForShort(userID, code, day)
+			if cost <= 0 {
+				continue // fail-open：开空成本不可知不计入
+			}
+			pnl += (cost - price) * qty
+		default:
+			continue // 买入/卖出开空是开仓腿，不实现盈亏
 		}
-		cost := d.costBasisFor(userID, code, day)
-		if cost <= 0 {
-			continue // fail-open：成本不可知不计入
-		}
-		pnl += (price - cost) * qty
 	}
 	return pnl, rows.Err()
 }
 
 // costBasisFor 某 code 的成本价：优先当前持仓 CostPrice；持仓已清时回落今日该 code 买入成交均价。
-// English: cost basis for a code — current position CostPrice first; falls back to today's average buy
-// fill price when the position has been fully closed.
+// §MR-4A：持仓行只认多头（side='long'）——单向持仓下空头行不可能接卖出平仓（成交层已拒），
+// 但历史脏数据也要防：拿空头均价当多头成本会把盈亏算反，方向不符直接落到成交均价回落腿。
+// English: cost basis for a code — long position CostPrice first; falls back to today's average buy
+// fill price when the position is gone. §MR-4A: a short row is never a long's cost basis.
 func (d *DB) costBasisFor(userID, code, day string) float64 {
-	if p, err := d.RealPositionByCodeForUser(userID, code); err == nil && p.Qty > 0 && p.CostPrice > 0 {
+	if p, err := d.RealPositionByCodeForUser(userID, code); err == nil && p.Qty > 0 && p.CostPrice > 0 && p.Side != "short" {
 		return p.CostPrice
 	}
 	fills, err := d.ListFillsByDay(userID, day)
@@ -220,6 +239,32 @@ func (d *DB) costBasisFor(userID, code, day string) float64 {
 		return 0
 	}
 	return buyAmt / buyQty
+}
+
+// costBasisForShort §MR-4A 空头持仓的成本基准（开空均价）：优先当前空头持仓行 CostPrice
+// （ApplyRealFill 对开空腿做加权成本，CostPrice 即加权开空价）；空头行已平完时回落
+// 今日该 code 卖出开空成交均价。任何一步不可知返回 0，由调用方 fail-open 不计入。
+// English: §MR-4A short cost basis — the short row's CostPrice (weighted short-open price),
+// falling back to today's average 卖出开空 fill price; 0 when unknowable (caller fails open).
+func (d *DB) costBasisForShort(userID, code, day string) float64 {
+	if p, err := d.RealPositionByCodeForUser(userID, code); err == nil && p.Qty > 0 && p.CostPrice > 0 && p.Side == "short" {
+		return p.CostPrice
+	}
+	fills, err := d.ListFillsByDay(userID, day)
+	if err != nil {
+		return 0
+	}
+	var openAmt, openQty float64
+	for _, f := range fills {
+		if f.Side == "卖出开空" && f.Code == code && f.Qty > 0 {
+			openAmt += f.Price * float64(f.Qty)
+			openQty += float64(f.Qty)
+		}
+	}
+	if openQty <= 0 {
+		return 0
+	}
+	return openAmt / openQty
 }
 
 // TotalAssets 当前总资产（元）：可用现金（券商已回报时）+ Σ持仓市值（现价优先，缺失回落成本价）。
@@ -253,8 +298,18 @@ func (d *DB) TotalAssetsForMarket(userID, market string) (float64, error) {
 		if price <= 0 {
 			price = p.CostPrice
 		}
+		// §MR-4A 空头行计**负市值**：开空成交的回款已进账户现金（柜台/交易所上报口径），
+		// 持仓侧再按现价计一笔正市值就是把同一笔钱数两次；按 −现价×数量 计恰好是
+		// 「现金里趴着开空款 − 买回负债」的权益净额，浮盈浮亏随价格自然反映。
+		// CN 恒为多头行（side 缺省 'long'），本分支对 CN 链零影响、逐字节不变。
+		// English: §MR-4A short rows contribute −market-value (the open proceeds already sit in
+		// reported cash; counting the row positive double-counts). CN rows are always long → byte-identical.
+		sign := 1.0
+		if p.Side == "short" {
+			sign = -1.0
+		}
 		if price > 0 {
-			total += price * float64(p.Qty)
+			total += sign * price * float64(p.Qty)
 		}
 	}
 	return total, nil

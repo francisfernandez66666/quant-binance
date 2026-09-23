@@ -31,11 +31,21 @@ import (
 )
 
 // SideBuy/SideSell 下单方向（与 trading 包同语义，避免包循环依赖而镜像常量）。
-// English: order sides mirroring the trading package constants (avoids an import cycle).
+// §MR-4A（2026-09-23）：新增做空两侧常量，与 trading 包 SideShortOpen/SideShortCover 逐字一致；
+// 空头方向仅允许 US/CRYPTO（CN 融券链不在本次实装范围），市场闸见 CheckLiveOrder 入口。
+// English: order sides mirroring the trading package constants (avoids an import cycle); §MR-4A adds
+// the two short sides, accepted only for US/CRYPTO markets.
 const (
-	SideBuy  = "买入"
-	SideSell = "卖出"
+	SideBuy        = "买入"
+	SideSell       = "卖出"
+	SideShortOpen  = "卖出开空" // §MR-4A 开空（融券卖出 / 合约开空）
+	SideShortCover = "买入平仓" // §MR-4A 平空（还券 / 平合约空）
 )
+
+// IsShortSide 是否空头方向（开空/平空）。English: true for the two short sides.
+func IsShortSide(side string) bool {
+	return side == SideShortOpen || side == SideShortCover
+}
 
 // LiveOrder 下单风控视图：Gate 需要的全部判定字段（由 controller 从 OrderRequest 装配，
 // 行情相关字段缺失时相应闸 fail-open 跳过——宁可放行也不因数据缺口误拦）。
@@ -119,6 +129,21 @@ type Gate struct {
 	// English: §P3 US-only trading-status evidence source; nil keeps the gate inert; absence of
 	// evidence rejects (never defaults to tradeable).
 	haltEvidence func(symbol string) (hasEvidence, halted bool)
+	// borrowEvidence §MR-4A（第 16 道闸 short_borrow）借券/做空可得性证据源
+	// （(market,code)→(可借, 说明)）。与 haltEvidence 的「无证据=可交易」不同，本闸
+	// **未装配证据源即拒开空**（fail-close）：做空是新增的高风险敞口，没有任何可信
+	// 借券/合约可得性判定时绝不放行——paper/模拟链由装配层注入模拟证据源，实盘链
+	// 注入柜台/交易所查询。English: short-borrow evidence source; unlike market_halt,
+	// an unwired source REJECTS short-open (fail-close) — no borrow evidence, no new short.
+	borrowEvidence func(market, code string) (available bool, detail string)
+	// liqEvidence §MR-4B（第 17 道闸 liq_distance）合约强平距离证据源
+	// （(market,code)→(距离达标?, 说明)）：开空前该代号既有空头持仓距强平价过近即拦。
+	// 数据类闸缺省姿势（同 haltEvidence，与 short_borrow 的刻意 fail-close 相反）：
+	// 未装配=闸不生效、阈值未配（liq_dist_min_pct≤0）=不生效——开空的第一道安全防线
+	// 已由 short_borrow fail-close 兜住，本闸是加严项而不是首防。
+	// English: futures liquidation-distance evidence; inert when unwired or threshold unset
+	// (short_borrow is the fail-close front line, this gate tightens it).
+	liqEvidence func(market, code string) (ok bool, detail string)
 }
 
 // SymbolRules §P1-e 单 symbol 交易所规则快照（min_notional/lot_precision 两道新闸的数据契约）。
@@ -142,6 +167,23 @@ func (g *Gate) SetSymbolRulesSource(fn func(symbol string) (SymbolRules, error))
 // English: injects the US trading-status evidence source (nil keeps market_halt inert).
 func (g *Gate) SetHaltEvidenceSource(fn func(symbol string) (hasEvidence, halted bool)) {
 	g.haltEvidence = fn
+}
+
+// SetShortBorrowEvidenceSource §MR-4A 注入借券/做空可得性证据源（setter 惯例同 haltEvidence）。
+// 注意与其余数据闸相反的姿势：nil=short_borrow 闸**拒收一切开空**（fail-close），
+// 装配了证据源做空才可用——模拟链注入恒真源、实盘链注入柜台查询源。
+// English: injects the borrow-availability source; nil rejects ALL short-opens (fail-close,
+// deliberate inversion vs the other data gates which stay inert when unwired).
+func (g *Gate) SetShortBorrowEvidenceSource(fn func(market, code string) (available bool, detail string)) {
+	g.borrowEvidence = fn
+}
+
+// SetLiqDistanceEvidenceSource §MR-4B 注入合约强平距离证据源（setter 惯例同 haltEvidence：
+// 数据源在装配尾段随合约执行器就绪）。nil 或档案阈值 ≤0 = liq_distance 闸保持跳过
+// （零配置零行为变化，现货/美股视图永不装配本闸）。
+// English: injects the liquidation-distance evidence source (nil keeps the gate inert).
+func (g *Gate) SetLiqDistanceEvidenceSource(fn func(market, code string) (ok bool, detail string)) {
+	g.liqEvidence = fn
 }
 
 // NewGate 创建风控闸。onGate 可空（命中时告警回调；新闸默认高优告警，存量守卫不告警）。
@@ -202,23 +244,36 @@ func (g *Gate) CheckLiveOrder(cfg config.BrokerConfig, o LiveOrder) *Verdict {
 	// ST/blacklist/buy-discipline) while the executor still folds it into one real side. An unknown
 	// direction must never collect the skip dividend of directional gates, so we reject once here
 	// instead of letting each gate abstain on its own.
-	if o.Side != SideBuy && o.Side != SideSell {
+	if o.Side != SideBuy && o.Side != SideSell && o.Side != SideShortOpen && o.Side != SideShortCover {
 		return g.verdict(o.Market, "side_unknown", fmt.Sprintf(
-			"非法下单方向(side=%q)：只接受 %s/%s（不做任何归一/缺省），未知方向一律拒单（fail-close，防止方向性风控闸被静默跳过）",
-			o.Side, SideBuy, SideSell), true)
+			"非法下单方向(side=%q)：只接受 %s/%s/%s/%s（不做任何归一/缺省），未知方向一律拒单（fail-close，防止方向性风控闸被静默跳过）",
+			o.Side, SideBuy, SideSell, SideShortOpen, SideShortCover), true)
+	}
+	// §MR-4A（2026-09-23）空头方向市场闸：开空/平空仅允许 US/CRYPTO（融券与合约做空语义
+	// 只在新市场档案下实装）；CN 出现空头方向一律入口拒单（fail-close）——A 股 T+1/融券
+	// 规则与这里的账本模型不同构，store.ApplyRealFill 有同口径第二道闸，防绕过编排直写。
+	// English: §MR-4A short sides are US/CRYPTO-only; a short order on CN is rejected at the
+	// entry (the store applies the same guard as a second layer for paths bypassing the gate).
+	if IsShortSide(o.Side) && o.Market != "US" && o.Market != "CRYPTO" {
+		return g.verdict(o.Market, "short_side_market_unsupported", fmt.Sprintf(
+			"空头方向 %s 仅支持 US/CRYPTO 市场（当前 %s）：CN 融券链未实装，拒单（fail-close）",
+			o.Side, o.Market), true)
 	}
 	// 闸口清单：按序评估，gate=留痕标识，alert=命中是否触发高优告警（新机构级闸为 true），
-	// run 返回非空字符串即视为命中并携带原因。共 15 道闸（§XCHECK 2026-09-22 C批 新增第 12 道
+	// run 返回非空字符串即视为命中并携带原因。共 17 道闸（§XCHECK 2026-09-22 C批 新增第 12 道
 	// price_cross_check；§P1-e 2026-09-22 新增第 13/14 道 min_notional/lot_precision；
-	// §P3 2026-09-23 新增第 15 道 market_halt）：
+	// §P3 2026-09-23 新增第 15 道 market_halt；§MR-4A 2026-09-23 新增第 16 道 short_borrow；
+	// §MR-4B 2026-09-23 新增第 17 道 liq_distance）：
 	// 其中 st/blacklist/t1_sellable/buy_discipline/whitelist/max_positions
 	// 为存量守卫（不告警），其余为新增机构闸（命中高优告警）。
-	// 市场启停矩阵（PLAN §9，15 闸 × CN/CRYPTO/US）：st/t1_sellable/limit_up_down/price_cross_check
+	// 市场启停矩阵（PLAN §9，16 闸 × CN/CRYPTO/US）：st/t1_sellable/limit_up_down/price_cross_check
 	// 仅 CN（各自入口短路）；min_notional 仅 CRYPTO；lot_precision 仅 CRYPTO+US；market_halt 仅 US
-	//（且未装配 haltEvidence 数据源时三市场一律短路=不生效）；其余闸三市场全开。
-	// English: 15 gates; market matrix per PLAN §9 — st/t1/limit/cross CN-only, min_notional
-	// CRYPTO-only, lot_precision CRYPTO+US, market_halt US-only (inert until wired), the rest
-	// active on all three markets.
+	//（且未装配 haltEvidence 数据源时三市场一律短路=不生效）；short_borrow/liq_distance 仅空头方向
+	//（CN 的空头方向已在入口被 short_side_market_unsupported 拒掉，永远走不到这两道闸；liq_distance 另需档案阈值>0 且合约强平证据源已装配，现货/美股视图两条件天然不成立）；
+	// 其余闸三市场全开。
+	// English: 17 gates; market matrix per PLAN §9 — st/t1/limit/cross CN-only, min_notional
+	// CRYPTO-only, lot_precision CRYPTO+US, market_halt US-only (inert until wired), short_borrow and
+	// liq_distance short-side-only (CN shorts never reach them), the rest active on all three markets.
 	checks := []struct {
 		gate  string
 		alert bool
@@ -239,6 +294,8 @@ func (g *Gate) CheckLiveOrder(cfg config.BrokerConfig, o LiveOrder) *Verdict {
 		{"min_notional", true, func() string { return g.checkMinNotional(o) }},             // §P1-e CRYPTO 最小名义额（仅 CRYPTO）
 		{"lot_precision", true, func() string { return g.checkLotPrecision(o) }},           // §P1-e 数量步长/价格小数位（CRYPTO+US）
 		{"market_halt", true, func() string { return g.checkMarketHalt(o) }},               // §P3 美股 tradingStatus 证据闸（仅 US，未装配数据源时不生效）
+		{"short_borrow", true, func() string { return g.checkShortBorrow(cfg, o) }},        // §MR-4A 开空借券/做空档案闸（仅 卖出开空；未装配证据源=拒一切开空 fail-close）
+		{"liq_distance", true, func() string { return g.checkLiqDistance(cfg, o) }},        // §MR-4B 合约强平距离闸（仅 卖出开空；阈值未配/证据源未装配=跳过，数据闸缺省姿势）
 	}
 	// 短路语义：首个命中即返回阻断裁定，后续闸不再评估（与原 controller 行为一致）。
 	for _, c := range checks {
@@ -316,16 +373,18 @@ func (g *Gate) checkST(o LiveOrder) string {
 	return ""
 }
 
-// checkBlacklist §GAP1.7 黑名单接线（仅买方向）：命中 qmt.blacklist 即拒。
-// English: §GAP1.7 blacklist wiring (buy-only) via the canonical normalized matcher.
+// checkBlacklist §GAP1.7 黑名单接线：命中 qmt.blacklist 即拒。
+// §MR-4A：开空同样是"新增敞口"，与买入一样受黑名单拦截；卖出/平空放行（退出通道必须保留）。
+// English: §GAP1.7 blacklist wiring — blocks new exposure (buy AND §MR-4A short-open); sells and
+// short-cover stay open as exit paths.
 func (g *Gate) checkBlacklist(cfg config.BrokerConfig, o LiveOrder) string {
-	// 仅买方向生效：黑名单拦截的是"新增敞口"，卖出放行避免强迫扛单。
-	if o.Side != SideBuy {
+	// 仅开仓方向生效：黑名单拦截的是"新增敞口"，卖出/平空放行避免强迫扛单。
+	if o.Side != SideBuy && o.Side != SideShortOpen {
 		return ""
 	}
-	// 命中 qmt.blacklist（规范化比对）即拒；卖出方向已在上方放行。
+	// 命中 qmt.blacklist（规范化比对）即拒；退出方向已在上方放行。
 	if config.CodeInBlacklist(cfg.BrokerBlacklist(), o.Code) {
-		return fmt.Sprintf("黑名单股票禁止买入: %s", o.Code)
+		return fmt.Sprintf("黑名单股票禁止开新敞口(%s): %s", o.Side, o.Code)
 	}
 	return ""
 }
@@ -499,8 +558,9 @@ func (g *Gate) checkPriceCross(cfg config.BrokerConfig, o LiveOrder) string {
 // reach the threshold as a share of total assets, new buys are broken (sells stay open). P&L from the
 // local ledger; falls back to InitialCapital when total assets are unavailable; both unknown → skip.
 func (g *Gate) checkDayLoss(cfg config.BrokerConfig, o LiveOrder) string {
-	// 未启用/无账本/非买方向（卖出与清仓必须始终放行，熔断只断新买入）→ 不检查。
-	if cfg.BrokerRiskGate().DayLossLimitPct <= 0 || g.st == nil || o.Side != SideBuy {
+	// 未启用/无账本/非开仓方向（卖出与平空必须始终放行，熔断只断新开敞口——
+	// §MR-4A：开空与买入同为"新增敞口"，一并受熔断约束）→ 不检查。
+	if cfg.BrokerRiskGate().DayLossLimitPct <= 0 || g.st == nil || (o.Side != SideBuy && o.Side != SideShortOpen) {
 		return ""
 	}
 	// 已实现盈亏取本地账本口径；查询失败或今日为盈利（≥0）时直接放行。
@@ -535,8 +595,9 @@ func (g *Gate) checkDayLoss(cfg config.BrokerConfig, o LiveOrder) string {
 // this buy (held + order amount) over total assets above the cap rejects the buy; total-assets unknown
 // fails open.
 func (g *Gate) checkConcentration(cfg config.BrokerConfig, o LiveOrder) string {
-	// 未启用/无账本/非买方向（卖出减少集中度，无需检查）→ 不检查。
-	if cfg.BrokerRiskGate().SingleStockValuePct <= 0 || g.st == nil || o.Side != SideBuy {
+	// 未启用/无账本/非开仓方向（卖出与平空减少集中度，无需检查；
+	// §MR-4A：开空与买入一样制造单票敞口，受同一集中度帽约束）→ 不检查。
+	if cfg.BrokerRiskGate().SingleStockValuePct <= 0 || g.st == nil || (o.Side != SideBuy && o.Side != SideShortOpen) {
 		return ""
 	}
 	// 总资产不可得（账本缺失或 ≤0）时失败跳过 —— 以草率分母算出的比例不可信。
@@ -545,7 +606,9 @@ func (g *Gate) checkConcentration(cfg config.BrokerConfig, o LiveOrder) string {
 	if err != nil || total <= 0 {
 		return ""
 	}
-	// 现有持仓市值：优先现价，现价缺失回落成本价；两者皆无按 0 估算（只计本单金额）。
+	// 现有持仓市值：优先现价，现价回落成本价；两者皆无按 0 估算（只计本单金额）。
+	// §MR-4A 空头行同样计敞口：空头行 qty 恒为正（数量语义），price×qty 即 |敞口名义值|；
+	// 单向持仓下一票一行，不存在多空两行相加的形态。
 	posVal := 0.0
 	if p, perr := g.st.RealPositionByCodeForUser(g.userID, o.Code); perr == nil && p.Qty > 0 {
 		price := p.CurPrice
@@ -556,11 +619,11 @@ func (g *Gate) checkConcentration(cfg config.BrokerConfig, o LiveOrder) string {
 			posVal = price * float64(p.Qty)
 		}
 	}
-	// 买入后该票预计市值 = 现有持仓市值 + 本单金额，占总资产比例超上限即拒新买。
+	// 开仓后该票预计敞口 = 现有持仓市值 + 本单金额，占总资产比例超上限即拒新开仓。
 	proj := posVal + o.Amount
 	if proj/total*100 > cfg.BrokerRiskGate().SingleStockValuePct {
-		return fmt.Sprintf("单票集中度超限: 预计市值 %.0f / 总资产 %.0f = %.1f%% > 上限 %.1f%%",
-			proj, total, proj/total*100, cfg.BrokerRiskGate().SingleStockValuePct)
+		return fmt.Sprintf("单票集中度超限: 预计敞口 %.0f / 总资产 %.0f = %.1f%% > 上限 %.1f%%（%s %s）",
+			proj, total, proj/total*100, cfg.BrokerRiskGate().SingleStockValuePct, o.Side, o.Code)
 	}
 	return ""
 }
@@ -573,8 +636,9 @@ func (g *Gate) checkConcentration(cfg config.BrokerConfig, o LiveOrder) string {
 // English: delegates the strategy-membership check to signalctl.AdmitStrategy — single shared
 // rule, kept here as a last-line guard for paths that bypass the orchestrator's admission.
 func (g *Gate) checkWhitelist(cfg config.BrokerConfig, o LiveOrder) string {
-	// 仅买方向且带战法标识时检查；卖出不受限（退出通道必须保留）。
-	if o.Side != SideBuy || o.Strategy == "" {
+	// 仅开仓方向且带战法标识时检查（§MR-4A：开空与买入同为战法驱动的新敞口，必须过白名单；
+	// 卖出/平空不受限——退出通道必须保留）。
+	if (o.Side != SideBuy && o.Side != SideShortOpen) || o.Strategy == "" {
 		return ""
 	}
 	// 装配信号视图，委托 signalctl.AdmitStrategy 做"唯一成员资格规则"判定
@@ -586,11 +650,14 @@ func (g *Gate) checkWhitelist(cfg config.BrokerConfig, o LiveOrder) string {
 	return ""
 }
 
-// checkMaxPositions 仓位上限校验（仅买方向，按账号过滤）：max_positions>0 且当前持仓数已达上限。
-// English: position-count cap (buy-only, per-account) — reject new buys when max_positions is reached.
+// checkMaxPositions 仓位上限校验（开仓方向，按账号过滤）：max_positions>0 且当前持仓数已达上限。
+// §MR-4A：空头持仓与多头同为 real_positions 行（单向持仓一票一行），开空同样占用仓位数；
+// 卖出/平空是减仓动作不受限。
+// English: position-count cap (opening sides, per-account) — §MR-4A short-opens consume slots too
+// (one-way book keeps one row per code regardless of side); sells/covers are exempt.
 func (g *Gate) checkMaxPositions(cfg config.BrokerConfig, o LiveOrder) string {
-	// 未启用（≤0）/非买方向（卖出减仓不受持仓数限制）/无账本 → 不检查。
-	if cfg.BrokerMaxPositions() <= 0 || o.Side != SideBuy || g.st == nil {
+	// 未启用（≤0）/非开仓方向（卖出与平空减仓不受持仓数限制）/无账本 → 不检查。
+	if cfg.BrokerMaxPositions() <= 0 || (o.Side != SideBuy && o.Side != SideShortOpen) || g.st == nil {
 		return ""
 	}
 	// 按账号读取本地持仓行；读取失败视为命中（错误原因即进入判定留痕）。
@@ -633,6 +700,9 @@ func (g *Gate) checkMaxPositions(cfg config.BrokerConfig, o LiveOrder) string {
 // Unified freeze-ledger basis since 2026-09-18: occupied = filled (fills) + frozen-in-transit
 // (derived from order status — submitted freezes, fills deduct, cancels release).
 func (g *Gate) checkBuyDiscipline(cfg config.BrokerConfig, o LiveOrder) string {
+	// §MR-4A 语义裁决：买入纪律的口径就是「买成几笔/花掉多少买入预算」，空头开仓
+	// （卖出开空）不动用买入预算、平空（买入平仓）是退出动作——两者均刻意不受本闸约束；
+	// 开空的额度纪律由 short_borrow/集中度/金额帽三道闸共同承担。
 	if o.Side != SideBuy || g.st == nil {
 		return ""
 	}
@@ -881,6 +951,85 @@ func (g *Gate) checkMarketHalt(o LiveOrder) string {
 	}
 	if !hasEvidence {
 		return "无 tradingStatus 在龄证据（未确认≠可交易，fail-close）：拒新单"
+	}
+	return ""
+}
+
+// shortMarginOf §MR-4A：取市场档案的融券保证金率（0=该市场禁做空）。
+// 与 moneyOf 同姿势：ShortMarginRate 是 BinanceMarketProfile 专属字段，不入 BrokerConfig 接口
+// （QMT 视图无做空档案，CN 空头方向在入口已被拒，断言不命中落 0=禁用恰是安全缺省）。
+// English: per-market short margin rate via type assertion (moneyOf pattern); non-binance views
+// get 0 = shorts disabled, which is the safe default since CN shorts never pass the entry gate.
+func shortMarginOf(cfg config.BrokerConfig) float64 {
+	if bv, ok := cfg.(config.BinanceBrokerView); ok {
+		return bv.BrokerShortMarginRate()
+	}
+	return 0
+}
+
+// checkShortBorrow §MR-4A 第 16 道闸：开空（卖出开空）前置守卫，三段判定——
+//  1. 市场档案开关：short_margin_rate ≤0 = 该市场整体禁做空（默认 0，配置显式启用才可开空）；
+//  2. 证据源装配闸：**未注入 borrowEvidence 即拒一切开空**（fail-close）。这与其余数据类闸
+//     （crossPrice/haltEvidence 未装配=跳过放行）姿势刻意相反：做空是无限风险的新敞口，
+//     "不知道能不能借到券"绝不等于"可以借到"。模拟/纸面链由装配层注入模拟证据源，
+//     实盘链注入柜台/交易所借券查询源。
+//  3. 可得性判定：证据源明确不可借（无券/黑名单券源/合约未开通）即拒，detail 带回原因。
+//
+// 平空（买入平仓）不受本闸约束——退出通道必须保留（与卖出豁免全部开仓闸同族语义）。
+// English: gate 16 — short-open guard: per-market margin-profile switch, fail-close on an
+// unwired borrow-evidence source (deliberate inversion vs other data gates), then the
+// availability verdict. Covering a short is never blocked by this gate (exit paths stay open).
+func (g *Gate) checkShortBorrow(cfg config.BrokerConfig, o LiveOrder) string {
+	if o.Side != SideShortOpen {
+		return ""
+	}
+	if r := shortMarginOf(cfg); r <= 0 {
+		return fmt.Sprintf("开空被拒: %s 市场档案未启用做空（short_margin_rate=%.2f≤0，默认禁做空）", o.Market, r)
+	}
+	if g.borrowEvidence == nil {
+		return "开空被拒: 未装配借券可得性证据源（无借券证据=不可做空，fail-close）"
+	}
+	avail, detail := g.borrowEvidence(o.Market, o.Code)
+	if !avail {
+		if detail == "" {
+			detail = "证据源判定不可借"
+		}
+		return fmt.Sprintf("开空被拒: %s", detail)
+	}
+	return ""
+}
+
+// liqDistMinPctOf §MR-4B：市场档案的强平距离阈值（百分点）；非币安视图落 0=闸不生效
+// （shortMarginOf 同款断言姿势，QMT 无合约概念）。
+func liqDistMinPctOf(cfg config.BrokerConfig) float64 {
+	if bv, ok := cfg.(config.BinanceBrokerView); ok {
+		return bv.BrokerLiqDistMinPct()
+	}
+	return 0
+}
+
+// checkLiqDistance §MR-4B 第 17 道闸：开空（卖出开空）前检查该代号既有空头距强平价的
+// 百分比距离是否守住档案下限（liq_dist_min_pct）。两级短路全部走"数据类闸"缺省姿势——
+// 阈值未配（≤0）或证据源未装配（现货/美股视图恒如此）=不生效；与 short_borrow 的
+// fail-close 相反是刻意的：开空的第一道安全防线已经由借券闸兜死，本闸只对有合约持仓
+// 的账户加严"雪上加霜的开空"（距强平太近还继续加空=把老仓推向爆仓）。
+// 平空（买入平仓）永不受拦——退出通道常开（同族纪律）。
+// English: gate 17 — reject a short-open when the symbol's existing short sits closer to its
+// liquidation price than the profile threshold; inert when threshold unwired or source absent
+// (fail-open by data-gate convention, short_borrow already fail-closes the category).
+func (g *Gate) checkLiqDistance(cfg config.BrokerConfig, o LiveOrder) string {
+	if o.Side != SideShortOpen {
+		return ""
+	}
+	if liqDistMinPctOf(cfg) <= 0 || g.liqEvidence == nil {
+		return ""
+	}
+	ok, detail := g.liqEvidence(o.Market, o.Code)
+	if !ok {
+		if detail == "" {
+			detail = "证据源判定强平距离不足"
+		}
+		return fmt.Sprintf("开空被拒: %s", detail)
 	}
 	return ""
 }

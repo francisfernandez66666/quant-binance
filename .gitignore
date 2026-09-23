@@ -115,3 +115,6 @@ web/.auth/
 
 # 文件桥测试/运行期命令中转文件（qmt_gateway 测试在 cwd 落盘，非仓库资产）
 qmt_gateway/bridge_cmd.json
+
+# 本地会话产物（进度快照等），不入库
+.qoder/

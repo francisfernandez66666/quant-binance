@@ -195,3 +195,100 @@ func TestEdgarISO8859CharsetDecode(t *testing.T) {
 		t.Fatal("不支持的编码必须显式报错，不得吞成乱码")
 	}
 }
+
+// §MR-EDGAR-TKR ────────────────────────────────────────────────────────────────
+
+// edgarRealShapeAtomFixture 现网真实标题形态：只有零补齐 CIK、无逗号 ticker。
+const edgarRealShapeAtomFixture = `<?xml version="1.0" encoding="ISO-8859-1"?>
+<feed xmlns="http://www.w3.org/2005/Atom">
+  <entry>
+    <title>8-K - ACME CORP (0001000000) (Filer)</title>
+    <published>2026-09-03T11:00:00-04:00</published>
+    <link href="https://www.sec.gov/Archives/edgar/data/1000000/0001.rn.txt" rel="alternate"/>
+    <summary>acme filed</summary>
+  </entry>
+  <entry>
+    <title>8-K - UNKNOWN CO (0009999999) (Filer)</title>
+    <published>2026-09-03T12:00:00-04:00</published>
+    <link href="https://www.sec.gov/Archives/edgar/data/9999999/0002.rn.txt" rel="alternate"/>
+    <summary>unknown filed</summary>
+  </entry>
+</feed>`
+
+// TestEdgarTickerMapFallback 锁：真实形态标题→映射命中填 ticker、未命中保空串；
+// 逗号式优先不被映射覆盖已由 entry1 形状保证（映射只处理 Ticker=="" 的行）。
+func TestEdgarTickerMapFallback(t *testing.T) {
+	ResetEDGARTickerCacheForTest()
+	defer ResetEDGARTickerCacheForTest()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case EDGARTickersPath:
+			_, _ = w.Write([]byte(`{"0":{"company_name":"ACME CORP","ticker":"acme","cik":1000000},"1":{"company_name":"BAD","ticker":"","cik":7}}`))
+		default:
+			_, _ = w.Write([]byte(edgarRealShapeAtomFixture))
+		}
+	}))
+	defer srv.Close()
+	c := NewEDGARClient(srv.URL, "QuantResearch admin@example.com")
+	events, err := c.FetchRecent8K(0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(events) != 2 {
+		t.Fatalf("want=2 got=%d", len(events))
+	}
+	if events[0].Ticker != "ACME" { // 映射命中 + 大小写归一（json 里小写→表内大写）
+		t.Fatalf("映射命中应填 ACME, got=%q", events[0].Ticker)
+	}
+	if events[1].Ticker != "" { // 未命中=空串如实呈现
+		t.Fatalf("未命中必须空串, got=%q", events[1].Ticker)
+	}
+}
+
+// TestEdgarTickerMapFailureKeepsFeed 锁：映射腿 500 → 事件腿照常出条目（ticker 空串），
+// 且失败结果不进缓存（下个用例换健康 server 必须能填上——load-once 只记忆成功）。
+func TestEdgarTickerMapFailureKeepsFeed(t *testing.T) {
+	ResetEDGARTickerCacheForTest()
+	defer ResetEDGARTickerCacheForTest()
+	bad := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == EDGARTickersPath {
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		_, _ = w.Write([]byte(edgarRealShapeAtomFixture))
+	}))
+	defer bad.Close()
+	c := NewEDGARClient(bad.URL, "QuantResearch admin@example.com")
+	events, err := c.FetchRecent8K(0)
+	if err != nil || len(events) != 2 || events[0].Ticker != "" {
+		t.Fatalf("映射故障不得打死事件腿: n=%d err=%v tk0=%q", len(events), err, events[0].Ticker)
+	}
+	// 失败未被记忆：换健康 server 重试即命中。
+	bad.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == EDGARTickersPath {
+			_, _ = w.Write([]byte(`{"0":{"company_name":"ACME CORP","ticker":"ACME","cik":1000000}}`))
+			return
+		}
+		_, _ = w.Write([]byte(edgarRealShapeAtomFixture))
+	})
+	events2, err := c.FetchRecent8K(0)
+	if err != nil || len(events2) != 2 || events2[0].Ticker != "ACME" {
+		t.Fatalf("失败不记忆→重试应命中: err=%v tk=%q", err, events2[0].Ticker)
+	}
+}
+
+// TestEdgarPaddedCIKKey 钥匙提取单测：10 位补齐去前导零；9 位不匹配；全零系统条目=空。
+func TestEdgarPaddedCIKKey(t *testing.T) {
+	cases := []struct{ title, want string }{
+		{"8-K - ACME CORP (0001234567) (Filer)", "1234567"},
+		{"8-K - PAD (0000000003) (Filer)", "3"},
+		{"8-K - SYS (0000000000) (Filer)", ""}, // 全零=SEC 系统条目不查表
+		{"8-K - SHORT (1234567) (Filer)", ""},  // 非补齐 10 位不配
+		{"Plain (CIK 0001234567)", ""},         // 带前缀不配（现网为裸数字）
+	}
+	for _, cs := range cases {
+		if got := edgarPaddedCIKKey(cs.title); got != cs.want {
+			t.Fatalf("key(%q)=%q want=%q", cs.title, got, cs.want)
+		}
+	}
+}

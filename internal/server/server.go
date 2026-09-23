@@ -234,6 +234,18 @@ type Server struct {
 	// English: §ENH-A4/B8 event-leg snapshot closure (market → dedup'd candidates/age);
 	// nil keeps the "events" node absent; refresh is kicked asynchronously by the assembler.
 	xeventsSource func(market string) (events []map[string]any, ageSec int64, ok bool)
+
+	// dispatchSource §战法批-5 派发摘要腿：(账号, 市场) → 该引擎最近一轮 DispatchReport（JSON 可序列化值）。
+	// nil=零配置零行为（/api/binance/state 不含 "dispatch" 节）；返回值由装配层给出（engine 包结构自带
+	// json tag，server 不反向依赖 engine，同 fng/xevents 惯例）。按账号取数——多账号各看各的派发台。
+	// English: per-(account, market) last dispatch report closure; nil omits the "dispatch" node entirely.
+	dispatchSource func(userID, market string) (any, bool)
+
+	// cnMaster §CN-MASTER A股总开关的 boot 快照（main.go 经 SetCNMaster 注入，运行期不再变化），
+	// 随 /api/status 的 cn_master 字段下发给前端做导航隐藏。展示口径必须与进程实际在跑的
+	// 循环一致，故用启动快照而非每请求热读 Rules（热轮换不改装配）。
+	// English: boot-frozen CN master flag surfaced via /api/status for frontend nav gating.
+	cnMaster bool
 }
 
 // EngineRegistry 引擎注册表的 HTTP 可见接口（由 engine.Registry 实现，避免 server→engine 依赖环）。
@@ -391,6 +403,13 @@ func (s *Server) SetPaper(p *paper.Engine) { s.paper = p }
 // SetNotifier §C9-UX 注入全局通知器（/api/notify-test 真实探测用；nil 时接口回显 noop）。
 // English: §C9-UX — installs the global notifier so /api/notify-test can probe live channels.
 func (s *Server) SetNotifier(n *notify.Notifier) { s.notifier = n }
+
+// SetCNMaster §CN-MASTER：注入 A股总开关的启动快照（main.go 在 boot 读 rules.cn.enabled
+// 后调用一次，运行期不再变化）。仅影响 /api/status 的 cn_master 展示字段，
+// 不参与任何后端判定——装配门在 main.go 启动期已落位。
+// English: injects the boot-frozen CN master snapshot for /api/status reporting only;
+// the assembly gate itself lives in main.go and never changes at runtime.
+func (s *Server) SetCNMaster(on bool) { s.cnMaster = on }
 
 // SetEngineController 设置引擎控制器。
 func (s *Server) SetEngineController(c EngineController) { s.ctrl = c }

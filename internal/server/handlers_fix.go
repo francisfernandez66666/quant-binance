@@ -578,6 +578,9 @@ func (s *Server) handleFixStatus(w http.ResponseWriter, r *http.Request) {
 		"in_trade_time": inTrade,
 		"active":        active,
 		"signal_count":  finalCount,
+		// §CN-MASTER：A股总开关 boot 快照（true=CN 循环在跑；false=缺省，CN 装配腿未启动）。
+		// 前端导航据此隐藏 CN 专属入口；口径与 main.go 装配门同源，不参与判定仅参与展示。
+		"cn_master":     s.cnMaster,
 		"quote_source":  quoteSource,
 		"quote_age_sec": quoteAgeSec,
 		// §A7（20260918 审计批）：下发后端二进制 git 指纹。部署脚本对后端与前端 dist 用同一

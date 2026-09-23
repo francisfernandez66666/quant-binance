@@ -122,6 +122,11 @@ export default function App() {
   const [versionNotice, setVersionNotice] = useState(null)
   // 权限入口状态位：研究审批/管理员/模拟盘三个入口由后端角色与开关决定
   const [paperEnabled, setPaperEnabled] = useState(false)
+  // §CN-MASTER A股总开关展示位：null=未获知（首帧/旧服务端无该字段→按"开"渲染，向后兼容），
+  // true/false=/api/status 回传的 boot 快照。false 时侧栏隐藏 CN 专属入口（信号/自选/热点/
+  // 情绪回看/消息/股票咨询/自动研究）；仪表盘/持仓/量化交易保留（承载币安链观测与账本）。
+  // English: §CN-MASTER — cn_master from /api/status; null keeps the legacy all-visible nav.
+  const [cnMaster, setCnMaster] = useState(null)
   // §MARKET_RISK_GATE F2：市场环境条状态（情绪相位/市场状态/仓位档/风险档），由 SSE `score` 广播驱动
   // English: F2 market-environment bar state, driven by the SSE `score` broadcast.
   const [marketEnv, setMarketEnv] = useState({ emotion: '', marketState: '', maxPosPct: 0, riskTier: '', riskReasons: [] })
@@ -227,6 +232,8 @@ export default function App() {
       setSignalCount(st.signal_count || 0)
       setInTradeTime(st.in_trade_time)
       setActiveWindow(st.active)
+      // §CN-MASTER：只认显式布尔（旧服务端缺字段=undefined→维持 null 全显，不误藏入口）
+      setCnMaster(typeof st.cn_master === 'boolean' ? st.cn_master : null)
       // §A7：APK/页面向导比对——服务器 build_commit 与本地构建指纹不一致即顶栏横幅告警
       setVersionNotice(versionMismatchNotice(APP_BUILD_COMMIT, st.build_commit))
     } catch (_) { setServerOnline(false); setVersionNotice(null) }
@@ -430,14 +437,18 @@ export default function App() {
   // ── 主界面 ──
   // 根据权限（canResearch/canAdmin）与模拟盘开关（paperEnabled）动态生成侧边栏导航项，
   // 过滤掉当前角色无权访问或功能未开启的入口，再交给下方 Menu 渲染
+  // §CN-MASTER：A股总开关关闭（后端回传 cn_master=false 的 boot 快照）时隐藏纯 CN 数据驱动
+  // 的入口；仪表盘/持仓/量化交易保留——它们是币安链观测卡与 US/CRYPTO 账本的家，
+  // 且根路径 "/" 重定向依赖仪表盘锚点。路由本身不删（装配级停用后端点自然空转）。
+  const cnOff = cnMaster === false
   const navItems = [
     { to: '/dashboard', icon: <DashboardIcon size="18px" />, label: '仪表盘' },
-    { to: '/signals', icon: <ThunderIcon size="18px" />, label: '信号', badge: signalCount },
-    { to: '/watchlist', icon: <StarIcon size="18px" />, label: '自选' },
-    { to: '/hotspot', icon: <TrendingUpIcon size="18px" />, label: '热点' },
+    !cnOff && { to: '/signals', icon: <ThunderIcon size="18px" />, label: '信号', badge: signalCount },
+    !cnOff && { to: '/watchlist', icon: <StarIcon size="18px" />, label: '自选' },
+    !cnOff && { to: '/hotspot', icon: <TrendingUpIcon size="18px" />, label: '热点' },
     // §情绪面板 C：情绪回看入口（涨停柱+净值+相位色带）
-    { to: '/emotion', icon: <ChartLineIcon size="18px" />, label: '情绪回看' },
-    { to: '/msgcenter', icon: <NotificationIcon size="18px" />, label: '消息', badge: alertCount },
+    !cnOff && { to: '/emotion', icon: <ChartLineIcon size="18px" />, label: '情绪回看' },
+    !cnOff && { to: '/msgcenter', icon: <NotificationIcon size="18px" />, label: '消息', badge: alertCount },
     { to: '/positions', icon: <WalletIcon size="18px" />, label: '持仓' },
     { to: '/quant', icon: <ChartLineIcon size="18px" />, label: '量化交易' },
     paperEnabled ? { to: '/paper', icon: <RocketIcon size="18px" />, label: '模拟盘' } : null,
@@ -445,8 +456,8 @@ export default function App() {
     // §PERM-GATE 20260918：LLM 诊断两个主数据源均为 admin 守卫（server.go:683/692），
     // 成员常显入口进页必 403 —— 收敛为仅管理员可见。
     canAdmin ? { to: '/llm-debug', icon: <TerminalIcon size="18px" />, label: 'LLM诊断' } : null,
-    { to: '/consult', icon: <ChatBubble1Icon size="18px" />, label: '股票咨询' },
-    canResearch ? { to: '/research', icon: <SearchIcon size="18px" />, label: '自动研究' } : null,
+    !cnOff && { to: '/consult', icon: <ChatBubble1Icon size="18px" />, label: '股票咨询' },
+    !cnOff && (canResearch ? { to: '/research', icon: <SearchIcon size="18px" />, label: '自动研究' } : null),
     // 条件项为 null 时由下方 filter(Boolean) 剔除，实现入口按权限显隐
     canAdmin ? { to: '/admin', icon: <UsergroupIcon size="18px" />, label: '用户管理' } : null,
   ].filter(Boolean)

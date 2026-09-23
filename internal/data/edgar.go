@@ -14,12 +14,23 @@
 // SEC 强制 UA 政策：EDGAR 自动化访问要求带**含联系邮箱的 User-Agent**，空 UA 会被
 // 限流/拉黑——故 UA 字段必填，FetchRecent8K 在空 UA 时**直接拒发**（错误信息，不裸奔）。
 //
+// §MR-EDGAR-TKR ticker 增强：现网真实标题形如 "8-K - ACME CORP (0001234567) (Filer)"
+// ——只有零补齐 10 位 CIK、无逗号 ticker 形态，extractEDGARTicker 提不到。本文件新增
+// CIK→ticker 映射兜底：拉取 SEC 公开的 company_tickers.json（EDGARTickersPath），
+// 仅在逗号式提取失败且标题带 (0001234567) 式补齐 CIK 时启用；映射命中=填 ticker，
+// 未命中/映射拉取失败=保持空串（**绝不编造**，事件腿必须活着）。
+// 既有 "(NAME, CIK, …)" 逗号式优先级不变，映射只是 fallback。
+//
 // 失败语义：网络失败/非 200/XML 解不动 → 空集 + error，绝不 panic、绝不返回编造数据。
+// ticker 映射拉取失败**不升级为整腿错误**：只留空 ticker 继续返回条目。
 //
 // English: SEC EDGAR 8-K Atom feed puller for the US event leg. Base URL injectable
 // (default sec.gov); endpoint path is documented-shape only and pending a live probe.
 // UA with contact email is mandatory (SEC policy) — empty UA refuses to send. Atom is
 // parsed leniently; ticker extraction is best-effort and yields "" when absent.
+// §MR-EDGAR-TKR adds a CIK→ticker map fallback loaded from SEC's public
+// company_tickers.json (process-level load-once cache, failures degrade to empty
+// tickers, never abort the feed); the legacy comma-form extraction still wins.
 package data
 
 import (
@@ -138,6 +149,31 @@ func (c *EDGARClient) FetchRecent8K(limit int) ([]XEvent, error) {
 			PublishedAt: parseEDGARTime(e.Published, e.Updated),
 		}
 		events = append(events, ev)
+	}
+	// §MR-EDGAR-TKR CIK 映射兜底（懒加载：只有出现「逗号式提不到 + 标题带补齐 CIK」
+	// 的条目才拉映射；全零补齐 CIK=0000000000 是 SEC 系统条目，显式跳过不查表）。
+	// 映射失败/未命中=维持空串如实呈现，**绝不让映射故障打死整条事件腿**。
+	needMap := false
+	for i := range events {
+		if events[i].Ticker == "" && strings.TrimSpace(edgarPaddedCIKKey(events[i].Title)) != "" {
+			needMap = true
+			break
+		}
+	}
+	if needMap {
+		tickerMap := EDGARTickerMap(c.Base, c.UA, client)
+		for i := range events {
+			if events[i].Ticker != "" {
+				continue // 既有 "(NAME, CIK, …)" 逗号式优先，映射只做 fallback
+			}
+			key := edgarPaddedCIKKey(events[i].Title)
+			if key == "" || key == "0" {
+				continue
+			}
+			if tk := tickerMap[key]; tk != "" {
+				events[i].Ticker = tk
+			}
+		}
 	}
 	return events, nil
 }
