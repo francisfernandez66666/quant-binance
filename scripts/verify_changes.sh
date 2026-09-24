@@ -1490,5 +1490,97 @@ if grep -Fq '/^\d{6}$/.test(query.trim())' web/src/components/CommandPalette.jsx
 if awk '/addMkt !== .CN./{guard=NR} /api\.addWatchlist\(code\)/{if(!guard||guard>NR){print "BAD";exit}}' web/src/pages/Watchlist.jsx | grep -q BAD; then echo "--- FAIL: §市场分家-1 自选添加守卫被挪到入库调用之后（顺序红锁）"; exit 1; fi
 echo "ok - §市场分家-1 专项守卫通过（行为回归 3 组 + vitest 文件锁 1 + 静态锁 8 道〔含面板旧判定/守卫顺序 2 负锁〕）"
 
+# ══════════════════════════════════════════════════════════════════════════════
+# 64：§抄母仓-2（2026-09-24）纪律引擎延持态「终态失明」止血（母仓 §P0-C / bddcccb）
+# English: section 64 locks the ported §P0-C discipline blindness fix.
+# ══════════════════════════════════════════════════════════════════════════════
+echo "==> 64 §DISCIPLINE 延持态终态失明止血 + 重评估非对称守卫（抄母仓 §P0-C，2026-09-24）..."
+# 现象：纪律引擎一旦置位 Settled&&!Confirmed（延持），下一轮直接在函数顶部 early-return 不再出卡，
+# 价格继续跌破更深一档线也视而不见 = 终态失明（该走的仓位永远不走，资金级漏卖）。
+# 修法：延持态每轮重评估，出卡需「本轮仍破线且不轻于原始锁定线」（reevalAllowsSettle）；
+# 反向情形（止损延持后反弹进止盈区）一律不收卡，避免把失明换成「按反弹后的止盈价挂止损标签卖」。
+go test -count=1 ./internal/trading/ -run 'TestDiscipline' 2>&1 | grep -q '^ok' || { echo "--- FAIL: §P0-C 纪律引擎回归未过（含对称行为锁 3 例）"; exit 1; }
+grep -q 'func reevalAllowsSettle(' internal/trading/discipline.go || { echo "--- FAIL: §P0-C 重评估准入判据丢失"; exit 1; }
+grep -q 'if extendHold && !reevalAllowsSettle(st.Line, line)' internal/trading/discipline.go || { echo "--- FAIL: §P0-C 准入判据未被调用（定义了个寂寞）"; exit 1; }
+grep -q 'func isLossLine(' internal/trading/discipline.go || { echo "--- FAIL: §P0-C 损失族判定丢失（止盈延持跌进损失线无法识别）"; exit 1; }
+# 负锁：延持态无条件 early-return 的旧形态绝迹（同族教训：只在注释里说改过、代码没改）。
+if grep -nE 'if st\.Settled && !st\.Confirmed \{[[:space:]]*return' internal/trading/discipline.go | grep -q .; then
+	echo "--- FAIL: §P0-C 延持态又无条件 early-return（终态失明复活）"; exit 1; fi
+# 正锁：已确认态短路仍在（Settled && Confirmed 重放处置单，修复不得顺手放宽成重复出卡）
+grep -q 'if st.Settled && st.Confirmed {' internal/trading/discipline.go || { echo "--- FAIL: §P0-C 已确认态短路丢失（确认后会逐轮重复出卡）"; exit 1; }
+echo "ok - §DISCIPLINE 专项守卫通过（行为锁 TestDiscipline 全组 + 静态锁 4 道 + 负锁 1 道）"
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 65~66：§抄母仓-1（2026-09-24）测试栈「误杀别人 / 打错对象」三修（母仓 cf3be1f §PICKILL-SCOPE §UAT-PORTS）
+# English: sections 65-66 lock the ported UAT-stack scoping fixes (scoped kill + mock URL single source).
+# ══════════════════════════════════════════════════════════════════════════════
+echo "==> 65 §PICKILL-SCOPE UAT 自举的兜底 kill 只圈本项目拉起的进程（抄母仓 cf3be1f）..."
+# 现象（母仓 2026-09-23 实测误伤、本仓 2026-09-24 走查同形复犯）：`uat_bootstrap.sh stop` 的兜底
+#       `pkill -f "quant.*QUANT_ADDR=:18080"` 会杀掉同机另一份 checkout 的 UAT 引擎。
+# 根因：macOS 的 pkill/pgrep -f 把**进程环境变量一并计入匹配串**（`pgrep -fl` 输出里命令行后拖着整段 env 即证），
+#       于是"端口名"成了跨项目的通配；两份 checkout 共用 18080/18789 端口约定 ⇒ 一条 stop 停掉别人的栈。
+# 前置：kill 判据必须含数据目录绝对路径（$PIDDIR 由 $DATA_DIR 派生，checkout 间天然不同），
+#       且不能再按 env 里的端口名匹配。
+if ! grep -qF 'pkill -f -- "$PIDDIR/quant"' scripts/uat_bootstrap.sh; then
+  echo "--- FAIL: 兜底 kill 不再按本项目二进制绝对路径匹配（跨项目误伤的入口）"; exit 1; fi
+if ! grep -qF 'pkill -f -- "$PIDDIR/qmt-mock"' scripts/uat_bootstrap.sh; then
+  echo "--- FAIL: 假柜台的兜底 kill 缺失（只清引擎会留下占端口的 mock）"; exit 1; fi
+# §VITE-ORPHAN：pid 记的是 npx 外壳，真占端口的 node(.bin/vite) 会活下来让下次 --strictPort 失败。
+if ! grep -qF 'pkill -f -- "$ROOT/web/node_modules/\.bin/vite --port ${FRONT_PORT}' scripts/uat_bootstrap.sh; then
+  echo "--- FAIL: vite 子进程兜底 kill 缺失（stop 后再 up 会卡在端口占用）"; exit 1; fi
+# 负锁：端口名/env 形式的匹配串不得复活。只判**真正执行的 pkill 行**（行首无 #），
+# 否则"描述旧写法为何危险"的注释本身会被这条锁打死（§静态负锁自伤形态）。
+if grep -E '^[[:space:]]*pkill' scripts/uat_bootstrap.sh | grep -q 'QUANT_ADDR'; then
+  echo "--- FAIL: pkill 又按 env 端口名匹配（会在任意 checkout 间互杀）"; exit 1; fi
+# 行为锁（2026-09-24 实跑同形验证）：造三个诱饵进程——命令行分别带「别家 checkout 的 vite」「别家
+# checkout 的 quant」「本仓 PIDDIR 的 quant」，跑一遍兜底 kill：别家两个必须活、本家必须死。
+# 只判路径不判端口才成立；诱饵用 exec -a 伪造 argv[0]，stdout 重定向到 /dev/null 免得命令替换等管道 EOF。
+decoy() { sh -c 'exec -a "$0" sleep 20' "$1" >/dev/null 2>&1 & echo $!; }
+DEC_A="$(decoy "/Users/zhangzifei/Desktop/quant-trading-v2/web/node_modules/.bin/vite --port 5173 --strictPort")"
+DEC_B="$(decoy "/Users/zhangzifei/Desktop/quant-trading-v2/.uat-data/pids/quant -addr :18080")"
+DEC_M="$(decoy "$PWD/.uat-data/pids/quant -addr :18080")"
+sleep 0.3
+pkill -f -- "$PWD/web/node_modules/\.bin/vite --port 5173( |$)" 2>/dev/null || true
+pkill -f -- "$PWD/.uat-data/pids/quant" 2>/dev/null || true
+sleep 0.6
+for d in "$DEC_A" "$DEC_B"; do
+  kill -0 "$d" 2>/dev/null || { echo "--- FAIL: 兜底 kill 误伤了别家 checkout 的进程（跨项目误杀复活）"; kill "$DEC_M" 2>/dev/null; exit 1; }
+done
+if kill -0 "$DEC_M" 2>/dev/null; then
+  kill "$DEC_M" 2>/dev/null
+  echo "--- FAIL: 兜底 kill 没圈住本仓 PIDDIR 进程（锁与实现脱节）"; exit 1
+fi
+kill "$DEC_A" "$DEC_B" 2>/dev/null || true
+echo "ok - §PICKILL-SCOPE 守卫通过（同源路径锁 3 + env 匹配负锁 1 + 跨 checkout 误杀行为锁 1）"
+
+echo "==> 66 §UAT-PORTS e2e 打的是「本次自举的那套栈」，不是同机任意一套（抄母仓 cf3be1f）..."
+# 现象（母仓 2026-09-23）：同机并存第二份 checkout 已占 18080/18789，本项目自举只能挪端口；
+#       而 spec 里硬编 http://127.0.0.1:18789 + 「连不上 mock 就 skip」⇒ L1-2/QS-2 打到**别人那套 mock**
+#       上拿到 200 照样绿。断言的对象都不是本仓库代码。
+# 前置：mock 地址单一来源 = E2E_MOCK_URL（自举脚本与 CI 各自导出）；且"传了该变量=跑在自举栈上"
+#       时连不上必须判红，软跳过只留给外部部署场景。
+grep -qF 'const MOCK_URL = process.env.E2E_MOCK_URL' web/e2e/uat_full.spec.mjs \
+  || { echo "--- FAIL: mock 地址不再单源自 E2E_MOCK_URL"; exit 1; }
+grep -qF 'function mockUnavailableOrFail' web/e2e/uat_full.spec.mjs \
+  || { echo "--- FAIL: mock 不可达的两种口径（自举=红／外部=skip）没有收在一处"; exit 1; }
+[ "$(grep -cF 'if (!resp) mockUnavailableOrFail(lastErr)' web/e2e/uat_full.spec.mjs)" -eq 2 ] \
+  || { echo "--- FAIL: mockUnavailableOrFail 接点数≠2（L1-2/QS-2 有一处仍在软跳过）"; exit 1; }
+grep -qF 'export E2E_MOCK_URL=http://127.0.0.1:${MOCK_PORT}' scripts/uat_bootstrap.sh \
+  || { echo "--- FAIL: 自举脚本不再按本次 MOCK_PORT 导出 E2E_MOCK_URL（spec 会退回默认口）"; exit 1; }
+grep -qF 'E2E_MOCK_URL="http://127.0.0.1:${MOCK_PORT}"' scripts/uat_bootstrap.sh \
+  || { echo "--- FAIL: run 模式未把 E2E_MOCK_URL 传给 playwright"; exit 1; }
+grep -qF 'E2E_MOCK_URL: http://127.0.0.1:18789' .github/workflows/nightly-e2e.yml \
+  || { echo "--- FAIL: CI 未导出 E2E_MOCK_URL（CI 本来就要求零 skip，软跳过在这里该失效）"; exit 1; }
+# 负锁①：不得再有直连硬编端口的请求/断言字面量（注释里描述历史形态不在此列 ⇒ 只查调用式）。
+if grep -qE "request\.get\('[^']*18789|toContainText\('127\.0\.0\.1:18789" web/e2e/uat_full.spec.mjs; then
+  echo "--- FAIL: spec 里又出现硬编 18789 的调用"; exit 1; fi
+# 负锁②：`test.skip(!resp...)` 的无条件软跳过不得复活（它会连"栈根本没起来"一起洗白）。
+if grep -q 'test.skip(!resp' web/e2e/uat_full.spec.mjs; then
+  echo "--- FAIL: 复活了无条件 skip(!resp)"; exit 1; fi
+# 语法锁：spec 与脚本至少可解析（改的是 e2e 骨架，语法错会让 nightly 整栈假红）。
+node --check web/e2e/uat_full.spec.mjs || { echo "--- FAIL: uat_full.spec.mjs 语法未通过"; exit 1; }
+bash -n scripts/uat_bootstrap.sh || { echo "--- FAIL: uat_bootstrap.sh 语法未通过"; exit 1; }
+echo "ok - §UAT-PORTS 守卫通过（单源锁 1 + 口径锁 2 + 导出锁 3 + 负锁 2 + 语法锁 2）"
+
 echo ""
 echo "==> 全部通过"
