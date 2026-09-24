@@ -2026,19 +2026,60 @@ func (s *Server) handleListPositions(w http.ResponseWriter, r *http.Request) {
 
 // handleGetStrategyConfig 处理 GET /api/config/strategy：返回全局策略参数配置。
 // 战法参数全局共享（多账号一致），不按账号隔离。
+// §N-4：响应体含 updated_at（§中-6 版本戳），前端保存时原样回传做写前比对。
 func (s *Server) handleGetStrategyConfig(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, s.cfg.GetStrategyConfig())
 }
 
-// handleSetStrategyConfig 处理 POST /api/config/strategy：保存全局策略参数配置。
+// handleSetStrategyConfig 处理 POST /api/config/strategy：稀疏 merge 保存全局策略参数配置。
+//
+// §N-4（2026-09-22 傍晚批 §CFGSMASH，2026-09-24 抄母仓移植）**对外语义变更**：旧实现把 body
+// 反序列化成完整 StrategyConfig 后全量替换（json 缺键=零值），前端一次加载失败 + 一次整份保存
+// 即把五套战法阈值落 0、已落库、重启救不回。现改为「**没传=保留旧值**」的稀疏 merge（逐字段递归，
+// 详见 config.Manager.MergeStrategyConfig）；显式传某个键仍会更新该键（要清 0 请明写 0）。
+// §中-6 乐观锁：body 可携带 GET 读到的 updated_at——与服务端当前版本不一致回 409
+// （附 current_updated_at，前端提示"配置已被他人更新，请重载"）；不带 = 不比对（兼容脚本直 POST）。
+// 端点注释即对外契约：响应回传本次写入后的新 updated_at。
+// English: §N-4 — the write is now a SPARSE MERGE ("absent key keeps the stored value", the old
+// decode-then-replace-all turned a failed page load + save into zeroed tactics); optional
+// optimistic locking via updated_at, mismatch => 409 with current_updated_at.
 func (s *Server) handleSetStrategyConfig(w http.ResponseWriter, r *http.Request) {
-	var cfg config.StrategyConfig
-	if err := json.NewDecoder(r.Body).Decode(&cfg); err != nil {
+	// 先解成「顶层键→原始 JSON」而不是 typed struct：typed 解码会把缺失键折叠成零值，
+	// 正是本缺陷的成因；RawMessage 保留了"键到底出现过没有"这一稀疏 merge 的唯一判据。
+	var body map[string]json.RawMessage
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		writeError(w, 400, "invalid request body")
 		return
 	}
-	s.cfg.SetStrategyConfig(&cfg)
-	writeJSON(w, 200, map[string]string{"status": "ok"})
+	// §中-6：取出客户端基线版本（允许缺省=不比对），非法类型宽容忽略而非 400——
+	// 版本只是比对输入，不值得为它拒绝一次合法参数写入。
+	baseVersion := ""
+	if raw, ok := body["updated_at"]; ok {
+		var v string
+		if err := json.Unmarshal(raw, &v); err == nil {
+			baseVersion = v
+		}
+	}
+	merged, err := s.cfg.MergeStrategyConfig(body, baseVersion)
+	if errors.Is(err, config.ErrStrategyVersionConflict) {
+		// 后写不覆盖前写：回 409 让管理员重载后再改（静默覆盖=两个人互相"改没了"）。
+		writeJSON(w, http.StatusConflict, map[string]string{
+			"error":              "战法参数已被其他操作更新（版本不一致），请重新加载后再保存",
+			"current_updated_at": merged.UpdatedAt,
+		})
+		return
+	}
+	if err != nil {
+		writeError(w, 400, err.Error())
+		return
+	}
+	// 操作留痕：merge 写改了哪些顶层键（不含数值正文，配合配置历史快照可追溯）。
+	keys := make([]string, 0, len(body))
+	for k := range body {
+		keys = append(keys, k)
+	}
+	opslog.Audit("config_strategy_merge", userIDFor(r), "strategy", fmt.Sprintf("keys=%v version=%s", keys, merged.UpdatedAt))
+	writeJSON(w, 200, map[string]string{"status": "ok", "updated_at": merged.UpdatedAt})
 }
 
 // ── D1 规则配置 ──

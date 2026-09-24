@@ -1719,5 +1719,39 @@ if ! grep -q 'SetGauge("settlement_diff_count", 0)' internal/trading/settlement.
 fi
 echo "ok - §DEADGAUGE 专项守卫通过（行为锁 4 组 + 静态锁 4 道 + 通用死规则守卫 1 条 + 负锁 3 道）"
 
+# ══════════════════════════════════════════════════════════════════════════════
+# 70：§抄母仓-6（2026-09-24）战法参数保存稀疏 merge + 乐观锁 409（母仓 bddcccb §N-4/§中-6）
+# English: section 70 locks the ported sparse-merge strategy-config writer and its 409 optimistic lock.
+# ══════════════════════════════════════════════════════════════════════════════
+echo "==> 70 §CFGSMASH 战法参数保存：稀疏 merge + 版本冲突 409 +  getter 快照（抄母仓 §N-4，2026-09-24）..."
+# 现象（三重叠加，缺一不至于丢参数）：① 前端加载失败被 catch 吞 → 表单落在空对象；
+# ② 数字字段 `?? 0` 把「键缺失」渲染成 0（缺失与真实 0 混同）；③ 后端把 body 反序列化成完整
+# StrategyConfig 后**全量替换**落盘 ⇒ 一次「加载失败 + 保存」即把五套战法阈值清零、重启救不回。
+# 另：GetStrategyConfig 返回内部指针、Set 系无锁写，与打分/热更新并发（-race 可复现）。
+# 修法：逐字段 JSON 递归稀疏 merge（没传=保留旧值，要清 0 请明写 0）+ updated_at 乐观锁 409
+# + 全部 getter 改快照拷贝、setter 加锁 + 前端三态加载（缺失渲空并保存前必填校验）。
+g_cfg=$(go test -count=1 ./internal/config/ -run 'TestMergeStrategyConfig|TestSetStrategyConfig|TestStrategyConfigSaveWhileScoringRace' 2>&1 || true)
+printf '%s\n' "$g_cfg" | grep -q '^ok' || { echo "--- FAIL: §N-4 稀疏 merge/乐观锁/并发行为锁未过"; exit 1; }
+g_race=$(go test -race -count=1 ./internal/config/ 2>&1 || true)
+printf '%s\n' "$g_race" | grep -q '^ok' || { echo "--- FAIL: §CFGSMASH-concurrency -race 未过（getter 又回退成别名活体）"; exit 1; }
+g_srv=$(go test -count=1 ./internal/server/ -run 'TestSetStrategyConfig' 2>&1 || true)
+printf '%s\n' "$g_srv" | grep -q '^ok' || { echo "--- FAIL: §N-4 端点级行为锁未过（部分键保存/409/坏结构 400）"; exit 1; }
+( cd web && npx vitest run src/__tests__/n4_cfg_smash.test.jsx >/dev/null 2>&1 ) \
+  || { echo "--- FAIL: §N-4 前端三态加载/409 冲突锁未过（E1/E3/E4 之一失效）"; exit 1; }
+grep -q 'func (m \*Manager) MergeStrategyConfig(patch map\[string\]json.RawMessage' internal/config/config.go \
+  || { echo "--- FAIL: 稀疏 merge 入口签名变更（回到整 struct 反序列化=缺键即清零）"; exit 1; }
+grep -q 'var ErrStrategyVersionConflict' internal/config/config.go || { echo "--- FAIL: 乐观锁哨兵错误丢失"; exit 1; }
+grep -q 'UpdatedAt string `json:"updated_at,omitempty"`' internal/config/config.go \
+  || { echo "--- FAIL: 版本戳字段丢失（409 无从比对）"; exit 1; }
+[ "$(grep -c 'next.UpdatedAt = time.Now().UTC()' internal/config/config.go || true)" -ge 3 ] \
+  || { echo "--- FAIL: 版本戳推进点 < 3 处（有写路径不刷新 updated_at，409 形同虚设）"; exit 1; }
+# 负锁 1：handler 又整份反序列化到 StrategyConfig（全量替换形态）——函数体内必须仍有 RawMessage 稀疏 merge。
+if ! grep -q 'json.RawMessage' <(sed -n '/func (s \*Server) handleSetStrategyConfig/,/^}/p' internal/server/server.go); then
+	echo "--- FAIL: handleSetStrategyConfig 不再走稀疏 merge（缺键清零复活）"; exit 1; fi
+# 负锁 2：前端 renderField 的 `?? 0` 兜底绝迹（缺失渲染成 0 是本缺陷的第二重）。
+if grep -nE '\?\? 0[[:space:]]*\}[[:space:]]*$|value=\{[^}]*\?\? 0\}' web/src/pages/Settings.jsx | grep -vE '^[0-9]+:[[:space:]]*(//|\*)' | grep -q .; then
+	echo "--- FAIL: 前端又用 ?? 0 渲染缺失字段（空表单被提交成全 0）"; exit 1; fi
+echo "ok - §CFGSMASH 专项守卫通过（行为锁 4 组含 -race + 静态锁 4 道 + 负锁 2 道）"
+
 echo ""
 echo "==> 全部通过"
