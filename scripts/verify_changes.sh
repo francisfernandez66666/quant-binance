@@ -1146,7 +1146,11 @@ go test -count=1 ./internal/store/ -run 'TestResetCancelledZeroFillReplayable|Te
 grep -q 'cash, cashFresh := ctrl.AvailableCash()' internal/engine/engine.go || { echo "--- FAIL: 自动买入腿未走三态消费形态（§M12）"; exit 1; }
 grep -q 'if !cashFresh {' internal/engine/engine.go || { echo "--- FAIL: 资金口径不可得的 fail-close 分支丢失（§M12）"; exit 1; }
 grep -q 'json:"cash_stale"' internal/trading/controller.go || { echo "--- FAIL: /api/qmt/state 的 cash_stale 暴露丢失（§M12 前端降级横幅数据源断供）"; exit 1; }
-grep -q 'state.cash_stale' web/src/pages/Quant.jsx || { echo "--- FAIL: 前端资金口径不可得降级横幅丢失（§M12）"; exit 1; }
+# 前端腿锁按**渲染位形态**匹配而非按变量名：§QMT-FROZEN 批在函数顶部引入 `const st = state || {}`
+# 别名，把 `state.cash_stale` 写成 `st.cash_stale` 后旧字面量锁当场判红（行为完全等值却断门）。
+# 改锁为「{ (state|st).cash_stale ? row('可用资金 」这一行渲染语句本身——别名两种都认，
+# 但删掉整条降级横幅照样红（反向验证：注释掉该行 → 本锁判红）。
+grep -qE '\{(state|st)\.cash_stale \? row\(.可用资金' web/src/pages/Quant.jsx || { echo "--- FAIL: 前端资金口径不可得降级横幅丢失（§M12）"; exit 1; }
 # §H1-MG 放行集须同时覆盖「发送失败」与「已撤+零成交」，且成交判定走 fills 相关子查询（与 SumFilledQty 同前缀口径）。
 grep -q "status='发送失败'" internal/store/real_positions.go || { echo "--- FAIL: 发送失败可重放腿丢失（§GAP2-W1 回归）"; exit 1; }
 grep -q "status='已撤' AND NOT EXISTS" internal/store/real_positions.go || { echo "--- FAIL: 已撤零成交可重放腿丢失（§H1-MG 撤单猝死复活）"; exit 1; }

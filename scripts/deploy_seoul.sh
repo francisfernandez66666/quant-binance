@@ -224,7 +224,7 @@ echo "      qmt-mock 已部署（service 关闭）；qmt_gateway/ Python 骨架�
 # 与 [4/8] 的 /etc/quant.env 分开——后者每次部署整文件覆盖，塞进去会被抹掉）。
 # English: install the on-box ops cron jobs (watchdog + daily backup). Off by default because an
 # unconfigured alert channel makes the watchdog a no-op writing noise, and backups consume disk.
-echo "[7b/8] 运维装载（watchdog/backup cron，当前 OPS_WATCHDOG=$OPS_WATCHDOG OPS_BACKUP=$OPS_BACKUP）..."
+echo "[7b/8] 运维装载（watchdog/backup cron，当前 OPS_WATCHDOG=${OPS_WATCHDOG} OPS_BACKUP=${OPS_BACKUP}）..."
 $SSH "sudo mkdir -p $DEPLOY_DIR/scripts"
 $SCP "$APP_DIR/scripts/watchdog.sh" "$APP_DIR/scripts/backup.sh" $SERVER_USER@$SERVER_IP:/tmp/
 $SSH "sudo mv /tmp/watchdog.sh $DEPLOY_DIR/scripts/watchdog.sh && sudo mv /tmp/backup.sh $DEPLOY_DIR/scripts/backup.sh && sudo chmod +x $DEPLOY_DIR/scripts/watchdog.sh $DEPLOY_DIR/scripts/backup.sh"
@@ -285,7 +285,7 @@ if [ "$OPS_WATCHDOG" = "1" ]; then
         gen_wrapper "watchdog-$svc.sh" "watchdog.sh" "export QUANT_SERVICE=$svc"
         cron_ensure "#quant-watchdog-$svc" "* * * * * $DEPLOY_DIR/scripts/watchdog-$svc.sh >> /var/log/quant-watchdog-$svc.log 2>&1 #quant-watchdog-$svc"
     done
-    echo "      ✓ watchdog 已装为每分钟 cron（服务清单：$OPS_SERVICES，包装脚本 $DEPLOY_DIR/scripts/watchdog-*.sh）"
+    echo "      ✓ watchdog 已装为每分钟 cron（服务清单：${OPS_SERVICES}，包装脚本 $DEPLOY_DIR/scripts/watchdog-*.sh）"
     [ -z "${HEALTHCHECK_URL:-}" ] && [ -z "${ALERT_WEBHOOK:-}" ] && \
         echo "      ⚠ 未给 HEALTHCHECK_URL/ALERT_WEBHOOK：探测照跑但异常无人收，/etc/quant-ops.env 补上即可"
 fi
