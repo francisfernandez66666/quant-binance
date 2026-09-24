@@ -14,6 +14,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	_ "modernc.org/sqlite" // 纯 Go SQLite 驱动（driver 名 "sqlite"）
@@ -23,6 +24,21 @@ import (
 // （DB wraps the research database handle.）
 type DB struct {
 	db *sql.DB // SQLite 数据库连接
+	// eventBasisAborted §ADJ-BASIS（2026-09-23）：backtest_event_results 的口径位主键重建被
+	// 「行数守恒」守卫中止（或服务启动时读到未知表形态）时置真。真 = 本库该表**没有**可用的
+	// adj_basis 键列，此时读写侧一律走保守路径（见 backtest_jobs.go / emotion_matrix.go）：
+	// 读恒判未命中、写直接拒绝并留痕——宁可整轮重算，也绝不把改前旧行当新结果报出去。
+	// 中止只影响回测缓存命中率，不影响交易路径，故 Open 不返回错误（应用照常启动）。
+	// English: set when the basis-in-PK rebuild was aborted by the row-conservation guard. Readers
+	// then always miss and writers refuse, so a half-migrated cache fails toward recomputation
+	// instead of serving pre-fix rows as fresh results; the app still starts.
+	eventBasisAborted bool
+	// eventBasisReason 中止原因（仅 eventBasisAborted 为真时有意义，日志/错误信息用）。
+	eventBasisReason string
+	// eventBasisWarn 口径位相关告警的日志去重（读/写/情绪矩阵各一次，防逐事件、逐请求刷屏）。
+	eventBasisWarnRead   sync.Once
+	eventBasisWarnWrite  sync.Once
+	eventBasisWarnMatrix sync.Once
 }
 
 // Open 打开（必要时创建）研究数据库并初始化表结构。
@@ -217,16 +233,23 @@ func (d *DB) migrate() error {
 			updated_at TEXT NOT NULL,
 			UNIQUE(kind, candidate_id)
 		)`,
-		// 回测断点缓存：按候选 + 事件唯一键（事件日+行业）存完整 EventResult JSON，
+		// 回测断点缓存：按候选 + 事件唯一键（事件日+行业+**复权口径位**）存完整 EventResult JSON，
 		// 中断/重启后续跑只重算未缓存的事件；同一候选重跑覆盖（INSERT OR REPLACE 语义）。
-		// English: backtest checkpoint cache — full EventResult JSON per (candidate, event-date, industry);
-		// a resumed run only recomputes uncached events; reruns overwrite (INSERT OR REPLACE semantics).
+		// adj_basis §ADJ-BASIS（2026-09-23）：数值口径进主键。研究断点键早已带口径位
+		// （internal/research.AdjBaselineVersion），本表却漏了——§ADJ(P0-A 复权因子前向填充) 这种
+		// "入口不变、数值全变"的修复不会让本表缓存失效，离线重放同一候选会直接把改前的行当成
+		// 新结果报出来（"数据是旧的 / 流水线是绿的"同时成立）。空串 '' 是**改前旧证据行**的哨兵值，
+		// 不代表任何当前口径，读写侧一律排除（见 backtest_jobs.go）。
+		// English: backtest checkpoint cache — full EventResult JSON per (candidate, event-date,
+		// industry, adjustment basis); a resumed run only recomputes uncached events. '' in adj_basis
+		// is the sentinel for pre-basis evidence rows and is never presented as a current result.
 		`CREATE TABLE IF NOT EXISTS backtest_event_results (
 			candidate_id INTEGER NOT NULL,
 			event_date TEXT NOT NULL,
 			industry TEXT NOT NULL,
+			adj_basis TEXT NOT NULL DEFAULT '',
 			result_json TEXT NOT NULL,
-			PRIMARY KEY (candidate_id, event_date, industry)
+			PRIMARY KEY (candidate_id, event_date, industry, adj_basis)
 		)`,
 		// 研究任务队列（子系统统一改造一期）：quant(API) 与 researchd 夜间作业都只入队，
 		// 唯一消费者是 researchd worker（盘后门控 + 优先级 + kill 抢占）。
@@ -721,6 +744,15 @@ func (d *DB) migrate() error {
 	// English: P0-2 migrate orders signal_id uniqueness to (user_id, signal_id).
 	if err := d.migrateOrdersSignalUnique(); err != nil {
 		return fmt.Errorf("store migrate orders signal unique: %w", err)
+	}
+	// §ADJ-BASIS（2026-09-23）backtest_event_results 主键加复权口径位：旧库四列重建。
+	// 本迁移**刻意不把 Open 变成硬失败**——守卫中止时只置降级标志 + ERROR 日志，交易路径
+	// 不受影响（详见 migrateBacktestEventResultsAdjBasis 的注释）。
+	// English: rebuild the event-result PK with the adjustment-basis column; an aborted rebuild
+	// degrades (loud log + readers/writers fail toward recomputation) rather than failing Open.
+	if err := d.migrateBacktestEventResultsAdjBasis(); err != nil {
+		log.Printf("[store] ERROR §ADJ-BASIS backtest_event_results 口径位主键重建异常（本库回测缓存按保守路径处理：读恒未命中、写拒绝）: %v", err)
+		d.markEventBasisDegraded("重建异常: " + err.Error())
 	}
 	// §P1-d（PLAN §5.2-3）orders/fills/shadow_orders 的 qty 列 INTEGER→REAL 重建（Go 侧 Qty 已
 	// float64）。必须排在 §M4 fills 索引块之前：重建 DROP 表会连带删除随行索引，M4 的
@@ -1281,6 +1313,179 @@ func (d *DB) migrateQtyReal() error {
 	return nil
 }
 
+// eventResultsPKTarget / eventResultsPKLegacy backtest_event_results 的目标 / 待迁移主键列序。
+var (
+	eventResultsPKTarget = []string{"candidate_id", "event_date", "industry", "adj_basis"}
+	eventResultsPKLegacy = []string{"candidate_id", "event_date", "industry"}
+)
+
+// pkColumnsEqual 主键列序逐位比对（顺序即语义，ON CONFLICT 目标按列序匹配）。
+func pkColumnsEqual(got, want []string) bool {
+	if len(got) != len(want) {
+		return false
+	}
+	for i := range got {
+		if !strings.EqualFold(got[i], want[i]) {
+			return false
+		}
+	}
+	return true
+}
+
+// markEventBasisDegraded 置降级标志并打 ERROR（幂等：只打第一次，重复调用只留首条日志）。
+// 由 migrate() 在 Open 返回前调用，故读取侧无需加锁（发布发生在任何并发使用之前）。
+// English: flags the degraded mode once with a loud ERROR log; written before Open returns.
+func (d *DB) markEventBasisDegraded(reason string) {
+	if d.eventBasisAborted {
+		return
+	}
+	d.eventBasisAborted = true
+	d.eventBasisReason = reason
+	log.Printf("[store] ERROR §ADJ-BASIS backtest_event_results 复权口径位主键未生效（%s）："+
+		"原表保持未迁移形态、不删任何行；本进程回测断点缓存转入保守模式——读恒判未命中、写直接拒绝，"+
+		"整轮重算而不是把改前旧行当新结果。请人工核对该表后重启服务。", reason)
+}
+
+// EventBasisDegraded 报告本库 backtest_event_results 是否处于「口径位主键未生效」的保守模式。
+// English: reports whether event-result caching is in the degraded (basis-PK not in place) mode.
+func (d *DB) EventBasisDegraded() bool { return d.eventBasisAborted }
+
+// migrateBacktestEventResultsAdjBasis 把 backtest_event_results 主键从
+// (candidate_id, event_date, industry) 重建为 (candidate_id, event_date, industry, adj_basis)。
+// 幂等：已符合目标结构时不操作。
+//
+// 为什么必须重建表而不是加列（§ADJ-BASIS，2026-09-23）：adj_basis 只有**进主键**，才能同时做到
+// 「改前旧行原样留着当证据」和「同一三元组在当前口径下另起一行」。实测：只 ALTER 加列 + 建四列
+// UNIQUE 索引时，旧三元组上的表级 PRIMARY KEY 仍然拦新口径行，插入报
+// `UNIQUE constraint failed: backtest_event_results.candidate_id, event_date, industry (1555)`。
+// SQLite 不支持改主键，因此照本仓既有重建迁移（migrateRealPositionsPK /
+// migrateOrdersSignalUnique）的形态走：建 *_new → 整表搬运 → drop 旧表 → 改名回来，
+// 且额外套一层事务（本迁移会 drop 表，中途失败必须能回到原样）。
+//
+// 行数守恒守卫（任一条不满足 → ROLLBACK 中止，旧表原封不动，只置降级标志 + ERROR 日志）：
+//  1. 预检：按投影键（四列，NULL 先归一空串）去重后的行数必须等于 COUNT(*)——不相等说明搬运
+//     会把多行塌成一行（旧库被手工改过 / 键列含 NULL 互相撞键），删证据不可接受；
+//  2. 搬运用普通 INSERT（**不是** INSERT OR REPLACE）且新表键列 NOT NULL：任何塌行或 NULL 键
+//     都直接撞约束中止；
+//  3. 复检：事务内比对新旧两表——总 COUNT(*) 相等，且按**旧三元组**分组的
+//     (行数, result_json 字节合计) 摘要双向 EXCEPT 为空。既证「一行不丢」也证「没一行被改」，
+//     含 adj_basis 值逐行核对（旧行必须全为空串）。
+//
+// 旧行一律带空串 adj_basis 过表：空串就是「改前证据行」哨兵，永不参与当前口径的读取（见
+// backtest_jobs.go 读写侧与 emotion_matrix.go）。
+//
+// English: rebuilds the event-result primary key to carry the adjustment-basis column. Adding a
+// column plus a 4-column UNIQUE index is provably not enough — the table-level PRIMARY KEY on the
+// old triple still rejects a new-basis row for an existing triple (SQLite error 1555). Following
+// this repo's other rebuild migrations we create *_new, copy, drop and rename, wrapped in a
+// transaction, and carry every pre-basis row over with an empty adj_basis (the sentinel readers
+// never surface). Three count-conservation guards abort the whole thing and leave the original
+// table untouched; an abort degrades caching (recompute, never reuse) instead of failing Open.
+func (d *DB) migrateBacktestEventResultsAdjBasis() error {
+	cols, err := d.tableHasPKColumns("backtest_event_results")
+	if err != nil {
+		return err
+	}
+	if pkColumnsEqual(cols, eventResultsPKTarget) {
+		return nil // 已迁移（新建库建表语句本身就是目标形态）→ 幂等空转
+	}
+	if !pkColumnsEqual(cols, eventResultsPKLegacy) {
+		d.markEventBasisDegraded(fmt.Sprintf("主键形态非预期 (%s)，拒绝重建", strings.Join(cols, ",")))
+		return nil
+	}
+	// 旧库可能已被"只加列"的实验改过（列在，键不在）：有则原样带值搬，无则统一回填 ''。
+	hasBasisCol, err := d.hasColumn("backtest_event_results", "adj_basis")
+	if err != nil {
+		return err
+	}
+	basisSel := "''"
+	if hasBasisCol {
+		basisSel = "COALESCE(adj_basis, '')"
+	}
+	log.Printf("[store] migrate backtest_event_results PK: (candidate_id, event_date, industry) -> " +
+		"(candidate_id, event_date, industry, adj_basis)，旧行 adj_basis 回填 ''（改前证据行）")
+
+	tx, err := d.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback() // commit 之后是 no-op：任何守卫失败都回到原样
+
+	// 守卫 1（预检）：投影键去重数 == 总行数，否则搬运必塌行。
+	// GROUP BY 把 NULL 归入同一组，与复制语句里 COALESCE(adj_basis,'') 的归一口径一致。
+	var total, distinct int
+	if err := tx.QueryRow(`SELECT
+			(SELECT COUNT(*) FROM backtest_event_results),
+			(SELECT COUNT(*) FROM (SELECT 1 FROM backtest_event_results
+				GROUP BY candidate_id, event_date, industry, `+basisSel+`))`).Scan(&total, &distinct); err != nil {
+		return fmt.Errorf("行数预检失败: %w", err)
+	}
+	if total != distinct {
+		return fmt.Errorf("行数守恒预检不通过：COUNT(*)=%d 但投影键去重后=%d（搬运会把 %d 行塌成一行），中止迁移、旧表不动",
+			total, distinct, total-distinct)
+	}
+	if _, err := tx.Exec(`DROP TABLE IF EXISTS backtest_event_results_new`); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(`CREATE TABLE backtest_event_results_new (
+		candidate_id INTEGER NOT NULL,
+		event_date TEXT NOT NULL,
+		industry TEXT NOT NULL,
+		adj_basis TEXT NOT NULL DEFAULT '',
+		result_json TEXT NOT NULL,
+		rule_fp TEXT DEFAULT '',
+		PRIMARY KEY (candidate_id, event_date, industry, adj_basis)
+	)`); err != nil {
+		return err
+	}
+	// 守卫 2：普通 INSERT + NOT NULL 键列——塌行/NULL 键在这里撞约束。
+	if _, err := tx.Exec(`INSERT INTO backtest_event_results_new
+			(candidate_id, event_date, industry, adj_basis, result_json, rule_fp)
+		SELECT candidate_id, event_date, industry, ` + basisSel + `, result_json, COALESCE(rule_fp, '')
+		FROM backtest_event_results`); err != nil {
+		return fmt.Errorf("整表搬运失败（守卫：禁止塌行/NULL 键）: %w", err)
+	}
+	// 守卫 3（复检）：总行数相等 + 按旧三元组分组的 (行数, json 字节合计) 摘要双向一致。
+	var newTotal int
+	if err := tx.QueryRow(`SELECT COUNT(*) FROM backtest_event_results_new`).Scan(&newTotal); err != nil {
+		return err
+	}
+	if newTotal != total {
+		return fmt.Errorf("行数守恒复检不通过：迁移前 %d 行，搬运后 %d 行，中止迁移、旧表不动", total, newTotal)
+	}
+	// 逐组摘要：行数 + result_json 字节合计（LENGTH 对 NULL 返回 NULL，故 COALESCE 成 -1 让
+	// 「整组内容丢失」与「行数为 0」这两种异常都能显形）。两个方向各一次 EXCEPT，
+	// 合并计数必须为 0——既证明一行不丢，也证明没一行被改。
+	const groupDigest = `SELECT candidate_id, event_date, industry, COUNT(*), COALESCE(SUM(LENGTH(result_json)),-1) FROM %s GROUP BY candidate_id, event_date, industry`
+	var mismatch int
+	if err := tx.QueryRow(`SELECT COUNT(*) FROM (
+			SELECT * FROM (` + fmt.Sprintf(groupDigest, "backtest_event_results") + `)
+			EXCEPT
+			SELECT * FROM (` + fmt.Sprintf(groupDigest, "backtest_event_results_new") + `)
+			UNION ALL
+			SELECT * FROM (` + fmt.Sprintf(groupDigest, "backtest_event_results_new") + `)
+			EXCEPT
+			SELECT * FROM (` + fmt.Sprintf(groupDigest, "backtest_event_results") + `)
+		)`).Scan(&mismatch); err != nil {
+		return fmt.Errorf("逐组摘要比对失败: %w", err)
+	}
+	if mismatch != 0 {
+		return fmt.Errorf("行数守恒复检不通过：%d 组 (candidate_id,event_date,industry) 的行数/内容摘要在搬运前后不一致，中止迁移、旧表不动", mismatch)
+	}
+	// 三道守卫全过：换表（旧行已在新表里，adj_basis=''）。
+	if _, err := tx.Exec(`DROP TABLE backtest_event_results`); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(`ALTER TABLE backtest_event_results_new RENAME TO backtest_event_results`); err != nil {
+		return err
+	}
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	log.Printf("[store] migrate backtest_event_results PK 完成：%d 行全部带 adj_basis='' 落新表（旧证据行不参与当前口径读取）", total)
+	return nil
+}
+
 // QueryRows 执行只读查询，返回 列名→值 的行切片（TEXT 以 string 返回，其余按驱动原生类型）。
 // 供增量导出（dataload export-delta）等通用读取场景；仅限 SELECT。
 // English: runs a read-only query returning rows as column→value maps (TEXT as string, other types
@@ -1606,16 +1811,12 @@ func (d *DB) ReadyStockCount() (int, error) {
 }
 
 // HfqBars 读取某股票 hfq 后复权日线（升序）。
-// PrimarySourceThsDaily 数据源路由开关：true 时 RawBars 优先读 ths_daily（同花顺（新）），
-// 该股无数据回退旧 daily 表。由 config data.primary_source 在启动时装配。
-// 注意：HfqBars 不受此开关影响——ths 复权因子尚在草稿态（对账门禁未过，见
-// docs/HITHINK_DATA_SOURCE_PLAN.md §6.3），hfq 仍走旧表直到门禁放行。
-var PrimarySourceThsDaily = false
-
-// ThsFactorsReady 同花顺复权因子对账门禁：true 时 HfqBars 走 ths_daily×ths_adj_factor；
-// false（默认）时 hfq 仍走旧表——门禁未过前禁止消费（docs/HITHINK_DATA_SOURCE_PLAN §6.3）。
-var ThsFactorsReady = false
-
+// 数据源路由开关（PrimarySourceThsDaily / ThsFactorsReady）已收为包内私有，
+// 唯一写入口见 source_routing.go 的 ConfigureSource / ConfigureSourceFromFile；
+// 本文件只经 useThsDaily()/useThsHfq() 读取。
+// 注意：门禁未过时 hfq 仍走旧表——ths 复权因子尚在草稿态（对账门禁未过，见
+// docs/HITHINK_DATA_SOURCE_PLAN.md §6.3）。
+//
 // 换算：hfq_close = close * adj_factor（基座因子在收益率/动量等比例型因子里自然抵消；
 // 价格类因子如 MA/52周高距在同一基准下自洽，不影响相对结论）。
 // （HfqBars reads a stock's hfq back-adjusted daily bars (ascending). hfq_close = close * adj_factor;
@@ -1623,18 +1824,31 @@ var ThsFactorsReady = false
 func (d *DB) HfqBars(tsCode, start, end string) ([]Bar, error) {
 	// §数据源路由：主源=hithink 且复权门禁通过 → ths 双表 join；
 	// 否则走旧表（baostock）——因子口径未定稿前绝不混用两套复权体系。
-	if PrimarySourceThsDaily && ThsFactorsReady {
+	if useThsHfq() {
 		var n int
 		if err := d.db.QueryRow(`SELECT COUNT(*) FROM ths_adj_factor WHERE ts_code=?`,
 			tsCode).Scan(&n); err == nil && n > 0 {
 			return d.thsHfqBars(tsCode, start, end)
 		}
 	}
-	// 主源路径：日线 JOIN 复权因子（缺因子按 1 兜底），后复权口径计算。
+	// 主源路径：日线 × 复权因子（缺因子按 1 兜底），后复权口径计算。
+	//
+	// §ADJ(P0-A 20260922)：adj_factor 是【事件稀疏点】表——写入口 cmd/dataload/baostock.go
+	// （bsLoadStockTables 的 adjRows 构造处、bsLoadAdjFactor 专项补齐处）存的 trade_date =
+	// normDate(dividoperatedate)（分红实施日），一只票一年通常只有 0~3 行，而不是每个交易日一行。
+	// 因此因子必须**前向填充**：取"不晚于该交易日的最近一个事件日"的因子
+	// （与同包 ths_tables.go 的 LegacyAdjFactorAt 语义严格一致）。
+	// 若写成等值 JOIN（因子日 == 行情日），非除权日全部落空 → COALESCE 兜成 1 →
+	// **后复权价退化为不复权价**，回测/因子研究/图表复权口径全链路失真——这正是本处缺陷。
+	// 允许例外：allow-legacy-adj-join-eq —— 本函数为前向填充的合法实现点，注释中出现的
+	// "因子日 == 行情日" 仅为反面说明，SQL 内不含等值 JOIN 形态。
 	query := `SELECT d.trade_date,
 		COALESCE(d.open,0), COALESCE(d.high,0), COALESCE(d.low,0), COALESCE(d.close,0),
-		COALESCE(d.vol,0), COALESCE(d.amount,0), COALESCE(a.adj_factor,1) AS adj
-		FROM daily d LEFT JOIN adj_factor a ON a.ts_code=d.ts_code AND a.trade_date=d.trade_date
+		COALESCE(d.vol,0), COALESCE(d.amount,0),
+		COALESCE((SELECT a.adj_factor FROM adj_factor a
+		          WHERE a.ts_code=d.ts_code AND a.trade_date<=d.trade_date
+		          ORDER BY a.trade_date DESC LIMIT 1), 1) AS adj
+		FROM daily d
 		WHERE d.ts_code=? AND d.trade_date>=? AND d.trade_date<=?
 		ORDER BY d.trade_date`
 	rows, err := d.db.Query(query, tsCode, start, end)
@@ -1665,7 +1879,7 @@ func (d *DB) HfqBars(tsCode, start, end string) ([]Bar, error) {
 func (d *DB) RawBars(tsCode, start, end string) ([]Bar, error) {
 	// §数据源路由：主源=同花顺（新）且该股有 ths 数据 → 读 ths_daily；
 	// 无数据回退旧 daily 表（缺口登记重试队列的 provenance 机制随 Phase E 补齐）。
-	if PrimarySourceThsDaily {
+	if useThsDaily() {
 		var n int
 		if err := d.db.QueryRow(`SELECT COUNT(*) FROM ths_daily WHERE ts_code=? AND trade_date<=?`,
 			tsCode, end).Scan(&n); err == nil && n > 0 {
@@ -1717,6 +1931,20 @@ func (d *DB) thsRawBars(tsCode, start, end string) ([]Bar, error) {
 }
 
 // thsHfqBars 读同花顺（新）日K×因子的后复权序列（hfq_close = close × factor）。
+//
+// §ADJ 两源同核对（P0-A 20260922 施工核实，以代码为准不看文档）：
+// ths_adj_factor 的**唯一写入口** cmd/dataload/hithink_sync.go 的 cmdHithinkSyncAdjFactors：
+//   - 先 `db.ThsDatesSince(code, since)` 取该标的窗口内**全部交易日**；
+//   - 再对每个交易日 `batch = append(batch, ThsAdjFactorRow{TsCode, TradeDate: dt, Factor: cur})`
+//     逐日物化**累计**因子（cur 只在跨过除权事件时乘一次乘数，之后原样续写到下一个事件日）。
+//
+// 即 ths 侧是【日粒度全覆盖的累计值】，与 baostock 侧的【事件稀疏点】形态根本不同 ⇒
+// 这里的等值 JOIN 语义**正确**，不需要前向填充（若强行改成子查询反而掩盖"因子未按日物化"
+// 的数据缺陷）。允许例外：allow-legacy-adj-join-eq —— 等值 JOIN 作用于 ths_adj_factor
+// （日累计全覆盖表），不是事件稀疏的 adj_factor。
+// 已知覆盖缺口（门禁放行前须补，本次登记不修）：hithink_sync 只为"窗口内有事件"的标的展开
+// （无事件即 continue，与同文件"无事件也物化恒等基线行"的注释不符），且只覆盖 since 之后
+// 的日期 —— 门禁切换后，跨 since 之前的区间会被这条内连接丢行。
 func (d *DB) thsHfqBars(tsCode, start, end string) ([]Bar, error) {
 	// ths_daily JOIN ths_adj_factor：价格类在 SQL 层直接乘因子做后复权（量能不换算）。
 	query := `SELECT b.trade_date,

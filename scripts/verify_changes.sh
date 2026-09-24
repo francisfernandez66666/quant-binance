@@ -21,6 +21,8 @@
 #     + 2026-09-23 §BINANCE Phase 3+4 行情/状态双 WS+StdWsDial（纯标准库 RFC6455）/§9 第 15 闸 market_halt 证据链/xasset 三腿/前端市场维度+历史K线（见 59）
 #     + 2026-09-23 §ENH 增强批 A+B（PLAN_ENHANCE_20260923：FNG 情绪腿/EDGAR+CryptoPanic 事件腿/观测面三件套/lightweight-charts 试点/walk-forward/滑点回灌挂价，见 60）
 #     + 2026-09-24 §抄母仓 可抄榜批（母仓分叉后锤实的 8 项缺陷按序移植：§DISCIPLINE 延持终态失明/§PICKILL-SCOPE 跨 checkout 误杀/§UAT-PORTS e2e 端口单源/§NOTIFYADMIN 推送探测端点收权/§ALERTROUTE 指标告警出站+7×24 节拍/§DEADGAUGE 死规则通用守卫，见 64~69）
+#     + 2026-09-24 §抄母仓 可抄榜项 6（§STRATEGY-MERGE 战法参数并发保存稀疏 merge + 版本冲突 409，见 70）
+#     + 2026-09-24 §抄母仓 可抄榜项 7（日K复权口径捆绑批，四节同批生效缺一不可：§ADJ 因子前向填充+路由唯一入口 / §KLINE-CHAIN-3 日K三级兜底链 / §ADJ-BASIS 口径位进研究断点键 / §ADJ-BASIS-3 事件缓存口径位与降级保守，见 71~74）
 # ...
 # §全链路 UAT 修复批（2026-09-18 §UAT_FULLCHAIN_VERIFY）专项（见 11/11）：
 #   费用腿       ：成交回报 fee/stamp_tax 五路径透传（xt 回调/桥行/网关装配/mock/Go 落库），
@@ -1098,15 +1100,19 @@ echo "==> 54 §H3 打分链日K复权优先 + 不复权拒参与 + 腾讯静默�
 # 除权日 MA/动量/止损价系统性失真（全系统 qfq 契约的漏网链，§D6 收口后剩余那条）。
 # 现：东财(qfq)→腾讯(仅 qfq)优先，每源过 ValidateKLine；新浪/同花顺只作**带标记**的末位兜底，
 # 不复权序列不进 md.KLines（因子战法经 len 守卫自然拒参与）。
+# 2026-09-24 §KLINE-CHAIN-3 后链序已扩为 腾讯(仅qfq)→东财(qfq)→库内日K→不复权(带标记)：本节的
+# 「qfq 腿在不复权腿之前」是不等式断言，链序怎么插都仍成立；本段只守这一条不变式，具体四腿顺序见 72。
 go test -count=1 ./internal/strategy_engine/ -run 'TestFetchDayKLine|TestApplyDayKLine|TestFetchMinuteKLine' 2>&1 | grep -E '^(--- FAIL|FAIL|ok)'
 go test -count=1 ./internal/data/ -run 'TestGetTencentKLineRefusesUnadjustedFallback|TestParseTencent' 2>&1 | grep -E '^(--- FAIL|FAIL|ok)'
 # 顺序锁（比文本断言可靠）：fetchDayKLine 内东财 qfq 腿必须排在新浪不复权腿之前。
-H3_QFQ=$(grep -n 'GetKLine(code, "101", 120)' internal/strategy_engine/engine.go | grep -vE '^[0-9]+:[[:space:]]*(//|\*)' | head -1 | cut -d: -f1)
-H3_UNADJ=$(grep -n 'GetSinaKLine(code, 120)' internal/strategy_engine/engine.go | grep -vE '^[0-9]+:[[:space:]]*(//|\*)' | head -1 | cut -d: -f1)
+# 三处赋值必须带 `|| true`：grep 无命中时退出码 1，在 set -euo 下会把整道锁变成「脚本静默中止」
+# 而不是「跑到下面的判红」——静默中止看起来也是"没报错"，属锁自伤。
+H3_QFQ=$(grep -n 'GetKLine(code, "101", 120)' internal/strategy_engine/engine.go | grep -vE '^[0-9]+:[[:space:]]*(//|\*)' | head -1 | cut -d: -f1 || true)
+H3_UNADJ=$(grep -n 'GetSinaKLine(code, 120)' internal/strategy_engine/engine.go | grep -vE '^[0-9]+:[[:space:]]*(//|\*)' | head -1 | cut -d: -f1 || true)
 [ -n "$H3_QFQ" ] && [ -n "$H3_UNADJ" ] || { echo "--- FAIL: 找不到复权/不复权腿（§H3 静态锁失效）"; exit 1; }
 [ "$H3_QFQ" -lt "$H3_UNADJ" ] || { echo "--- FAIL: 日K链又是不复权优先（除权日因子失真复活，§H3）"; exit 1; }
 # 每源校验闸：fetchDayKLine 的四条腿都要过 ValidateKLine（旧实现只判 len>0）。
-H3_VALIDATE=$(grep -c 'err == nil && data.ValidateKLine(klines)' internal/strategy_engine/engine.go)
+H3_VALIDATE=$(grep -c 'err == nil && data.ValidateKLine(klines)' internal/strategy_engine/engine.go || true)
 [ "$H3_VALIDATE" -ge 4 ] || { echo "--- FAIL: ValidateKLine 闸数量 $H3_VALIDATE < 4（有腿退回只判 len>0，§H3/§D8 复活）"; exit 1; }
 grep -q 'KLineUnadj  *bool' internal/strategy_engine/types.go || { echo "--- FAIL: StockMarketData 不复权标记字段丢失（§H3 拒参与不可见）"; exit 1; }
 grep -q 'dayk-unadjusted-fallback' internal/strategy_engine/engine.go || { echo "--- FAIL: 复权链降级的 opslog 告警丢失（§H3 降级不可观测）"; exit 1; }
@@ -1752,6 +1758,159 @@ if ! grep -q 'json.RawMessage' <(sed -n '/func (s \*Server) handleSetStrategyCon
 if grep -nE '\?\? 0[[:space:]]*\}[[:space:]]*$|value=\{[^}]*\?\? 0\}' web/src/pages/Settings.jsx | grep -vE '^[0-9]+:[[:space:]]*(//|\*)' | grep -q .; then
 	echo "--- FAIL: 前端又用 ?? 0 渲染缺失字段（空表单被提交成全 0）"; exit 1; fi
 echo "ok - §CFGSMASH 专项守卫通过（行为锁 4 组含 -race + 静态锁 4 道 + 负锁 2 道）"
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 71~74：2026-09-24 抄母仓「日K复权口径」捆绑批（可抄榜项 7，母仓 §ADJ P0-A / §KLINE-CHAIN-3 /
+# §ADJ-BASIS / §ADJ-BASIS-3）。四节必须同批生效：前向填充改了数值，口径位进断点键负责让旧数值
+# 缓存失效，三级兜底链负责让"网络复权腿全挂"时仍有可用日K——只搬其中一半，就会出现
+# "修复已上线、结论仍是旧口径"或"兜底腿读的是没修的假价"。
+# ══════════════════════════════════════════════════════════════════════════════
+
+echo "==> 71 §ADJ 后复权因子前向填充 + 数据源路由唯一入口（抄母仓傍晚批 P0-A）..."
+# 现象：adj_factor 是【事件稀疏】表（只在分红实施日有行），HfqBars 却按「因子日==行情日」等值
+# LEFT JOIN → 非除权日全部落空 → COALESCE 兜成 1 → 后复权价退化为不复权价，回测/因子/图表全链路
+# 失真且零报错。路由开关（PrimarySourceThsDaily/ThsFactorsReady）曾是包级导出变量，装配点只有
+# cmd/quant ⇒ researchd/dataload/replay/backtest/research 各自按默认值（旧表）跑，同一份数据
+# 两条口径。修法：前向填充子查询（与同包 ths_tables.go 的 LegacyAdjFactorAt 语义同源）+
+# 开关收私有、唯一入口 store.ConfigureSource* 装配。
+go test -count=1 ./internal/store/ -run 'TestHfqBarsAdj|TestConfigureSourceSingleEntry' 2>&1 | grep -E '^(--- FAIL|FAIL|ok)'
+grep -q 'ORDER BY a.trade_date DESC LIMIT 1), 1) AS adj' internal/store/store.go || { echo "--- FAIL: §P0-A 因子前向填充子查询丢失（后复权又退化成不复权）"; exit 1; }
+# 负锁：baostock 侧 daily×adj_factor 的等值 JOIN 绝迹。ths 侧（ths_adj_factor 日累计全覆盖表）
+# 等值语义正确，由 allow-legacy-adj-join-eq 显式豁免——把两个同名 JOIN 一起判红会造出永久性假红。
+if grep -qE 'FROM daily d LEFT JOIN adj_factor a ON a\.ts_code=d\.ts_code AND a\.trade_date=d\.trade_date' internal/store/store.go; then
+	echo "--- FAIL: §P0-A 旧等值 JOIN 复活（除权日之外因子恒为 1）"; exit 1; fi
+[ "$(grep -c 'trade_date=b\.trade_date' internal/store/store.go || true)" -eq 1 ] || { echo "--- FAIL: 等值因子 JOIN 处数≠1（ths 日累计表那一处之外又冒出一处），§P0-A"; exit 1; }
+# 路由唯一入口：导出变量形态绝迹 + 任何进程不得直改 + 装配点覆盖 8 个入口文件。
+if grep -qE '^var (PrimarySourceThsDaily|ThsFactorsReady) ' internal/store/source_routing.go internal/store/store.go; then
+	echo "--- FAIL: 路由开关又被导出成包级变量（cmd 可绕过唯一入口裸赋值，§P0-A）"; exit 1; fi
+if grep -rn 'store\.PrimarySourceThsDaily\|store\.ThsFactorsReady' --include='*.go' cmd internal 2>/dev/null | grep -q .; then
+	echo "--- FAIL: 又出现 store.PrimarySourceThsDaily 直改（§P0-A 唯一入口失效）"; exit 1; fi
+[ "$(grep -rlE 'store\.ConfigureSource' --include='*.go' cmd internal | wc -l | tr -d ' ')" -ge 8 ] || { echo "--- FAIL: 路由装配点 < 8 个文件（有进程又走默认旧表口径）"; exit 1; }
+echo "ok - §ADJ 专项守卫通过（行为锁 3 例 + 静态锁 5 道 + 负锁 3 道）"
+
+echo "==> 72 §KLINE-CHAIN-3 日K三级兜底链：腾讯主源 + 东财降到复权链末尾 + 库内日K四道守卫（抄母仓 2026-09-23 夜间批）..."
+# 现象：腾讯与东财两条复权腿同时不通 → fetchDayKLine 只剩"带标记的不复权兜底"，而 §H3 的守卫
+#       正确地拒绝让不复权序列进 md.KLines → 日K为空、吃日K的战法整轮零分，当日只出不依赖
+#       日K的战法信号。定性："报警没用，兜住才是"——所以本条不是加告警，是把第三条腿做实。
+# 三条前置：① 链序 腾讯(仅qfq) → 东财(qfq，降级但不摘掉) → 库内日K → 不复权(带标记)；
+#       ② 库内价是后复权，必须按实时昨收定锚归一 + 量纲(手→股) + 新鲜度 + 丢当日行，
+#          四道守卫任一不过即拒用（锚错位的序列比空序列更坏：整体平移却不报错）；
+#       ③ 库内腿靠引擎注入才有数据——装配漏掉时表现与"根本没有兜底"完全一致（静默跳过）。
+go test -count=1 ./internal/strategy_engine/ -run 'TestFetchDayKLine|TestStoreDayKLine|TestCachedKLine|TestLastCloseSkipsStoreLeg|TestApplyDayKLine' 2>&1 | grep -E '^(--- FAIL|FAIL|ok)'
+go test -count=1 ./internal/engine/ -run 'TestDayBarsLookup' 2>&1 | grep -E '^(--- FAIL|FAIL|ok)'
+# 链序锁（行号严格递增比文本断言可靠；沿用 54 的滤注释姿势）：腾讯 < 东财 < 库内 < 新浪。
+K3_TC=$(grep -n 'GetTencentKLine(code, 120)' internal/strategy_engine/engine.go | grep -vE '^[0-9]+:[[:space:]]*(//|\*)' | head -1 | cut -d: -f1 || true)
+K3_EM=$(grep -n 'GetKLine(code, "101", 120)' internal/strategy_engine/engine.go | grep -vE '^[0-9]+:[[:space:]]*(//|\*)' | head -1 | cut -d: -f1 || true)
+K3_DB=$(grep -n 'e.storeDayKLine(code, prevClose)' internal/strategy_engine/engine.go | grep -vE '^[0-9]+:[[:space:]]*(//|\*)' | head -1 | cut -d: -f1 || true)
+K3_SINA=$(grep -n 'GetSinaKLine(code, 120)' internal/strategy_engine/engine.go | grep -vE '^[0-9]+:[[:space:]]*(//|\*)' | head -1 | cut -d: -f1 || true)
+[ -n "$K3_TC" ] && [ -n "$K3_EM" ] && [ -n "$K3_DB" ] && [ -n "$K3_SINA" ] \
+	|| { echo "--- FAIL: 日K四条腿少了一条（§KLINE-CHAIN-3 链序锁失效）"; exit 1; }
+[ "$K3_TC" -lt "$K3_EM" ] && [ "$K3_EM" -lt "$K3_DB" ] && [ "$K3_DB" -lt "$K3_SINA" ] \
+	|| { echo "--- FAIL: 日K链序回退（必须 腾讯→东财→库内→不复权；东财不得被摘掉，也不得排到库内腿之后）"; exit 1; }
+# 东财降级但仍在场："降到复权链末尾、不摘掉"，摘掉等于少一条独立复权源。
+grep -q 'e.bumpKLineSrc("东财")' internal/strategy_engine/engine.go \
+	|| { echo "--- FAIL: 东财复权腿被摘掉（裁决是降级不是删除）"; exit 1; }
+# 库内腿四道守卫（缺一道即"错锚/错量纲/陈旧K/当日半成品"进因子计算）。
+grep -q 'raw\[len(raw)-1\].Date.Format("20060102") >= today' internal/strategy_engine/engine.go \
+	|| { echo "--- FAIL: 守卫⓪（丢当日及未来日期的行）丢失——实时昨收锚当日半成品K会把今天涨幅摊进整条基准"; exit 1; }
+grep -q 'scale := prevClose / last.Close' internal/strategy_engine/engine.go \
+	|| { echo "--- FAIL: 守卫①（按实时昨收定锚归一）丢失——后复权价会整体抬高 LastClose/止损价"; exit 1; }
+grep -q 'lotsToShares' internal/strategy_engine/engine.go \
+	|| { echo "--- FAIL: 守卫②（库内 Vol 手→股）丢失"; exit 1; }
+grep -q 'const storeBarsMaxStale' internal/strategy_engine/engine.go \
+	|| { echo "--- FAIL: 守卫③（新鲜度上限）常量丢失——夜间同步断了会长期用旧K"; exit 1; }
+grep -q 'if prevClose <= 0 {' internal/strategy_engine/engine.go \
+	|| { echo "--- FAIL: 无锚（昨收取不到）不再拒用库内腿（宁可无兜底也不出错锚）"; exit 1; }
+# 拒用必须留痕：noteStoreBarsRejected 至少覆盖 无历史序列/末根非法/scale 非法/过期 四类分支。
+K3_REJ=$(grep -c 'noteStoreBarsRejected(' internal/strategy_engine/engine.go || true)
+[ "${K3_REJ:-0}" -ge 5 ] || { echo "--- FAIL: 库内腿拒用留痕只剩 ${K3_REJ:-0} 处（<5）——兜底静默失效不可见"; exit 1; }
+# 装配锁：库内腿靠注入取数，装配点漏了就是永久静默跳过（形态同"没有兜底"）。
+grep -q 'strategyEngine.SetDayBarsLookup(dayBarsLookup.Lookup)' cmd/quant/main.go \
+	|| { echo "--- FAIL: 库内日K读取器未注入引擎（兜底腿形同虚设且零报错）"; exit 1; }
+grep -q 'func (l \*DayBarsLookup) Lookup' internal/engine/day_bars_lookup.go \
+	|| { echo "--- FAIL: 库内日K读取器实现丢失"; exit 1; }
+# 缓存锁：命中缓存时必须回查昨收锚（锚一天一换，沿用旧锚=整条基准错位）。
+grep -q 'func (ent \*klineCacheEntry) cacheReusable(prevClose float64) bool' internal/strategy_engine/engine.go \
+	|| { echo "--- FAIL: 日K缓存的锚校验函数丢失"; exit 1; }
+grep -q 'ent.cacheReusable(prevClose)' internal/strategy_engine/engine.go \
+	|| { echo "--- FAIL: 缓存命中路径不再校验昨收锚（跨轮换锚后仍拿旧序列）"; exit 1; }
+# 负锁①：库内腿只读——兜底链里绝不允许出现写库调用（按「到下一个顶层 func」圈定函数体，
+# 比固定行窗口可靠；滤注释行，防打死"为何只准读"的说明）。
+if LC_ALL=C awk '/^func \(e \*Engine\) storeDayKLine/{f=1;next} /^func /{if(f)exit} f' internal/strategy_engine/engine.go \
+	| grep -vE '^[[:space:]]*//' | grep -qE 'UPDATE |DELETE |INSERT |\.Exec\('; then
+	echo "--- FAIL: 库内日K腿里出现写库调用（打分链取数只准读）"; exit 1; fi
+# 负锁②：不复权兜底不得重新进 KLines（§H3 的收口成果不许被本批"加兜底"顺手抵消）。
+if grep -nE 'md\.KLines = .*GetSinaKLine|md\.KLines = .*GetTHSKLine' internal/strategy_engine/engine.go | grep -vE '^[0-9]+:[[:space:]]*(//|\*)' | grep -q .; then
+	echo "--- FAIL: 不复权腿又直写 md.KLines（除权日因子失真复活，§H3）"; exit 1; fi
+echo "ok - §KLINE-CHAIN-3 守卫通过（行为锁 2 组 + 链序锁 2 + 四道守卫锁 5 + 留痕计数锁 1 + 装配锁 2 + 缓存锁 2 + 负锁 2）"
+
+echo "==> 73 §ADJ-BASIS 复权口径位进研究断点键（抄母仓，防「修好了但结论没重算」）..."
+# resume_key 原本只含 区间/参数/股票池，**不含数值口径**。于是 §ADJ（因子前向填充）这种
+# "入口不变、数值全变"的修复根本不会让旧断点失效——夜间链照旧逐窗命中改前装配好的面板并跳过
+# 重算，新基线形同没上。修法是把口径折进 key（断点表自己的注释就写着"靠 key 轮换失效"），
+# 而不是去生产库删行。
+for site in internal/research/windowed.go internal/research/pattern.go; do
+	grep -qF 'adjBasisTag' "$site" \
+		|| { echo "--- FAIL: $site 的断点键不再携带复权口径位（复权修复后夜间链会照旧复用改前面板）"; exit 1; }
+done
+# 三处键生成点逐点核对（discoveryResumeKey / pfac-dedup / 形态 dp），漏一处就等于那一路永不重算。
+grep -qE 'return fmt\.Sprintf\("df\|.*%s%s"' internal/research/windowed.go \
+	|| { echo "--- FAIL: 因子发现主键 df| 模板丢失口径位"; exit 1; }
+grep -qE '"pfac-dedup:" \+ start \+ ":" \+ end \+ adjBasisTag' internal/research/windowed.go \
+	|| { echo "--- FAIL: 逐因子去重缓存键 pfac-dedup 丢失口径位"; exit 1; }
+grep -qE 'fmt\.Sprintf\("dp\|.*%s%s"' internal/research/pattern.go \
+	|| { echo "--- FAIL: 形态扫描键 dp| 丢失口径位"; exit 1; }
+# 口径常量必须存在且被测试认识（改口径不 bump＝换键失败＝沿用旧面板）。
+grep -qE 'AdjBaselineVersion = "hfq-forward-fill-1"' internal/research/windowed.go \
+	|| { echo "--- FAIL: AdjBaselineVersion 常量形态变更（请同步本锁与取数口径注释）"; exit 1; }
+if ! go test ./internal/research -run 'TestDiscoveryResumeKeyCarriesAdjBasis|TestCkptRotationOnBasisBump' -count=1 >/dev/null 2>&1; then
+	echo "--- FAIL: §ADJ-BASIS 断点键回归测试未通过（旧键复用/新键不稳定）"; exit 1; fi
+echo "ok - §ADJ-BASIS 守卫通过（键位正锁 3 + 常量锁 1 + 回归测试 2）"
+
+echo "==> 74 §ADJ-BASIS-3 回测事件缓存口径位与降级保守（抄母仓）..."
+grep -qE 'PRIMARY KEY \(candidate_id, event_date, industry, adj_basis\)' internal/store/store.go \
+	|| { echo "--- FAIL: 事件缓存主键不再含 adj_basis（新旧口径数值继续互相覆盖）"; exit 1; }
+grep -q 'func (d \*DB) migrateBacktestEventResultsAdjBasis() error' internal/store/store.go \
+	&& grep -q 'd.migrateBacktestEventResultsAdjBasis()' internal/store/store.go \
+	|| { echo "--- FAIL: 旧库主键重建迁移或其调用点丢失（现网旧表升不上去）"; exit 1; }
+# 行为锁：迁移搬运守恒 / 塌行中止 / 未知主键形态降级不动表 / 新旧口径共存 / 读侧永不吐旧行 / 矩阵分桶。
+# 下限取 9（当前实跑 10 例）：任一用例失联即红，但不因新增用例而上抬门槛。
+KJ=$(go test -count=1 ./internal/store/ -run 'TestEventResults|TestEmotion' -v 2>&1 | grep -c '^--- PASS' || true)
+[ "${KJ:-0}" -ge 9 ] || { echo "--- FAIL: §ADJ-BASIS-3 行为用例只跑到 ${KJ:-0} 例（<9，迁移/降级/矩阵任一组失联）"; exit 1; }
+go test -count=1 ./internal/store/ -run 'TestEventResults' 2>&1 | grep -E '^(--- FAIL|FAIL|ok)'
+# 守恒守卫（四道，按「函数体」圈定而非全文匹配，防止只在别处出现同名文本就判绿）：
+# 重建前后必须核对行数 + 逐三元组的行数与内容长度双向 EXCEPT，缺一即"迁移自己造差异"。
+KBODY=$(LC_ALL=C awk '/^func \(d \*DB\) migrateBacktestEventResultsAdjBasis\(\) error \{/{f=1;next} f&&/^\}$/{exit} f' internal/store/store.go)
+[ -n "$KBODY" ] || { echo "--- FAIL: 迁移函数体取不到（签名改名会让本段四道锁集体失效，§ADJ-BASIS-3）"; exit 1; }
+printf '%s\n' "$KBODY" | grep -q 'EXCEPT' \
+	|| { echo "--- FAIL: §ADJ-BASIS-3 缺逐组双向 EXCEPT 内容守恒核对"; exit 1; }
+[ "$(printf '%s\n' "$KBODY" | grep -c 'COUNT(\*)' || true)" -ge 2 ] \
+	|| { echo "--- FAIL: §ADJ-BASIS-3 缺重建前后行数守恒核对"; exit 1; }
+printf '%s\n' "$KBODY" | grep -q 'markEventBasisDegraded' \
+	|| { echo "--- FAIL: §ADJ-BASIS-3 守卫不通过时未转降级模式（硬失败或悄悄继续都不可接受）"; exit 1; }
+printf '%s\n' "$KBODY" | grep -q 'SUM(LENGTH(' \
+	|| { echo "--- FAIL: §ADJ-BASIS-3 缺逐组内容长度指纹（只比行数比不出数值被换掉）"; exit 1; }
+# 降级=读未命中/写拒绝：两处都必须先看 EventBasisDegraded，且空串口径一律不当当前口径。
+grep -qE 'if adjBasis == "" \|\| d.EventBasisDegraded\(\)' internal/store/backtest_jobs.go \
+	|| { echo "--- FAIL: 读侧降级判断丢失（表结构不可用时仍查缓存=拿旧口径行当新结论）"; exit 1; }
+grep -q '改前旧证据行的哨兵值' internal/store/backtest_jobs.go \
+	|| { echo "--- FAIL: 写侧空串哨兵拒绝判据丢失（哨兵值可被当作当前口径写入）"; exit 1; }
+# 情绪×战法矩阵跨全表聚合：不过滤口径就把改前/改后两套数值平均进同一格并对外发布。
+grep -qE 'FROM backtest_event_results WHERE adj_basis = \?' internal/store/emotion_matrix.go \
+	|| { echo "--- FAIL: 情绪矩阵聚合未按口径过滤（混桶=假统计）"; exit 1; }
+grep -q 'if adjBasis == ""' internal/store/emotion_matrix.go \
+	&& grep -q 'd.EventBasisDegraded()' internal/store/emotion_matrix.go \
+	|| { echo "--- FAIL: 情绪矩阵缺「口径未装配/降级即拒绝聚合」的保守闸"; exit 1; }
+# 负锁：读侧 SQL 不得出现字面量 adj_basis=''（空串是旧证据行哨兵，永远不能当查询目标口径）。
+# 只用裸 grep 会误伤说明性文字（store.go 的注释与日志里就在描述"旧行落成 adj_basis=''"这件事，
+# 那是正确行为，不是查询条件），故滤掉 // 行注释与 log.Printf 文案两族。
+if grep -rn "adj_basis *= *''" internal/store/store.go internal/store/backtest_jobs.go internal/store/emotion_matrix.go \
+	| grep -vE ':[0-9]+:[[:space:]]*(//|\*)' | grep -v 'log\.Printf' | grep -q .; then
+	echo "--- FAIL: 出现按空串口径查询（把改前旧行当成可复用的当前口径结果）"; exit 1; fi
+# 负锁：调用方不得图省事传空串（口径位必须由 research.AdjBaselineVersion 供给）。
+if grep -rn 'ListEmotionStrategyMatrix(' internal/server/*.go | grep -vE ':[0-9]+:[[:space:]]*(//|\*)' | grep -vE 'research\.AdjBaselineVersion' | grep -q .; then
+	echo "--- FAIL: 情绪矩阵调用点未传 research.AdjBaselineVersion（口径位又变成可选参数）"; exit 1; fi
+echo "ok - §ADJ-BASIS-3 守卫通过（行为锁 2 组 + 主键锁 1 + 迁移锁 1 + 守恒锁 4 + 降级锁 2 + 聚合锁 3 + 负锁 2）"
 
 echo ""
 echo "==> 全部通过"
