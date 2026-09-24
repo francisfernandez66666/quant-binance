@@ -1582,5 +1582,26 @@ node --check web/e2e/uat_full.spec.mjs || { echo "--- FAIL: uat_full.spec.mjs �
 bash -n scripts/uat_bootstrap.sh || { echo "--- FAIL: uat_bootstrap.sh 语法未通过"; exit 1; }
 echo "ok - §UAT-PORTS 守卫通过（单源锁 1 + 口径锁 2 + 导出锁 3 + 负锁 2 + 语法锁 2）"
 
+# ══════════════════════════════════════════════════════════════════════════════
+# 67：§抄母仓-3（2026-09-24）/api/notify-test 抬档 + 频控 + 审计（母仓 bddcccb §N-2）
+# English: section 67 locks the ported notify-test admin gate, 60s throttle and opslog audit.
+# ══════════════════════════════════════════════════════════════════════════════
+echo "==> 67 §NOTIFYADMIN 全局推送探测端点抬档 + 频控（抄母仓 §N-2，2026-09-24）..."
+# 现象：/api/notify-test 在 §C9 从空 stub 升级为**逐通道实弹探测**（消息级 LevelHigh），
+# 但档位仍挂在普通登录态下 ⇒ 任何登录成员一次 POST 就能向 owner 的全部推送通道发实弹，
+# 用噪声淹没真告警（告警通道本身成为攻击面）。修法：抬 adminMiddleware + 全进程 60s 最小间隔
+# （探测打的是 server 级单例通道，按账号限流挡不住多管理员合流）+ 全路径 opslog 审计。
+go test -count=1 ./internal/server/ -run 'TestNotifyTestAdminOnlyAndRateLimited' 2>&1 | grep -q '^ok' || { echo "--- FAIL: §N-2 notify-test 行为锁未过（成员 403/首击 200/二击 429）"; exit 1; }
+grep -q '"POST /api/notify-test", s.adminMiddleware' internal/server/server.go || { echo "--- FAIL: §N-2 notify-test 抬档丢失（成员可轰炸 owner 推送通道）"; exit 1; }
+if grep -q '"POST /api/notify-test", s.authMiddleware' internal/server/server.go; then
+  echo "--- FAIL: §N-2 notify-test 又回退 authMiddleware"; exit 1; fi
+grep -q 'Retry-After' internal/server/handlers_fix.go || { echo "--- FAIL: §N-2 频控未回 Retry-After（429 无语义，调用方盲重试）"; exit 1; }
+# 审计留痕：受理与限流两条路径都必须落 opslog（事后要能回答"谁在什么时候打的"）。
+[ "$(grep -c 'opslog.Audit("notify_test"' internal/server/handlers_fix.go)" -ge 4 ] || { echo "--- FAIL: §N-2 opslog 审计点数<4（noop/无限流/无通道/实弹有一处无人知晓）"; exit 1; }
+# 空 stub 绝迹（§C9 的实探升级不得被回退掉）。
+if grep -A 3 'func (s \*Server) handleFixNotifyTest' internal/server/handlers_fix.go | grep -q 'writeJSON(w, 200, map\[string\]string{"status": "ok"})$'; then
+  echo "--- FAIL: §N-2 notify-test 又回退成永远 ok 的空 stub"; exit 1; fi
+echo "ok - §NOTIFYADMIN 专项守卫通过（行为锁 1 组 + 静态锁 4 道 + 负锁 2 道）"
+
 echo ""
 echo "==> 全部通过"

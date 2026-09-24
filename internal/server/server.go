@@ -223,6 +223,15 @@ type Server struct {
 	// 真实连通性探测（webhook/网关/ntfy 逐通道试发）。nil=独立 server 模式，接口回显 noop。
 	notifier *notify.Notifier
 
+	// §N-2（抄母仓 bddcccb，2026-09-24 移植）notify-test 进程内频控：该端点打的是 server 级单例
+	// 通知器（全局 Webhook/推送网关/ntfy 通道，非本用户配置），按账号限流挡不住多管理员合流刷
+	// owner 手机，故取**全进程最小间隔 60s** 这一最严口径——命中回 429 + Retry-After。
+	// 仅内存态（重启即清零）：探测本身无副作用持久化诉求，没必要为它落库。
+	// English: §N-2 — process-wide minimum interval (60s) for /api/notify-test; the endpoint
+	// blasts the GLOBAL channels, so the throttle is per-process rather than per-account.
+	notifyTestMu     sync.Mutex
+	notifyTestLastAt time.Time // 最近一次被受理的探测时刻（零值=从未）
+
 	// fngSource §ENH-A1 恐慌贪婪指数（FNG）证据闭包：由装配层经 SetFNGSource 注入，
 	// /api/binance/state 的 "fng" 节唯一数据腿。nil=零配置零行为（响应不含该节，
 	// 前端按"无数据"渲染）；闭包只读缓存不触网（出呼节奏归装配层，见 data.FNGClient）。
@@ -786,7 +795,12 @@ func (s *Server) registerRoutes() {
 	// 触实盘下单（内部本已 admin 闸）——路由整体升 adminMiddleware，成员点「忽略」不再能
 	// 静默改写他人信号簿；前端信号页忽略按钮对成员隐藏（见 web 侧 isForbidden 兜底）。
 	s.mux.HandleFunc("POST /api/action", s.adminMiddleware(s.handleFixAction))
-	s.mux.HandleFunc("POST /api/notify-test", s.authMiddleware(s.handleFixNotifyTest))
+	// §N-2（抄母仓 bddcccb，2026-09-24 移植）档位抬升：/api/notify-test 打的是 server 级单例
+	// 通知器（全局 Webhook/推送网关/ntfy 通道，非本用户配置），消息级 LevelHigh——此前只挂
+	// authMiddleware，任何登录成员一次 POST 就能向 owner 全部推送通道发实弹，可用噪声淹没真
+	// 告警（§C9 把空 stub 升级成真探测时漏抬的档位）。web/src 对该端点零调用，抬 admin 不破坏
+	// 现网流程；配套进程内 60s 最小间隔频控 + opslog 审计（见 handleFixNotifyTest）。
+	s.mux.HandleFunc("POST /api/notify-test", s.adminMiddleware(s.handleFixNotifyTest))
 	// 实盘交易（AUTO_TRADING_PLAN M1）：持仓页实盘 tab 拉真实持仓/建议/执行 + 网关回报/状态。
 	// English: live trading (AUTO_TRADING_PLAN M1) — live tab real positions/advice/execute + gateway report/state.
 	// §GAP1.8/1.10 实盘端点收权：实盘账本/建议/手动执行仅 admin（单一实盘账户归属老板账号，
