@@ -2,14 +2,14 @@
 // 聚合展示首页核心数据：策略信号统计、热门个股、宏观日历、IPO、热门板块、
 // 最新资讯、按战法胜率归因、数据源健康与实盘链路状态。
 // 使用 TDesign React 组件（Card / Table / Tag / Button / Dialog）。
-import React, { useState, useEffect, useMemo, useRef } from 'react'
+import React, { useState, useEffect, useMemo, useRef, useSyncExternalStore } from 'react'
 import { Card, Table, Tag, Button } from 'tdesign-react'
 import * as api from '../api/index.js'
 import { on } from '../sseBus.js'
 import { createStaleGuard } from '../utils/staleGuard.js' // §M-10 轮询后到丢弃
 // §QMT-FROZEN：系统卡「实盘链路」行走三态裁决（frozen/off/down/live）——
 // 冻结是"这条链路不存在"，不是"接口暂时没数据"，两者必须说不同的话。
-import { gatewayVerdict, LINK_FROZEN, FROZEN_HINT_SHORT } from '../gatewayLinkState'
+import { gatewayVerdict, LINK_FROZEN, FROZEN_HINT_SHORT, subscribeCnMaster, getCnMaster } from '../gatewayLinkState'
 import LogModal from '../components/LogModal.jsx'
 import Disclaimer from '../components/Disclaimer.jsx'
 import IcpFooter from '../components/IcpFooter'
@@ -118,6 +118,10 @@ export default function Dashboard() {
   const [strategyStats, setStrategyStats] = useState({})
   // 实盘/QMT 链路状态
   const [qmtState, setQmtState] = useState(null)
+  // §QMT-FROZEN-Z4：冻结裁决的另一半输入——App 轮询来的 A股总开关。必须走订阅而不是只在首帧
+  // 读一次：网关 503 时 qmtState 永远不再变，只看 [qmtState] 的 useMemo 就再也不会重算，
+  // 冻结行会在界面上静默消失（正是本用例要防的形态）。
+  const cnMaster = useSyncExternalStore(subscribeCnMaster, getCnMaster, getCnMaster)
 
   // 主数据刷新定时器（§F5 每 10s 兜底轮询，实时性靠 SSE）
   const timer = useRef(null)
@@ -173,7 +177,7 @@ export default function Dashboard() {
     parts.push(s.mode === 'auto' ? '自动' : '手动')
     parts.push(s.tripped ? '⚠熔断' + (s.trip_reason ? ':' + s.trip_reason : '') : '从未触发')
     return parts.join(' ')
-  }, [qmtState])
+  }, [qmtState, cnMaster]) // cnMaster 必须在依赖里：见上方 useSyncExternalStore 处的 Z4 说明
 
   // 加载实盘/QMT 状态（接口异常不阻断整页）
   // §M-10：15s 轮询与可见性恢复触发可交错，旧响应后到不得覆盖新快照。

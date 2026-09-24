@@ -12,9 +12,25 @@
 
 let cnMaster = null
 
-// setCnMaster 只认显式布尔（与 App.jsx 对 /api/status 的读法一致），其余值归 null=未知。
+// 订阅者集合：cn_master 刻意不装进 React 状态容器（避免再引一套全局 store），但"缓存变了"
+// 这件事必须能叫醒把它读进 useMemo 依赖的组件。缺这一腿会出 Z4 抓到的形态：
+// 仪表盘首帧在 App 的状态轮询到达之前算出 qmtLine=''（此时 cnMaster 还是 null=未知），
+// 而网关 503 时 qmtState 永远不再变化 → useMemo 永不重算 → 「实盘链路」整行静默消失，
+// 恰好复刻 §LINTGATE 那条"链路行永不渲染"的事故形状。
+const listeners = new Set()
+
+export function subscribeCnMaster(fn) {
+  listeners.add(fn)
+  return () => listeners.delete(fn)
+}
+
+// setCnMaster 只认显式布尔（与 App.jsx 对 /api/status 的读法一致），其余值归 null=未知；
+// 值未变化时不广播（App 每 5s 轮询一次，无变化就唤醒会造成无意义重渲染）。
 export function setCnMaster(v) {
-  cnMaster = typeof v === 'boolean' ? v : null
+  const next = typeof v === 'boolean' ? v : null
+  if (next === cnMaster) return
+  cnMaster = next
+  for (const fn of listeners) fn()
 }
 
 export function getCnMaster() {

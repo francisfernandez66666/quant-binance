@@ -23,7 +23,11 @@
 #     + 2026-09-24 §抄母仓 可抄榜批（母仓分叉后锤实的 8 项缺陷按序移植：§DISCIPLINE 延持终态失明/§PICKILL-SCOPE 跨 checkout 误杀/§UAT-PORTS e2e 端口单源/§NOTIFYADMIN 推送探测端点收权/§ALERTROUTE 指标告警出站+7×24 节拍/§DEADGAUGE 死规则通用守卫，见 64~69）
 #     + 2026-09-24 §抄母仓 可抄榜项 6（§STRATEGY-MERGE 战法参数并发保存稀疏 merge + 版本冲突 409，见 70）
 #     + 2026-09-24 §抄母仓 可抄榜项 7（日K复权口径捆绑批，四节同批生效缺一不可：§ADJ 因子前向填充+路由唯一入口 / §KLINE-CHAIN-3 日K三级兜底链 / §ADJ-BASIS 口径位进研究断点键 / §ADJ-BASIS-3 事件缓存口径位与降级保守，见 71~74）
-#     + 2026-09-24 §抄母仓 可抄榜项 8（§LINTGATE 前端未定义符号静态门禁：no-undef 锁 error + 实盘链路渲染行为锁，见 75）
+#     + 2026-09-24 §抄母仓 可抄榜项 8（§LINTGATE 前端未定义符号静态门禁：no-undef 锁 error + 实
+#     + 2026-09-24 §CN-FREEZE 后续本地接线批（§OPSLOAD 首尔链运维装载步 + §QMT-FROZEN 链路冻结三态
+#       改口（含浏览器端用例），见 §43/§75）+ §ADJ-BASIS-2/-2P 复权口径可见性收口（母仓 20e0449
+#       已落地后按单向顺序搬齐：落盘盖章/载入判 stale/实盘 fail-close 闸/接口两腿/前端红标/两条 p1 告警，见 76）
+# ...盘链路渲染行为锁，见 75）
 # ...
 # §全链路 UAT 修复批（2026-09-18 §UAT_FULLCHAIN_VERIFY）专项（见 11/11）：
 #   费用腿       ：成交回报 fee/stamp_tax 五路径透传（xt 回调/桥行/网关装配/mock/Go 落库），
@@ -2053,6 +2057,22 @@ if ! ( cd web && npx eslint src --quiet ); then
 # 行为锁：三态裁决语义单测 + 量化页冻结态渲染回归（含「按钮保留但禁用、点了不发切换请求」）。
 if ! ( cd web && npx vitest run src/__tests__/gateway_link_state.test.js src/__tests__/quant_frozen_panel.test.jsx ) >/dev/null 2>&1; then
 	echo "--- FAIL: §QMT-FROZEN 三态裁决/冻结面板行为锁未通过"; exit 1; fi
+# 浏览器端行为锁的**静态半边**（实跑半边在 nightly-e2e 与本仓收口批的 playwright 全量里）：
+# 为什么要单独立锁——vitest 里 api 整体是 mock 的，它证明不了 App.jsx 那条 cn_master 转发腿在
+# 真 bundle/真路由/真 fetch 层下仍成立；那条腿一断，三处展示位在线退回假活而组件测试照绿。
+[ -f web/e2e/qmt_frozen.spec.mjs ] || { echo "--- FAIL: §QMT-FROZEN 浏览器端用例丢失（组件 mock 挡不住转发腿断裂）"; exit 1; }
+node --check web/e2e/qmt_frozen.spec.mjs || { echo "--- FAIL: qmt_frozen.spec.mjs 语法未通过"; exit 1; }
+# 正锁①：三句"错误借口"每句都必须有一条 toHaveCount(0) 负断言（缺一句就等于放行一种假活相）。
+for exc in EXCUSE_PROBE EXCUSE_REPORT EXCUSE_PATH; do
+	grep -qE "locator\(\`text=\\$\{${exc}\}\`.*toHaveCount\(0\)" web/e2e/qmt_frozen.spec.mjs \
+		|| { echo "--- FAIL: §QMT-FROZEN 浏览器端缺「${exc}」的绝迹断言"; exit 1; }
+done
+# 正锁②：打桩必须自证"页面真读过这份冻结快照"（hits.status > 0）——否则桩没生效时后面的绿全是假绿。
+[ "$(grep -c 'expect(hits.status' web/e2e/qmt_frozen.spec.mjs)" -ge 3 ] \
+	|| { echo "--- FAIL: §QMT-FROZEN 浏览器端桩命中自证不足（<3 处：量化/持仓/概览各一）"; exit 1; }
+# 负锁：禁止"连不上就 skip"的软跳过形态——它会对着同机另一套栈或空端口静默放行（§GAP 实测踩过的坑）。
+if grep -qE 'test\.skip\(!' web/e2e/qmt_frozen.spec.mjs; then
+	echo "--- FAIL: qmt_frozen.spec.mjs 出现无条件软跳过（连不上即静默放行，用例形同不存在）"; exit 1; fi
 # 等值锁（形态无关，故用 python 而非固定 grep 串）：
 #   ①三处展示位（量化链路卡+委托卡 / 持仓实盘头部 / 仪表盘系统行）必须全部经 gatewayVerdict
 #     取裁决——任一页回落到自己写 `enabled ? 已启用` 的二态判断即红（那就是本批修掉的病灶）；
@@ -2117,6 +2137,189 @@ if bad:
 print("ok - §QMT-FROZEN 等值锁通过（三态单源 3 展示位 + cn_master 转发腿 + 判定顺序 + config.json 口径）")
 PY
 echo "ok - §LINTGATE 守卫通过（静态锁 5 道 + 行为锁 2 组 + 负锁 1 道 + §QMT-FROZEN 等值锁 + lint 实跑）"
+
+echo "==> 76 §ADJ-BASIS-2/-2P 复权口径可见性收口（抄母仓 20e0449，公共层单向顺序：母仓先落地→本仓再抄）..."
+# 现象：换过复权口径（§ADJ 后复权因子前向填充）之后，历史落盘的寻优/参数产物仍带着**旧口径**拟合出来的
+#       weights/阈值，却被当成"当前口径的结果"继续被前端展示、被审批链消费——项7 只搬了"把口径版本位塞进
+#       缓存键/断点键"那一半，另一半是**把口径显式盖章进产物、载入时判过期、并暴露给前端/接口/告警**。
+# 关键不变式（缺一条即回到"旧口径产物被当现口径消费"的静默错账）：
+#   ①口径版本号只有一个真值，且 Go 与 JS 两份副本必须逐字相等（前端只拿字符串比对，不比对就永远不显红标）；
+#   ②落盘时盖章（写侧 2 处）+ 载入时判 stale（读侧两侧各一组刷新）+ 实盘注入唯一闸（fail-close 2 处）；
+#   ③判定位 StaleAdjBasis 是**派生位**，绝不落盘（一旦落盘，改版本口径后旧文件里的 false 会永久自证清白）；
+#   ④接口把 adj_basis/stale_adj_basis 两条腿都回给前端，前端对**因子与形态一视同仁**（半边盲区=只给因子
+#     挂红标=形态侧继续假活，那是本族在原仓被踩出来的第二个坑）。
+# 行为锁：4 个 Go 测试文件 + 1 个 vitest 用例（全部从母仓逐字节复制，改动=偏离母仓，须先回母仓落地）。
+if ! ( go test -count=1 ./internal/research/ -run 'AdjBasis|StaleAdj' >/dev/null 2>&1 ); then
+	echo "--- FAIL: §ADJ-BASIS-2 落盘盖章/载入判 stale 行为锁未通过（internal/research）"; exit 1; fi
+if ! ( go test -count=1 ./internal/server/ -run 'StaleAdjBasis' >/dev/null 2>&1 ); then
+	echo "--- FAIL: §ADJ-BASIS-2 接口载荷两腿（adj_basis/stale_adj_basis）行为锁未通过"; exit 1; fi
+if ! ( go test -count=1 ./internal/config/ -run 'StaleAdjBasis|StaleBasis' >/dev/null 2>&1 ); then
+	echo "--- FAIL: §ADJ-BASIS-2 处置档（shadow|disable + 未知值归一）行为锁未通过"; exit 1; fi
+if ! ( go test -count=1 ./internal/metrics/ -run 'StaleBasis' >/dev/null 2>&1 ); then
+	echo "--- FAIL: §ADJ-BASIS-2 两条 p1 告警行为锁未通过"; exit 1; fi
+if ! ( cd web && npx vitest run src/__tests__/library_adj_basis_badge.test.jsx >/dev/null 2>&1 ); then
+	echo "--- FAIL: §ADJ-BASIS-2 前端红标渲染行为锁未通过"; exit 1; fi
+# 常量单源与跨语言等值（Go 侧三段拼接 + JS 侧一份副本必须同值）。
+grep -q 'const AdjBaselineVersion = "hfq-forward-fill-1"' internal/research/windowed.go \
+	|| { echo "--- FAIL: 口径版本常量真值被改动（改它=全体历史落盘产物一律判 stale，属口径迁移不是改文案）"; exit 1; }
+grep -q 'const AdjBasisMarker = "|adj=" + AdjBaselineVersion' internal/research/windowed.go \
+	|| { echo "--- FAIL: 标记串不再由版本常量拼接（marker 与常量脱钩=断点键与展示口径两套真值）"; exit 1; }
+grep -q 'var adjBasisTag = AdjBasisMarker' internal/research/windowed.go \
+	|| { echo "--- FAIL: adjBasisTag 未引用 AdjBasisMarker（回到字面量复制形态，改版本必漏一处）"; exit 1; }
+JS_ADJ=$(grep -oE "CURRENT_ADJ_BASELINE = '[^']*'" web/src/pages/Research.jsx | sed "s/.*'\\(.*\\)'/\\1/" || true)
+[ "$JS_ADJ" = "hfq-forward-fill-1" ] \
+	|| { echo "--- FAIL: 前端 CURRENT_ADJ_BASELINE（现为「${JS_ADJ}」）与 Go 侧口径版本不等值（红标永不出现）"; exit 1; }
+# 盖章点与字段计数（写侧 2 / 落盘字段 2 / 派生位不落盘 2）。
+[ "$(grep -cF 'AdjBasis: AdjBaselineVersion' internal/research/apply.go || true)" -eq 2 ] \
+	|| { echo "--- FAIL: 落盘盖章点不再是 2 处（因子/形态各一处写入，少一处=那一侧产物永远无口径）"; exit 1; }
+[ "$(grep -cF 'json:"adj_basis,omitempty"' internal/research/apply.go || true)" -eq 2 ] \
+	|| { echo "--- FAIL: adj_basis 落盘字段不再是 2 处（与盖章点必须成对）"; exit 1; }
+[ "$(grep -cF 'StaleAdjBasis bool `json:"-"`' internal/research/apply.go || true)" -eq 2 ] \
+	|| { echo "--- FAIL: 判定位 json:\"-\" 丢失（派生位一旦落盘，旧文件里的 false 会永久自证清白）"; exit 1; }
+# 载入侧刷新与实盘注入闸（读侧刷新各 ≥6 个返回路径、fail-close 闸恰好 2 处——第 3 处=有人新开一条注入腿）。
+[ "$(grep -c 'markStaleAdjBasis(' internal/research/apply.go || true)" -ge 7 ] \
+	|| { echo "--- FAIL: 因子侧载入刷新点少于 1 定义 + 6 返回路径（漏一个返回路径=那条路径永远不判 stale）"; exit 1; }
+[ "$(grep -c 'markStaleAdjBasisPatterns(' internal/research/apply.go || true)" -ge 7 ] \
+	|| { echo "--- FAIL: 形态侧载入刷新点少于 1 定义 + 6 返回路径（§ADJ-BASIS-2P 对称腿丢失）"; exit 1; }
+[ "$(grep -c 'failClose && .*StaleAdjBasis' internal/research/apply.go || true)" -eq 2 ] \
+	|| { echo "--- FAIL: 实盘注入的 stale 硬闸不是恰好 2 处（因子/形态各一，多一处=有人新开注入腿绕过判定）"; exit 1; }
+# 告警与路由：两条规则名/指标名逐字对齐，且显式 RoutePush（靠 DefaultRoute 兜=推送面静默漂移）。
+[ "$(grep -c 'applied_factor_stale_basis\|applied_pattern_stale_basis' internal/metrics/alerter.go || true)" -eq 2 ] \
+	|| { echo "--- FAIL: 两条 stale 口径告警规则丢失（发现面没了，只剩展示面）"; exit 1; }
+[ "$(grep -c 'applied_factor_stale_basis\|applied_pattern_stale_basis' internal/metrics/alert_routing.go || true)" -eq 2 ] \
+	|| { echo "--- FAIL: 两条告警的 RoutePush 显式路由丢失（改走 DefaultRoute=推送面不可预期）"; exit 1; }
+# 配置键与装配（活回调：热重载后处置档要跟着变，静态值=改配置不生效还得不到提示）。
+[ "$(grep -cF 'json:"stale_adj_basis_action' internal/config/config.go || true)" -eq 1 ] \
+	|| { echo "--- FAIL: rules.research.stale_adj_basis_action 配置键不是唯一（两处定义=改一处没改另一处）"; exit 1; }
+grep -q 'ConfigureStaleAdjBasisActionFunc' cmd/quant/main.go \
+	|| { echo "--- FAIL: 装配未用活回调版（处置档热重载不生效）"; exit 1; }
+if grep -qE 'ConfigureStaleAdjBasisAction\(' cmd/quant/main.go; then
+	echo "--- FAIL: main.go 里出现静态一次性注入（与活回调并存会互相覆盖，留一条腿）"; exit 1; fi
+# 接口两腿 + 前端渲染点唯一（红标出现两次=卡片重复挂载，判据本身也可能错）。
+[ "$(grep -cF 'json:"adj_basis,omitempty"' internal/server/library.go || true)" -eq 1 ] \
+	&& [ "$(grep -cF 'json:"stale_adj_basis,omitempty"' internal/server/library.go || true)" -eq 1 ] \
+	|| { echo "--- FAIL: /api/research/library 的口径两腿不齐（前端拿不到就是永远不标红）"; exit 1; }
+[ "$(grep -cF '<AdjBasisStaleTag' web/src/pages/Research.jsx || true)" -eq 1 ] \
+	|| { echo "--- FAIL: 前端红标渲染点不是恰好 1 处"; exit 1; }
+# 负锁：派生位禁止落盘 tag（internal/research 侧；server/library.go 的展示字段是合法的，别误圈）。
+if grep -rnF 'json:"stale_adj_basis' internal/research/*.go | grep -v '_test' | grep -q .; then
+	echo "--- FAIL: internal/research 里给派生位加了落盘 tag（旧文件里的 false 会永久自证清白）"; exit 1; fi
+# 负锁（切片版，防半边盲区）：isAdjBasisStale 函数体内不得出现按 kind 分流——
+# 因子与形态必须同规。全仓 grep 'kind ===' 会命中无关的候选过滤（实测 3 处），故按函数体切片判。
+python3 - <<'PY' || { echo "--- FAIL: §ADJ-BASIS-2 前端判定盲区负锁未通过"; exit 1; }
+import pathlib, re, sys
+src = pathlib.Path("web/src/pages/Research.jsx").read_text(encoding="utf-8")
+i = src.find("export function isAdjBasisStale")
+if i < 0:
+    print("isAdjBasisStale 函数丢失：前端不再单点判定口径"); sys.exit(1)
+body = src[i:i + src[i:].find("\n}\n") + 3]
+if re.search(r"\bkind\b|'factor'|'pattern'", body):
+    print("isAdjBasisStale 内出现按 kind 分流（只给因子判=形态侧继续假活，本族在原仓踩过的盲区）"); sys.exit(1)
+print("ok - 前端口径判定对因子/形态一视同仁（函数体内无 kind 分流）")
+PY
+# 存在性锁：母仓随族带来的 5 个行为测试文件缺一不可（删测试=拆护栏）。
+for tf in internal/research/adj_basis_stamp_test.go internal/server/library_adj_basis_test.go \
+          internal/config/research_stale_basis_test.go internal/metrics/stale_basis_alert_test.go \
+          web/src/__tests__/library_adj_basis_badge.test.jsx; do
+	[ -f "$tf" ] || { echo "--- FAIL: §ADJ-BASIS-2 行为测试文件丢失 $tf"; exit 1; }
+done
+echo "ok - §ADJ-BASIS-2 守卫通过（行为锁 5 组 + 跨语言等值 1 + 计数锁 9 + 配置/装配锁 3 + 负锁 3 + 存在性锁 5）"
+
+echo "==> 77 §UAT-SESSION + §Z4 e2e 会话单源与冻结位订阅腿（2026-09-25 收口批）..."
+# 现象①（测试面，34 条伪红）：全套 Playwright 多进程并发时各 spec 自行 POST /api/auth/login，
+#       后端每账号只留 8 条会话（internal/auth/auth.go maxSessions）并 FIFO 淘汰最旧——被踢掉的
+#       恰是 auth.setup 建的那条浏览器会话 → 接口 401 → 前端 clearAuth() → localStorage 里 token
+#       变 null → 表现为"headers[0].value: expected string, got object""登录后才有的卡片不见了"。
+#       红得像产品鉴权缺陷，源码里却什么都没有；今天新增的两份 spec 只是把这条既有隐患压过阈值。
+# 现象②（产品面，真缺陷）：概览页「实盘链路」行的 useMemo 只依赖 [qmtState]，而冻结位 cn_master
+#       是模块级缓存、由 App 的 /api/status 轮询晚于首帧写入 ⇒ 首帧算出 ''，此后网关 503 让
+#       qmtState 永不变化 ⇒ memo 永不重算 ⇒ 整行静默消失（与 §LINTGATE"链路行永不渲染"同形，
+#       成因从"未定义符号"换成"少写一个依赖"）。
+# 修法：①登录单源 web/e2e/session.mjs——每账号一份共享会话，spec 只借不登（唯一需要新会话的
+#       撤销用例显式走 freshToken，用完即弃）；②gatewayLinkState 加订阅腿，Dashboard 用
+#       useSyncExternalStore 把冻结位读进依赖。
+# 行为锁口径：先跑"测试自己"（playwright --list 解析十份 spec），再跑组件/契约用例——
+#       编译期红一律先怀疑测试侧，别拿放宽断言去掩盖。
+if ! ( cd web && npx playwright test --list >/dev/null 2>&1 ); then
+	echo "--- FAIL: e2e spec 解析/收集失败（playwright --list）——先怀疑测试自身，禁止改断言"; exit 1; fi
+if ! ( cd web && npx vitest run src/__tests__/n1_qmt_link.test.jsx src/__tests__/gateway_link_state.test.js >/dev/null 2>&1 ); then
+	echo "--- FAIL: §Z4 行为锁未通过（E5 冻结位晚到时整行自唤醒 + 订阅广播契约）"; exit 1; fi
+# 静态锁：订阅腿与依赖腿（缺一即"缓存变了没人重算"）。
+grep -q 'const cnMaster = useSyncExternalStore(subscribeCnMaster, getCnMaster, getCnMaster)' web/src/pages/Dashboard.jsx \
+	|| { echo "--- FAIL: 概览页不再经 useSyncExternalStore 订阅冻结位（Z4 形态复活）"; exit 1; }
+grep -q '\[qmtState, cnMaster\]' web/src/pages/Dashboard.jsx \
+	|| { echo "--- FAIL: qmtLine 的 useMemo 依赖缺 cnMaster（冻结位晚到时整行永不出现）"; exit 1; }
+grep -q 'for (const fn of listeners) fn()' web/src/gatewayLinkState.js \
+	|| { echo "--- FAIL: setCnMaster 不再向订阅者广播（模块缓存变了却无人知道）"; exit 1; }
+grep -q 'if (next === cnMaster) return' web/src/gatewayLinkState.js \
+	|| { echo "--- FAIL: setCnMaster 的去重丢失（App 每 5s 轮询会持续叫醒订阅方无意义重渲染）"; exit 1; }
+grep -q 'const maxSessions = 8' internal/auth/auth.go \
+	|| { echo "--- FAIL: 每账号会话上限不再是 8（e2e 共享会话的容量前提；改它须同步 session.mjs 头注释与用例）"; exit 1; }
+# 接线锁：会话单源的三端（存储/建立方/消费方）缺一不可。
+[ -f web/e2e/session.mjs ] || { echo "--- FAIL: web/e2e/session.mjs 丢失（登录单源没了，逐用例登录的淘汰风暴回来了）"; exit 1; }
+for need in 'export async function sharedToken' 'export function adoptSharedSession' 'export function resetSharedStore' 'export async function freshToken'; do
+	grep -qF "$need" web/e2e/session.mjs || { echo "--- FAIL: session.mjs 缺出口 ${need}（共享会话链断一环）"; exit 1; }
+done
+grep -q 'resetSharedStore()' web/e2e/auth.setup.mjs \
+	|| { echo "--- FAIL: auth.setup 不再清空上轮 token（陈旧 token 被复用=把淘汰伪装成权限缺陷）"; exit 1; }
+grep -q "adoptSharedSession('admin'" web/e2e/auth.setup.mjs \
+	|| { echo "--- FAIL: auth.setup 未把浏览器会话登记为共享会话（spec 借不到，只能自己登）"; exit 1; }
+grep -q 'freshToken(' web/e2e/uat_full.spec.mjs \
+	|| { echo "--- FAIL: 撤销会话用例不再用一次性 token（拿共享会话去 revoke 会踢掉整轮运行）"; exit 1; }
+# 今天新增的浏览器端用例形状锁：网关整族都要 503（只 stub state 时实盘 mock 会喂来 orders:[]
+# →「今日暂无实盘委托」假红），惰性页签要点开（不点就没有那段 DOM）。
+grep -qF "'**/api/qmt/**'" web/e2e/qmt_frozen.spec.mjs \
+	|| { echo "--- FAIL: 冻结态用例不再 stub 整个 /api/qmt 族（mock 的活数据会伪造出「正常」分支）"; exit 1; }
+grep -q "实盘持仓" web/e2e/qmt_frozen.spec.mjs \
+	|| { echo "--- FAIL: 冻结态用例不再点开「实盘持仓」页签（惰性挂载下断言打在空 DOM 上）"; exit 1; }
+# §QMT-FROZEN 文案口径同步到 e2e：熔断未触发说「从未触发」，且按卡标题定位（币安卡的
+# 「链路」行标签 + 「状态端点未上线」占位拼起来正好含"链路状态"，旧写法 strict-mode 双命中）。
+grep -q '从未触发' web/e2e/uat_full.spec.mjs \
+	|| { echo "--- FAIL: 概览/量化页 e2e 仍在断言旧文案「正常」（熔断未触发=从未触发）"; exit 1; }
+grep -q 'hasText: /\^链路状态\$/' web/e2e/uat_full.spec.mjs \
+	|| { echo "--- FAIL: 链路状态卡定位不再按标题收紧（币安接入状态卡会一起命中）"; exit 1; }
+# 负锁：注释剥离后，全仓 e2e 里字面 "/api/auth/login" 只准出现在 session.mjs 一处。
+python3 - <<'PY' || { echo "--- FAIL: §UAT-SESSION 登录单源负锁未通过"; exit 1; }
+import pathlib, re, sys
+def strip_comments(t):
+    t = re.sub(r"/\*.*?\*/", "", t, flags=re.S)
+    t = re.sub(r"^\s*//.*$", "", t, flags=re.M)
+    return t
+bad = []
+for p in sorted(pathlib.Path("web/e2e").glob("*.mjs")):
+    body = strip_comments(p.read_text(encoding="utf-8"))
+    hits = body.count("/api/auth/login")
+    if p.name == "session.mjs":
+        if hits != 1:
+            bad.append(f"session.mjs 的登录点应恰好 1 处，实际 {hits}（多处登录=会话源不止一个）")
+    elif hits:
+        bad.append(f"{p.name} 自行登录（{hits} 处 /api/auth/login）——必须改走 sharedToken/freshToken")
+    if re.search(r"\btokenCache\b", body):
+        bad.append(f"{p.name} 自建 token 缓存（逐进程登录是本次 34 条伪红的根因）")
+if bad:
+    print("\n".join(bad)); sys.exit(1)
+print("ok - e2e 登录单源：全仓只有 session.mjs 打 /api/auth/login")
+PY
+# 负锁：memo 依赖不得退回 [qmtState] 单独一员（只剥注释，避免命中说明注释里的旧写法）。
+python3 - <<'PY' || { echo "--- FAIL: §Z4 依赖负锁未通过"; exit 1; }
+import pathlib, re, sys
+t = pathlib.Path("web/src/pages/Dashboard.jsx").read_text(encoding="utf-8")
+t = re.sub(r"/\*.*?\*/", "", t, flags=re.S)
+t = re.sub(r"^\s*//.*$", "", t, flags=re.M)
+i = t.find("const qmtLine = useMemo(")
+if i < 0:
+    print("qmtLine 的 useMemo 不见了（冻结分流失去落点）"); sys.exit(1)
+deps = re.search(r"\}\s*,\s*\[([^\]]*)\]", t[i:i + 2000])
+if not deps:
+    print("qmtLine 的 useMemo 依赖数组读不到"); sys.exit(1)
+if "cnMaster" not in deps.group(1):
+    print(f"依赖数组只剩 {deps.group(1).strip()}——Z4 形态复活：冻结位晚到时整行静默消失"); sys.exit(1)
+print("ok - qmtLine 依赖含 cnMaster（订阅腿与依赖腿成对）")
+PY
+# 会话凭据落盘目录禁止入库（token 明文写进 git 就再也不是一台机器的问题了）。
+git check-ignore -q web/.auth/state.json \
+	|| { echo "--- FAIL: web/.auth 不再被忽略（共享会话 token 有进仓库的风险）"; exit 1; }
+echo "ok - §UAT-SESSION/§Z4 守卫通过（行为锁 2 组 + 静态锁 6 + 接线锁 6 + 负锁 3 + 入库卫生 1）"
 
 echo ""
 echo "==> 全部通过"

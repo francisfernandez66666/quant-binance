@@ -1,5 +1,6 @@
 // ── 自动研究页面 Research.jsx ──
 // 研究候选审批、战法库管理、回测任务中心、参数寻优与资金池纪律配置。
+// §ADJ-BASIS-2：战法库卡片对"复权口径基线已失效"的因子战法打红标（AdjBasisStaleTag）。
 // 全量使用 TDesign React 组件（Card / Table / Tag / Button / Dialog / Tabs / Select / Input）。
 import React, { useState, useEffect, useRef, useMemo } from 'react'
 import {
@@ -12,6 +13,35 @@ import BacktestConfigPanel from '../components/BacktestConfigPanel'
 import * as api from '../api/index.js'
 import { showToast, confirmDialog } from '../ui.jsx'
 
+
+// §ADJ-BASIS-2（2026-09-23）当前复权口径基线版本，与 Go 侧 internal/research/windowed.go 的
+// AdjBaselineVersion 同源——**改复权取数口径时两边一起 bump**（后端条目带着旧戳就会被判 stale）。
+const CURRENT_ADJ_BASELINE = 'hfq-forward-fill-1'
+
+// 失效判定：以后端载入侧算出的 stale_adj_basis 为准；老后端/缺字段时退到"戳不等于当前基线"。
+// §ADJ-BASIS-2P（2026-09-23）形态战法同样参与——其条件（AtrRatio14/Brk60 一类）取的就是
+// CloseHfq 派生面板，口径一换历史依据一样作废，只标因子战法会留下半边盲区。
+// English: trust the server-computed verdict; fall back to a stamp mismatch when the field is
+// absent. Patterns are covered too — their conditions read the same Hfq-derived panels.
+export function isAdjBasisStale(s) {
+  if (!s) return false
+  if (typeof s.stale_adj_basis === 'boolean') return s.stale_adj_basis
+  return s.adj_basis !== CURRENT_ADJ_BASELINE
+}
+
+// §ADJ-BASIS-2 基线口径失效标记：该战法的 weights/buy_threshold 是在 §ADJ 修正前的
+// 复权口径（HfqBars 未做前向填充 ≈ 不复权价）面板上拟合的，历史依据已失效。
+// 后端字段：GET /api/research/library 每条带 adj_basis（落盘时的口径版本）+ stale_adj_basis（载入侧判定）。
+// 导出供单测直接渲染（整页挂载 Research 需要 mock 十余个端点，与本断言无关）。
+// English: badge for strategies whose fitted parameters were derived on the pre-fix price basis.
+export function AdjBasisStaleTag({ strategy }) {
+  if (!isAdjBasisStale(strategy)) return null
+  return (
+    <Tag theme="danger" title="参数是在修正前的复权口径上拟合的：这条战法的历史依据已失效，需重跑寻优+审批（缺省仅标记告警，不停投）">
+      基线口径已失效
+    </Tag>
+  )
+}
 
 // 将小数格式化为带百分号的字符串（如 12.34%）
 function fmtPctGlobal(v) {
@@ -1339,6 +1369,8 @@ export default function Research() {
                 {canApprove && !editingName[s.id] && <Button size="small" variant="text" theme="primary" onClick={() => startRename(s)}>改名</Button>}
                 <Tag theme={s.kind === 'pattern' ? 'primary' : 'default'}>{s.kind === 'pattern' ? '形态' : '因子'}</Tag>
                 <Tag theme={s.enabled ? 'success' : 'default'}>{s.enabled ? '已启用' : '已停用'}</Tag>
+                {/* §ADJ-BASIS-2 因子战法专属：复权口径基线已失效 → 红标（形态战法不吃复权因子面板，不判） */}
+                <AdjBasisStaleTag strategy={s} />
                 <span style={{ fontSize: 11, color: 'var(--app-text-2)', marginLeft: 'auto' }}>{s.id}｜{s.applied_at}</span>
               </div>
               {/* 战法条件/因子标签：形态战法展示扫参条件，因子战法展示多空因子列表 */}

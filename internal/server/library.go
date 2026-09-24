@@ -55,6 +55,13 @@ func (s *Server) handleResearchLibrary(w http.ResponseWriter, r *http.Request) {
 		BacktestDone bool                   `json:"backtest_done"`        // 全链路回测是否已跑过（avg_excess 已回填）
 		Reason       string                 `json:"reason,omitempty"`     // 候选证据文本（样本内外 IR / 反推超额）
 		Conds        []research.PatternCond `json:"conds,omitempty"`
+		// §ADJ-BASIS-2 复权口径基线戳 + 失效判定（载入侧算出的派生值，非文件字段）。
+		// 前端据此在战法卡片上打「基线口径已失效」红标：这条战法的 weights/buy_threshold 是在
+		// §ADJ 修正前的复权面板上拟合的，参数已无成立的历史依据。
+		// English: adjustment-basis stamp + staleness verdict; the UI badges entries whose fitted
+		// parameters lost their historical basis.
+		AdjBasis      string `json:"adj_basis,omitempty"`
+		StaleAdjBasis bool   `json:"stale_adj_basis,omitempty"`
 	}
 	var out []libItem
 	stats := map[string]research.AppliedFactorEntry{}
@@ -79,6 +86,7 @@ func (s *Server) handleResearchLibrary(w http.ResponseWriter, r *http.Request) {
 			AppliedAt: e.AppliedAt, SignalCount: e.SignalCount, Win: e.Win, Loss: e.Loss, CumReturn: e.CumReturn,
 			Factors: e.Factors, Weights: e.Weights, Directions: e.Directions,
 			BuyThreshold: e.BuyThreshold, Horizon: e.Horizon, IR: e.IR, Excess: e.Excess,
+			AdjBasis: e.AdjBasis, StaleAdjBasis: e.StaleAdjBasis,
 		}
 		// 关联候选表验证信息：全样本 IC / 全链路回测超额与状态 / 证据文本（样本内外 IR、反推超额），
 		// 让战法库卡片完整展示"这条规律电脑验证过吗"。
@@ -120,6 +128,9 @@ func (s *Server) handleResearchLibrary(w http.ResponseWriter, r *http.Request) {
 			Kind: "pattern", ID: e.ID, Name: e.Name, Enabled: e.Enabled, CandID: e.CandID,
 			AppliedAt: e.AppliedAt, SignalCount: e.SignalCount, Win: e.Win, Loss: e.Loss, CumReturn: e.CumReturn,
 			Conds: e.Conds,
+			// §ADJ-BASIS-2P 形态卡与因子卡共用同一红标（条件因子同样跑在复权价上）。
+			AdjBasis:      e.AdjBasis,
+			StaleAdjBasis: e.StaleAdjBasis,
 		})
 	}
 	writeJSON(w, 200, map[string]any{"library": out})

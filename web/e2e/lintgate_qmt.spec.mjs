@@ -9,19 +9,14 @@
 // English: behavior lock for the §LINTGATE batch — with a healthy QMT status payload the overview
 // page must actually render the「实盘链路」indicator.
 import { test, expect } from '@playwright/test'
+import { sharedToken } from './session.mjs'
 
-const ADMIN = { u: process.env.E2E_USER || 'admin', p: process.env.E2E_PASS || '' }
 const API = process.env.E2E_API || 'http://localhost:18080'
 
-// token 整进程缓存一次：/api/auth/login 计入 §T-3 租户频控，全套 spec 并发时逐用例登录会挤进 429。
-let cachedTok = ''
+// token 走全栈共享会话（§UAT-SESSION）：不再自行登录。逐用例/逐进程登录会累积会话数，
+// 后端每账号只留 8 条（FIFO 淘汰最旧），被踢掉的正是 auth.setup 建的那条浏览器会话。
 async function adminToken(request) {
-  if (cachedTok) return cachedTok
-  const r = await request.post(API + '/api/auth/login', { data: { username: ADMIN.u, password: ADMIN.p } })
-  const body = await r.json()
-  expect(body.token, `admin 登录应拿到 token（status=${r.status()}）`).toBeTruthy()
-  cachedTok = body.token
-  return cachedTok
+  return sharedToken(request, 'admin')
 }
 
 test.describe('§LINTGATE 概览页实盘链路渲染', () => {

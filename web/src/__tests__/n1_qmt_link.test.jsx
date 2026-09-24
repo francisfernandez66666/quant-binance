@@ -11,8 +11,10 @@
 // English: behavior lock for the §LINTGATE batch — with a healthy QMT status payload the overview
 // page MUST render the「实盘链路」indicator; guards against another silently-swallowed
 // undefined-symbol regression that no type checker would have caught.
+// §QMT-FROZEN-Z4 增补（2026-09-25）：E4/E5 锁冻结态这一支——E4 管"冻结位已知"，E5 管
+// "冻结位比首帧晚到"（生产真实时序），后者才钉得住 useMemo 少写一个依赖的静默失效。
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
-import { render, screen, cleanup } from '@testing-library/react'
+import { render, screen, cleanup, act } from '@testing-library/react'
 import { MemoryRouter } from 'react-router-dom'
 
 const { state } = vi.hoisted(() => ({ state: {} }))
@@ -111,6 +113,24 @@ describe('§LINTGATE 概览页「实盘链路」指示渲染', () => {
     render(<MemoryRouter><Dashboard /></MemoryRouter>)
     const line = await screen.findByText(/实盘链路/, {}, { timeout: 5000 })
     expect(line.textContent).toContain('冻结维护')
+    expect(line.textContent).toContain(FROZEN_HINT_SHORT)
+  })
+
+  // E5（§QMT-FROZEN-Z4）：真正的生产时序是 **cn_master 晚于首帧到达**——App.jsx 的 /api/status
+  // 轮询在 Dashboard 挂载之后才把冻结位写进裁决模块缓存。旧写法把 cnMaster 当普通模块变量读、
+  // useMemo 只依赖 [qmtState]，而网关 503 时 qmtState 永远停在 null 不再变化 ⇒ 缓存变了也没人重算
+  // ⇒ 整行静默消失（正是 §LINTGATE 那条"链路行永不渲染"的事故形状，只是换了成因）。
+  // E4 在渲染前就置好了冻结位，看不见这个形态；本用例把它按到达顺序钉住：
+  // 首帧确实没有这一行 → 冻结位到达后必须自己冒出来。
+  it('E5 冻结位在首帧之后才到达 → 实盘链路行必须随订阅自唤醒（旧 [qmtState] 依赖下永不出现）', async () => {
+    state.impl.fetchQMTState = () => { throw Object.assign(new Error('503'), { status: 503 }) }
+    const { container } = render(<MemoryRouter><Dashboard /></MemoryRouter>)
+    // 等首个轮询 tick 落定：此时 cnMaster 仍是 null=未知，按口径整行不渲染（不是缺陷，是 E3 语义）
+    await new Promise((r) => setTimeout(r, 120))
+    expect(container.textContent).not.toMatch(/实盘链路/)
+    // App 的状态轮询此刻才到达：只写缓存、不重新挂载组件，界面靠订阅腿自己醒来
+    act(() => setCnMaster(false))
+    const line = await screen.findByText(/实盘链路/, {}, { timeout: 5000 })
     expect(line.textContent).toContain(FROZEN_HINT_SHORT)
   })
 })

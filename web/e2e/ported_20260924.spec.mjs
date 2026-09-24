@@ -11,22 +11,17 @@
 // English: HTTP-contract locks for the four ported defects (strategy-config merge/409, notify-test
 // gate+throttle, alert rules surface, adjustment-basis on the emotion matrix).
 import { test, expect } from '@playwright/test'
+import { sharedToken } from './session.mjs'
 
 const ADMIN = { u: process.env.E2E_USER || 'admin', p: process.env.E2E_PASS || '' }
 const MEMBER = { u: process.env.E2E_USER2 || 'tester', p: process.env.E2E_PASS2 || ADMIN.p }
 const API = process.env.E2E_API || 'http://localhost:18080'
 
-// token 按用户**整进程缓存一次**：/api/auth/login 受 §T-3 租户频控（默认 600 次/分钟）计量，
-// 全套 spec 并发跑时逐用例重复登录会把自己挤进 429，表现为"拿不到 token"的伪缺陷红。
-const tokenCache = new Map()
+// token 走全栈共享会话（§UAT-SESSION）：admin 与成员各复用一条会话，不再"整进程缓存一份"。
+// 为什么进程级缓存还不够：后端每账号只保留 8 条会话（FIFO 淘汰最旧），四个 worker 各缓存一份
+// 就是 4 条，加上 uat_full 逐用例登录与 auth.setup 的浏览器会话即越限——被踢掉的正是浏览器那条。
 async function tok(request, who) {
-  const key = who.u
-  if (tokenCache.has(key)) return tokenCache.get(key)
-  const r = await request.post(API + '/api/auth/login', { data: { username: who.u, password: who.p } })
-  const body = await r.json()
-  expect(body.token, `${who.u} 登录应拿到 token（status=${r.status()}）`).toBeTruthy()
-  tokenCache.set(key, body.token)
-  return body.token
+  return sharedToken(request, who === ADMIN ? 'admin' : 'member')
 }
 
 test.describe('§抄母仓-6 战法参数并发保存（稀疏合并 + 409）', () => {

@@ -12,6 +12,8 @@ import { test, expect } from '@playwright/test'
 // §M1/§F4（2026-09-22 修复批 K）：quote_source 枚举不再在本文件硬编，改读后端 golden 单源
 // （qmt_gateway/contract/quote_sources.json）；helper 内含「golden 缺失 → 显式失败」口径。
 import { loadQuoteSources } from './quote_sources.mjs'
+// §UAT-SESSION：会话统一从共享存储取（sharedToken），需要"用完即弃"的用例才现登（freshToken）。
+import { sharedToken, freshToken } from './session.mjs'
 
 // 两套账号凭据（admin=超管，tester=普通用户）与像素截图输出目录
 const ADMIN = { u: process.env.E2E_USER || 'admin', p: process.env.E2E_PASS || '' }
@@ -91,13 +93,18 @@ test.describe('像素级全页面 UAT (admin)', () => {
 
 // 交易相关分支：Quant 配置链路、Paper 撮合/战法/交易操作、消息中心与信号页交互
 test.describe('交易相关分支', () => {
-  // 验证 Quant 页链路状态卡展示 mock 网关地址、熔断态与执行路径徽标
-  test('Quant：链路状态卡显示 mock 网关+熔断正常+执行路径', async ({ page }) => {
+  // 验证 Quant 页链路状态卡展示 mock 网关地址、熔断态与执行路径徽标。
+  // §QMT-FROZEN 口径更正（2026-09-24）：健康探测一次都没跑过时熔断行显示「从未触发」，不再是
+  // 绿色「正常」——旧文案把"时间戳为零"说成机制在健康运转，属假活相。本栈跑在非冻结分支上
+  // （uat_bootstrap 写 rules.cn.enabled=true ⇒ cn_master=true），冻结分支由 qmt_frozen.spec.mjs Z1–Z5 锁。
+  test('Quant：链路状态卡显示 mock 网关+熔断从未触发+执行路径', async ({ page }) => {
     await page.goto('/#/quant')
-    const card = page.locator('.t-card', { hasText: '链路状态' })
+    // 按「卡标题」定位：旧写法 .t-card + hasText '链路状态' 会 strict-mode 双命中——币安接入状态卡的
+    // 「链路」行标签与「状态端点未上线」占位拼起来正好含"链路状态"四个字。
+    const card = page.locator('.t-card').filter({ has: page.locator('.t-card__title', { hasText: /^链路状态$/ }) })
     // 断言的是"引擎装配的网关地址 = 本次自举拉起的 mock"，故端口随环境变量取（见 §UAT-PORTS）。
     await expect(card).toContainText(new URL(MOCK_URL).host, { timeout: 15000 })
-    await expect(card).toContainText('正常')
+    await expect(card.getByText('从未触发')).toBeVisible()
     await expect(card).toContainText('miniQMT兼容')
     await expect(card.getByText('QMT桥兜底')).toBeVisible()
     await page.screenshot({ path: `${SHOT}/branch-quant-chain.png`, fullPage: true })
@@ -557,10 +564,12 @@ test.describe('全局组件分支', () => {
 // ─────────────────────────────────────────────────────────────────────
 test.describe('修复回归 · 安全与目标', () => {
   const API = process.env.E2E_API || 'http://localhost:18080'
-  // helper：走后端登录 API 换 admin token（纯 request 上下文用例复用）
+  // helper：取全栈共享的 admin 会话 token（§UAT-SESSION）。
+  // 这里**不再逐用例登录**：后端每账号只留 8 条会话（FIFO 淘汰最旧），本文件原先每条用例
+  // 登录一次，加上其它 spec 的登录，会把 auth.setup 建立的浏览器会话挤下线——表现为
+  // 「读 localStorage token → null」的一大串无关红（今天全量跑 34 红里 28 红即此形状）。
   async function adminToken(req) {
-    const r = await req.post(API + '/api/auth/login', { data: { username: ADMIN.u, password: ADMIN.p } })
-    return (await r.json()).token
+    return sharedToken(req, 'admin')
   }
 
   // D1 安全回归：admin 用户列表响应不得泄露 sessions/password_hash，且 enabled 字段显式存在
@@ -576,7 +585,10 @@ test.describe('修复回归 · 安全与目标', () => {
 
   // D7 安全回归：logout 后同一 token 立即失效（继续访问返回 401）
   test('D7：/api/auth/logout 后同 token 立即失效（401）', async ({ request }) => {
-    const tok = await adminToken(request)
+    // 必须用一次性会话（freshToken）：本用例会把这条 token 吊销。
+    // 若图省事改用共享会话（adminToken），等于当场把全栈共用的登录态吊销，
+    // 之后每条依赖 storageState 的用例都会 401——那正是 §UAT-SESSION 要消灭的形状。
+    const tok = await freshToken(request)
     const before = await request.get(API + '/api/status', { headers: { Authorization: 'Bearer ' + tok } })
     expect(before.status(), '退出前 200').toBe(200)
     const out = await request.post(API + '/api/auth/logout', { headers: { Authorization: 'Bearer ' + tok } })
@@ -824,11 +836,8 @@ test.describe('修复回归 · 运维入口与即时熔断', () => {
 
   // MT 回归：普通用户访问租户/用户列表均 403（adminMiddleware 拦截）
   test('MT：普通用户访问租户管理面 403、列用户只见 platform=false', async ({ request }) => {
-    const login = await request.post('/api/auth/login', {
-      data: { username: process.env.E2E_USER2, password: process.env.E2E_PASS2 },
-    })
-    expect(login.status(), 'tester 登录').toBe(200)
-    const tk = (await login.json()).token
+    // §UAT-SESSION：成员 token 从共享存储取（缺则登录一条并落盘），不再逐用例新建会话。
+    const tk = await sharedToken(request, 'member')
     const h = { Authorization: tk }
     const rt = await request.get('/api/tenants', { headers: h })
     expect(rt.status(), '普通用户访问租户清单应 403（adminMiddleware）').toBe(403)
@@ -944,10 +953,9 @@ test.describe('修复回归 · GAP_VERIFY_20260917 D 批', () => {
   // （仅隐藏历史卡）；现在 admin 数据端点首拉 403 即由页面主动跳转统一 /403 页——
   // 本用例改钉新语义：伪造角色 + 成员 token → 落 403，页面本体（服务器连接卡）不渲染。
   test('D-3 tester：Settings 无配置历史卡', async ({ page, context }) => {
-    // 用 tester 凭据现登（不动共享 storageState 会话）
-    const resp = await context.request.post('/api/auth/login', { data: { username: process.env.E2E_USER2 || 'tester', password: process.env.E2E_PASS2 || '' } })
-    expect(resp.ok(), 'tester 登录').toBe(true)
-    const t = (await resp.json()).token
+    // 成员 token 从全栈共享存储取（§UAT-SESSION）：只覆盖这一个页面的 localStorage，
+    // 不动 admin 的 storageState 会话，也不为它新登一条。
+    const t = await sharedToken(context.request, 'member')
     const p2 = await context.newPage()
     await p2.goto('/#/')
     await p2.evaluate((tok) => localStorage.setItem('liangzai_token', tok), t)
@@ -1101,7 +1109,10 @@ test.describe('修复回归 · §ENH-4 事件因子展示', () => {
 
   test('EF-2 研究页回测 tab：事件因子卡渲染 + 未生成指引', async ({ page }) => {
     await page.goto('/#/research')
-    await page.getByText('回测').first().click()
+    // 点页签必须按「页签」定位（.t-tabs__nav-item），不能用 getByText('回测').first()：
+    // 研究页顶部的调度状态行今天起带出「（回测队列：N 个任务排队/执行中）」，它在 DOM 里排在页签之前，
+    // first() 于是点中一段说明文字——页签没切过去，卡自然不存在（红的是取道，不是功能）。
+    await page.locator('.t-tabs__nav-item', { hasText: '回测' }).first().click()
     const card = page.locator('.t-card', { hasText: '事件因子检验' })
     await expect(card, '回测 tab 必须含事件因子卡').toBeVisible({ timeout: 10000 })
     // 报告未生成 → 指引文案（诚实空态，禁止假表格/假数字）
@@ -1234,17 +1245,11 @@ test.describe('修复回归 · §3.1-1/§M1 quote_source 契约单源化', () =>
 // 顺带把 §M13 的判定口径钉住：两类端点 403 文案语言不同 → 前端只能按状态码判权限，
 // 不得按文案 indexOf('无权限') 匹配（英文 403 会漏判）。
 // ─────────────────────────────────────────────────────────────────────────────
-const USER2 = { u: process.env.E2E_USER2 || 'tester', p: process.env.E2E_PASS2 || '' }
-let testerToken = null // 模块级缓存：全 spec 只登录一次，避后端 login 5/min 匿名频控
+// 成员会话统一由 §UAT-SESSION 的共享存储托管（web/e2e/session.mjs），本文件不再持有成员凭据常量。
 
-// loginTester 用 tester 凭据换 token（复用已缓存的，避免多用例连打登录被频控成 429 假红）。
+// loginTester 取成员会话 token（§UAT-SESSION：走全栈共享存储，进程内不再各自缓存）。
 async function loginTester(request) {
-  if (testerToken) return testerToken
-  const resp = await request.post('/api/auth/login', { data: { username: USER2.u, password: USER2.p } })
-  expect(resp.ok(), 'tester 登录应 200（凭据缺失时请设 E2E_PASS2）').toBe(true)
-  testerToken = (await resp.json()).token
-  expect(testerToken, 'tester token 非空').toBeTruthy()
-  return testerToken
+  return sharedToken(request, 'member')
 }
 
 test.describe('权限硬锁 · §3.1-4 成员直连 API + §M13 轮询止血', () => {
