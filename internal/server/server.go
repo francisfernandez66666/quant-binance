@@ -905,7 +905,7 @@ const maxBodyBytes = 64 << 10
 
 // Serve 启动 HTTP 服务监听指定地址。
 // Serve 启动 HTTP 服务。§WS-F B4：若设置 QUANT_TLS_CERT 与 QUANT_TLS_KEY 则启用 HTTPS
-// （可选本地直连加密；生产公网仍以 Caddy TLS 终结为准，见 deploy/caddy/guangzhou.conf）。
+// （可选本地直连加密；生产公网仍以 Caddy TLS 终结为准，见 deploy/Caddyfile）。
 // 文档强制约定：公网部署必须经 TLS（Caddy）暴露，禁止明文 8080 直连公网。
 // English: Serve starts the HTTP server. If QUANT_TLS_CERT/QUANT_TLS_KEY are set, it serves HTTPS.
 // Production TLS termination stays with Caddy; plaintext 8080 must never be exposed to the public net.

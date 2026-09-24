@@ -246,10 +246,8 @@ echo "==> 9/9 加固件1/2 专项（2026-09-15 §HARDENING：ntfy 通道 + 备�
 go vet ./internal/notify ./cmd/quant
 go test -count=1 ./internal/notify/ -run 'TestNtfy|TestPushGatewayDualDispatch|TestPushGatewayOnlyOneChannel' 2>&1 \
 	| grep -E '^(--- FAIL|FAIL|ok)'
-# 备份链路三件套在位：广州快照 ps1+py、Mac 拉取器、launchd 清单
-[ -f deploy/qmt-win/backup_snapshot.ps1 ] && [ -f deploy/qmt-win/backup_snap.py ] \
-	&& [ -f deploy/mac/restic_pull_backup.sh ] && [ -f deploy/mac/com.quant.backup.plist ] \
-	&& echo "ok - 备份链路脚本在位" || { echo "FAIL - 备份链路脚本缺失"; exit 1; }
+# 备份链路三件套随广州部署面下线（2026-09-24 owner 裁决「广州不部署」，见 §76 防回潮锁）：
+# 原锁对象 = 广州快照 ps1/py + Mac restic 拉取器 + launchd 清单，异机备份待新部署位选定后重建。
 # Kuma 无头初始化脚本在位（监控重建的最小物料）
 [ -f deploy/mac/kuma_seed.js ] && echo "ok - kuma_seed.js 在位" || { echo "FAIL - kuma_seed.js 缺失"; exit 1; }
 
@@ -431,34 +429,59 @@ go test -count=1 ./internal/factor/ -run 'TestRegistry' 2>&1 | grep -E '^(--- FA
 go test -count=1 ./internal/research/ -run 'TestDeflatedIR|TestPBOSignConsistency|TestDiscoveryRobustnessFields' 2>&1 | grep -E '^(--- FAIL|FAIL|ok)'
 # 前端：寻优列表 expired 默认过滤契约用例登记于 web/e2e/uat_full.spec.mjs（RW-1/RW-2，随 E2E 全量跑）
 
-echo "==> 19/19 §ENH-A 生产回填承载脚本静态守卫（2026-09-20 回填实录：PS5.1 无控制台吞 stderr 首跑失败教训）..."
-# run_ths_backfill.ps1 四条铁律回归锁：①恰好一个 UTF-8 BOM（双 BOM 令 PS 报「?# 不是 cmdlet」）；
-# ②输出必须走 cmd /c 重定向（& exe 2>&1 管道在 ErrorActionPreference=Stop 下把原生 stderr 转
-#    NativeCommandError 静默终止——09-20 首跑退出码1日志0字节实录）；③密钥只从机器注册表读、
-# 脚本内不得内嵌任何 key 字面量；④退出码显式上抛（计划任务 LastTaskResult 可信）。
-rb=deploy/qmt-win/run_ths_backfill.ps1
-python3 - "$rb" <<'PY' || { echo "--- FAIL: $rb BOM 检查"; exit 1; }
-import sys
-d = open(sys.argv[1], 'rb').read()
-boms = 0
-while d.startswith(b'\xef\xbb\xbf'):
-    boms += 1
-    d = d[3:]
-assert boms == 1 and b'\r\n' in d and b'\n\n' not in d.replace(b'\r\n', b''), 'BOM/CRLF 不合规'
+echo "==> 19/19 §GZ-OFFLINE 广州部署面下线守卫（2026-09-24 owner 裁决「广州不部署」，防抄母仓时顺手带回）..."
+# 背景：广州单机（Windows Server 2022 + NSSM + restic 快照 + PowerShell 运维）整套部署面已随
+#       裁决下线（96 个文件，兜底 tag=pre-guangzhou-removal、归档=~/.quant-archive/guangzhou-removal-20260924.tar.gz）。
+#       本仓在役部署面只剩 scripts/deploy_seoul.sh + deploy/Caddyfile + deploy/*.service。
+# 守卫：①已删路径不得复活；②代码/脚本/CI 的非注释行不得再引用它们（注释里讲历史允许）。
+#       注：本脚本自身必然含这些字面量，故排除自身；行级跳过 # /// /* 开头的注释行。
+python3 - <<'PY' || { echo "--- FAIL: 广州部署面复活（§GZ-OFFLINE）"; exit 1; }
+import pathlib, sys
+GONE = ["scripts/deploy_guangzhou.sh", "scripts/verify_deploy_guangzhou.sh",
+        "scripts/check_deploy_static_locks.sh", "deploy/qmt-win", "dist-guangzhou",
+        "deploy/caddy/guangzhou.conf", "deploy/mac/restic_pull_backup.sh",
+        "deploy/mac/com.quant.backup.plist", "deploy/com.quant.syncdata.plist"]
+roots = [pathlib.Path(p) for p in ("internal", "cmd", "web/src", "web/e2e", "scripts", ".github", "ops", "qmt_gateway")]
+self = pathlib.Path("scripts/verify_changes.sh")
+bad = []
+for root in roots:
+    if not root.is_dir():
+        continue
+    for p in sorted(root.rglob("*")):
+        if not p.is_file() or p.suffix in (".md", ".png", ".svg", ".pdf") or p == self:
+            continue
+        if "node_modules" in p.parts or "dist" in p.parents:
+            continue
+        try:
+            text = p.read_text(encoding="utf-8")
+        except (UnicodeDecodeError, OSError):
+            continue
+        for i, line in enumerate(text.splitlines(), 1):
+            s = line.strip()
+            if s.startswith(("#", "//", "*", "<!--")):
+                continue
+            for g in GONE:
+                if g in line:
+                    bad.append(f"{p}:{i}: {g}   <-- 广州部署面已下线，不得复活")
+        if p.suffix == ".ps1":
+            bad.append(f"{p}: PowerShell 运维脚本不得再入本仓（广州面专属形态）")
+if bad:
+    print("\n".join(bad))
+    sys.exit(1)
+print("ok - 广州部署面零引用（96 文件下线，含 ps1 形态负锁）")
 PY
-grep -q 'cmd /c' "$rb" || { echo "--- FAIL: $rb 缺 cmd /c 重定向承载"; exit 1; }
-grep -q "GetEnvironmentVariable('HITHINK_FINANCE_API_KEY', 'Machine')" "$rb" || { echo "--- FAIL: $rb 密钥未走机器注册表"; exit 1; }
-! grep -qE 'sk-[A-Za-z0-9]{8,}' "$rb" || { echo "--- FAIL: $rb 疑似内嵌密钥字面量"; exit 1; }
-grep -q 'exit \$LASTEXITCODE' "$rb" || { echo "--- FAIL: $rb 未上抛退出码"; exit 1; }
-echo "ok"
 
-echo "==> 20/20 §A7 版本漂移根治专项（2026-09-20：部署脚本必须同步前端 web/dist）..."
-# 根因：旧版 deploy_guangzhou.sh 只同步二进制/gateway/pydata，从不传 web/dist，
-#       云端 Caddy 前端冻结在旧 buildCommit，浏览器端误报「前端与服务器版本不一致」。
-#       静态守卫：脚本必须含 web/dist 同步段（漏传即失败，防回归）。
-dg=scripts/deploy_guangzhou.sh
-grep -q 'web/dist' "$dg" && echo "ok - $dg 含 web/dist 同步段（版本漂移回归锁）" \
+echo "==> 20/20 §A7 版本漂移根治专项（2026-09-20 立规；2026-09-24 对象改为首尔站部署脚本）..."
+# 根因：部署脚本只同步二进制、从不传 web/dist，云端 Caddy 前端冻结在旧 buildCommit，
+#       浏览器端误报「前端与服务器版本不一致」。广州面下线后本仓唯一在役部署脚本 =
+#       scripts/deploy_seoul.sh，同一守卫换对象继续成立：上传前端前必须先重新构建。
+dg=scripts/deploy_seoul.sh
+grep -q 'web/dist' "$dg" && echo "ok - $dg 含 web/dist 上传段（版本漂移回归锁）" \
   || { echo "--- FAIL: $dg 未同步前端 web/dist（§A7 版本漂移根因）"; exit 1; }
+[ -n "$(awk '!/^[[:space:]]*(#|echo)/ && /npm run build/' "$dg")" ] \
+  || { echo "--- FAIL: $dg 上传前端前未真正执行 npm run build（陈旧 dist 直传即版本漂移）"; exit 1; }
+# 注：只认执行行——`echo "构建前端 (npm run build)..."` 这类日志行也算满足过（反证踩出的假绿），
+#     故 §23 的「先构建后上传」顺序锁同样剔除 echo/注释行。
 
 echo "==> 21/21 §FIX-5 UAT 自举脚本静态守卫（2026-09-20：全栈 UAT 必须可从本地一键复跑）..."
 # 根因：mock+engine+前端+seed 的启动流程此前只内联在 .github/workflows/nightly-e2e.yml，
@@ -506,16 +529,27 @@ echo "==> 23/23 §A7-B/§A7-C 部署健壮性专项（2026-09-20：前端产物�
 #    导致的漂移无法被自动拦住（2026-09-20 两次踩中，用户端报版本不一致横幅）。
 grep -q 'buildCommitMarker' web/vite.config.js || { echo "--- FAIL: vite.config.js 缺 buildCommitMarker（§A7-B）"; exit 1; }
 grep -q 'BUILD_COMMIT' web/vite.config.js || { echo "--- FAIL: vite.config.js 未落盘 dist/BUILD_COMMIT（§A7-B）"; exit 1; }
-grep -q 'BUILD_COMMIT' "$dg" || { echo "--- FAIL: $dg 未校验 dist/BUILD_COMMIT（§A7-B）"; exit 1; }
 grep -q 'BUILD_COMMIT' scripts/build_apk.sh || { echo "--- FAIL: build_apk.sh 未校验内嵌指纹（§A7-B）"; exit 1; }
-grep -q 'web:fingerprint' scripts/verify_deploy_guangzhou.sh || { echo "--- FAIL: 验证脚本缺前端指纹探针 4b（§A7-B）"; exit 1; }
-# ② §A7-C 停服必须可逆：[2/5] 的 net stop 之后只有 [4/5] 会拉起，而 `-s` 跳过 [4/5]、
-#    任何提前退出在 set -e 下直接结束 —— 两处都会把线上引擎留在停机态（2026-09-20 实录，
-#    引擎停了约 3 分钟且无提示）。守卫锁死「EXIT 兜底 + -s 分支显式拉起」两个出口。
-grep -q 'trap restore_services_on_exit EXIT' "$dg" || { echo "--- FAIL: $dg 缺停服 EXIT 兜底（§A7-C）"; exit 1; }
-grep -q '^start_engine_services()' "$dg" || { echo "--- FAIL: $dg 缺 start_engine_services（§A7-C）"; exit 1; }
-grep -q 'SERVICES_STOPPED=1' "$dg" || { echo "--- FAIL: $dg 未在停服处置位 SERVICES_STOPPED（§A7-C）"; exit 1; }
-# ③ shell 变量名吞噬：`$VAR` 紧跟全角字符（如 `$ds）`）时 bash 会把多字节并入变量名，
+# ② 停服必须可逆：广州面靠「trap EXIT + 显式拉起」两个出口兜底；首尔面走 systemd，
+#    正确形态是**根本不做无兜底的 stop/disable**，只用 restart（restart 失败服务仍在原位）。
+#    守卫改为负向：部署脚本一旦出现 systemctl stop|disable 即判红（等值锁：换实现不换语义）。
+if grep -qE 'systemctl +(stop|disable)' "$dg"; then echo "--- FAIL: $dg 出现无兜底的 systemctl stop/disable（§A7-C 停服可逆）"; exit 1; fi
+# ③ 前端顺序锁：必须先 npm run build 再上传 web/dist（顺序颠倒=把陈旧 dist 直传云端，§A7 同款根因）。
+python3 - "$dg" <<'PY' || exit 1
+import sys
+lines = open(sys.argv[1], encoding="utf-8").read().splitlines()
+def real(l):
+    s = l.strip()
+    return not (s.startswith("#") or s.startswith("echo "))
+b = next((i for i, l in enumerate(lines) if "npm run build" in l and real(l)), None)
+u = next((i for i, l in enumerate(lines) if "web/dist/." in l and real(l)), None)
+if b is None or u is None:
+    print(f"--- FAIL: {sys.argv[1]} 缺「构建前端」或「上传 web/dist」一步（§A7-B 顺序锁失效）"); sys.exit(1)
+if b > u:
+    print(f"--- FAIL: {sys.argv[1]} 先上传({u+1}) 后构建({b+1}) —— 陈旧 dist 直传即版本漂移"); sys.exit(1)
+print(f"ok - 前端先构建后上传（build@{b+1} < upload@{u+1}）")
+PY
+# ④ shell 变量名吞噬：`$VAR` 紧跟全角字符（如 `$ds）`）时 bash 会把多字节并入变量名，
 #    在 set -u 下报 unbound variable 直接中止（2026-09-20 实测：部署在「指纹校验通过」那行
 #    崩溃，前端因此漏传）。全仓 12 处，已全部改为 ${VAR}；此守卫防新增写法回归。
 #    注：必须用 python 扫——grep 无法可靠匹配 Unicode 区间（toybox grep 对 -P/码位静默失灵）。
@@ -533,7 +567,7 @@ if bad:
     print("\n".join(bad))
     sys.exit(1)
 PY
-echo "ok - 静态守卫 9/9 通过（产物指纹 5 + 停服兜底 3 + 变量名吞噬全仓扫描 1）"
+echo "ok - 静态守卫 7/7 通过（产物指纹 3 + 前端构建/上传正锁+顺序锁 2 + 停服负锁 1 + 变量名吞噬全仓扫描 1）"
 
 echo "==> 24/24 §FIX-20260920 数据管道修复批专项（THS 单域熔断 + 东财 f62 主站信任 + 板块列表镜像分页 + EM-FFLOW 真值口径 + THS-KLINE 5分钟 + QUOTE-CHAIN 同花顺首选源）..."
 # A THS 单域熔断（per-operation isolation）：分钟 K 不支持档位不得误伤其他域；空 op 是 no-op；
@@ -597,7 +631,7 @@ import sys
 d = open('qmt_gateway/qmt_bridge_strategy.py', 'rb').read()
 sys.exit(0 if all(b < 128 for b in d) else 1)
 PY
-grep -q 'qmt_bridge_strategy.py' scripts/deploy_guangzhou.sh || { echo "--- FAIL: 部署 [2b] 清单缺 qmt_bridge_strategy.py（桥修复不会随部署下发）"; exit 1; }
+grep -q 'qmt_gateway/' scripts/deploy_seoul.sh || { echo "--- FAIL: 部署脚本不下发 qmt_gateway/（桥修复不会随部署上线，§ENH-5 教训同族）"; exit 1; }
 echo "ok - §CB 专项守卫通过（行为回归 2 组 + 静态锁 6 道）"
 
 echo "==> 27 §SELLPOINT-UNIFY 卖出并轨统一裁决层专项（2026-09-21：P1 signalctl 状态机 / P1-b 影子 / P2 live 切闸 / P3 模拟盘并轨 / P4 探测器修复 + §D1 护栏 + BUGFIX 缺陷1~4）..."
@@ -788,19 +822,17 @@ grep -q 'SetAlertFunc' cmd/researchd/main.go || { echo "--- FAIL: researchd 告�
 echo "ok - §M14/§M15 专项守卫通过（行为回归 5 例 + 静态锁 5 道）"
 
 echo "==> 37 §H8/§F6 运维探针同源 + UAT 构建指纹（2026-09-22 修复批，代理F）..."
-# §H8：watchdog/daily_ops_check/register 三方探针 URL 收敛 service_probe_config.ps1 单源
-# （quant→:8081/setup 无鉴权、web→Caddy :8080、researchd→scheduler_status.json mtime≤5min
-# 文件心跳）；旧三连错（:8080/api/status 鉴权 401 误熔、虚构 :9091/health、探引擎根路径）
-# 静态锁死不得复活；deploy_guangzhou.sh 同步清单必须带上新文件（教训=quote_feed 漏列）。
+# §H8 的原始教训（与形态无关，继续锁死）：探针三连错——探鉴权口当存活（401 误熔）、
+# 虚构 :9091/health 端口、探引擎根路径。广州 watchdog 三件套随部署面下线，这里换成
+# 全仓口径锁：①两种错误形态在非注释行零命中；②在役监控（gatus）探 /api/status 必须带鉴权头。
+if grep -rnE '127\.0\.0\.1:9091|127\.0\.0\.1:8080/api/status' ops .github/workflows scripts internal cmd 2>/dev/null \
+	| grep -vE ':[0-9]+:[[:space:]]*#' | grep -v 'verify_changes.sh' >/dev/null; then
+	echo "--- FAIL: 误熔探针形态复活（§H8：:9091 虚构口 / 鉴权口探活）"; exit 1
+fi
+grep -q 'Authorization' ops/gatus/config.yaml || { echo "--- FAIL: gatus 探 /api/status 未带鉴权头（§H8 401 误熔复活）"; exit 1; }
 # §F6：uat_bootstrap 构建注入与生产同款 -ldflags buildCommit，A7 指纹用例口径对齐。
-test -f deploy/qmt-win/service_probe_config.ps1 || { echo "--- FAIL: 探针同源配置文件缺失（§H8）"; exit 1; }
-grep -q 'service_probe_config.ps1' deploy/qmt-win/all_service_watchdog.ps1 || { echo "--- FAIL: watchdog 未 dot-source 同源配置（§H8 回归）"; exit 1; }
-grep -q 'service_probe_config.ps1' scripts/daily_ops_check.ps1 || { echo "--- FAIL: daily_ops_check 未 dot-source 同源配置（§H8 回归）"; exit 1; }
-grep -q 'service_probe_config.ps1' deploy/qmt-win/register_engine_services.ps1 || { echo "--- FAIL: register 未接同源配置（§H8 回归）"; exit 1; }
-if grep -qE '127\.0\.0\.1:9091|127\.0\.0\.1:8080/api/status' deploy/qmt-win/all_service_watchdog.ps1 scripts/daily_ops_check.ps1; then echo "--- FAIL: 旧误熔探针形态复活（§H8：:9091 虚构口/鉴权口探活）"; exit 1; fi
-grep -q 'service_probe_config.ps1' scripts/deploy_guangzhou.sh || { echo "--- FAIL: 探针配置未入部署同步清单（§H8/§ENH-5 教训）"; exit 1; }
 grep -q 'main.buildCommit' scripts/uat_bootstrap.sh || { echo "--- FAIL: UAT 构建指纹注入丢失（§F6 回归）"; exit 1; }
-echo "ok - §H8/§F6 专项守卫通过（静态锁 8 道）"
+echo "ok - §H8/§F6 专项守卫通过（探针口径负锁 + 监控鉴权锁 + UAT 构建指纹锁）"
 
 echo "==> 38 §M1 quote_source 契约单源化 golden 双向锁（2026-09-22 修复批二波，代理G/K）..."
 # M1：行情源名散落六处（Go 枚举 / 前端下拉 / 网关日志文本 / 桥策略 / E2E 断言 / mock 注入）
@@ -880,17 +912,36 @@ grep -q '轮首快照' internal/engine/engine.go || { echo "--- FAIL: M9 轮首�
 grep -q 'validateInsertSurface' internal/store/store.go || { echo "--- FAIL: M11 InsertRows 表面校验移除"; exit 1; }
 echo "ok - §M9/M10/M11 专项守卫通过（行为锁 7 例 + 静态锁 3 道）"
 
-echo "==> 43 §M7 部署清单收编：quant-web 注册 / 网关配置生成 / 静态锁总闸（2026-09-22 修复批二波，代理L）..."
-# M7a/b/c：verify_deploy 要求的 quant-web(Caddy) 站点与网关 config.xt.json 过去全是手工
-# 一次性操作（部署面与校验面各说各话）——现 register_web_service.ps1 / ensure_gateway_config.ps1
-# 幂等收编进 deploy_guangzhou.sh；29 道部署口径静态锁收敛在 check_deploy_static_locks.sh，
-# 本段直接执行该总闸（端口单源/清单缺项/GUANGZHOU_CADDY 手工步骤残留等一次全验）。
-test -f deploy/qmt-win/register_web_service.ps1 || { echo "--- FAIL: web 站点注册脚本缺失（M7b 手工步骤复活）"; exit 1; }
-test -f deploy/qmt-win/ensure_gateway_config.ps1 || { echo "--- FAIL: 网关配置生成脚本缺失（M7c 秒起秒死复活）"; exit 1; }
-grep -q 'register_web_service.ps1' scripts/deploy_guangzhou.sh || { echo "--- FAIL: web 注册未接入部署链（M7b）"; exit 1; }
-grep -q 'ensure_gateway_config.ps1' scripts/deploy_guangzhou.sh || { echo "--- FAIL: 网关配置生成未接入部署链（M7c）"; exit 1; }
-bash ./scripts/check_deploy_static_locks.sh || { echo "--- FAIL: 部署静态锁总闸未过（M7 口径漂移）"; exit 1; }
-echo "ok - §M7 专项守卫通过（静态锁 4 道 + 部署口径总闸）"
+echo "==> 43 §M7 部署清单收编：部署物料在位总闸（2026-09-22 立规；2026-09-24 广州面下线后收敛为首尔面物料闸）..."
+# M7a/b/c 的原始教训 = 部署面与校验面各说各话：脚本引用的物料（systemd 单元、Caddy 配置、
+# 网关目录、构建目标）缺一项，部署会在远端半途中断且现场手工补。广州面的 29 道口径锁随
+# 该部署形态一起下线；这里保留**与形态无关的那一半**——静态解析在役部署脚本引用了哪些
+# 仓库内路径，逐个断言存在，并断言每个 go build 目标存在（新增引用忘了落盘=当场红）。
+python3 - <<'PY' || { echo "--- FAIL: 部署物料在位总闸未过（§M7 口径漂移）"; exit 1; }
+import pathlib, re, sys
+text = pathlib.Path("scripts/deploy_seoul.sh").read_text(encoding="utf-8")
+missing = []
+for lineno, line in enumerate(text.splitlines(), 1):
+    # 只认顶格的 $SCP 硬上传行：缩进行处于 [ -f ] 条件分支或带 warn 兜底，属可缺项。
+    if line.startswith("$SCP"):
+        for m in re.findall(r'\$APP_DIR/([A-Za-z0-9_.\-/]+)', line):
+            cand = m.rstrip("/.")
+            if cand.startswith("web/"):        # 构建产物，本机/CI clone 后不存在属正常
+                continue
+            if not pathlib.Path(cand).exists():
+                missing.append(f"deploy_seoul.sh:{lineno}: 引用物料缺失 {cand}")
+    for m in re.findall(r'(\./cmd/[a-z0-9_-]+)', line):
+        if not pathlib.Path(m).is_dir():
+            missing.append(f"deploy_seoul.sh:{lineno}: go build 目标不存在 {m}")
+# 部署面必带的四个 systemd 单元（首尔脚本逐个 SCP，缺一个即服务起不来）
+for unit in ("quant.service", "quant-research.service", "pydata.service", "qmt-mock.service"):
+    if not pathlib.Path("deploy", unit).is_file():
+        missing.append(f"deploy/{unit} 缺失（systemd 单元即部署物料）")
+if missing:
+    print("\n".join(missing)); sys.exit(1)
+print("ok - 部署物料在位总闸通过（SCP 引用 + go build 目标 + 4 个 systemd 单元）")
+PY
+echo "ok - §M7 专项守卫通过（部署物料总闸，广州形态锁已随面下线）"
 
 echo "==> 44 §M12/§M13 移动壳凭据面 + 前端权限一致性 + researchd 主链冒烟（2026-09-22 修复批二波，代理K/L/J）..."
 # M13：成员账号进 Quant/Paper 页——①403 后轮询定时器照跑（opslog 灌噪声）；②判 403 用
@@ -939,21 +990,22 @@ if grep -rn "liangzai_token" web/src --include='*.js' --include='*.jsx' 2>/dev/n
 echo "ok - §NATIVEAUTH 专项守卫通过（行为锁 1 组 + 静态锁 4 道 + 直读负锁）"
 
 echo "==> 47 §ROOTQMT 根级死键防回潮 + §APPVER 强制更新通道（2026-09-22 C批，代理A4/A5）..."
-# §ROOTQMT：config.json 根级 qmt 死键（旧生成器层级错误产物，§M7a）——清理脚本收编进
-# 部署链 [3a] 常态执行，防回潮；引擎 Save 只写 {rules,d1}，清理无回写竞态。
-test -f deploy/qmt-win/clean_root_qmt.ps1 || { echo "--- FAIL: 根级 qmt 清理脚本缺失（§ROOTQMT 手工告警复活）"; exit 1; }
-grep -q 'clean_root_qmt' scripts/deploy_guangzhou.sh || { echo "--- FAIL: 清理未接入部署链（§ROOTQMT 防回潮失效）"; exit 1; }
-# §APPVER：公开版本端点（登录前检查必须免鉴权）+ Caddy /dl 分发块 + v2 原生更新闸。
+# §ROOTQMT：config.json 根级 qmt 死键（旧生成器层级错误产物，§M7a）——清理脚本随广州部署面
+# 下线（该键的产物现场在被删的那台机器上）；本仓口径保留为「引擎 Save 只写 {rules,d1}」，
+# 由 §43 物料闸 + §19 防回潮锁兜住，新部署位接线时再补现场清理腿。
+# §APPVER：公开版本端点（登录前检查必须免鉴权）+ 构建腿在位 + v2 原生更新闸。
+# ⚠ 缺口登记：APK 的**下载分发腿**（Caddy /dl/* + quant-latest.apk 随部署上传）原挂在广州面上，
+#    随该面下线；本仓在役 Caddyfile 无 /dl/*。新部署位选定后需重接（否则客户端只能收到"有新版"
+#    却拿不到安装包）。这里保留能锁住的一半：构建脚本在位 + 版本跃迁，分发腿作为待办见 docs/PROGRESS.md。
 go test -count=1 ./internal/server/ -run 'TestAppVersionPublicEndpoint' 2>&1 | grep -E '^(--- FAIL|FAIL|ok)'
 grep -q 'GET /api/app/version' internal/server/server.go || { echo "--- FAIL: 版本端点注册丢失（§APPVER）"; exit 1; }
 # 负锁：该端点注册行若被 authMiddleware 包裹=登录前更新检查死锁（v1 登不进即永远收不到更新单）。
 if grep -n 'GET /api/app/version' internal/server/server.go | grep -q 'authMiddleware'; then
 	echo "--- FAIL: /api/app/version 被套鉴权（§APPVER 登录前检查死锁复活）"; exit 1; fi
-grep -q 'handle /dl/\*' deploy/caddy/guangzhou.conf || { echo "--- FAIL: Caddy APK 分发块丢失（§APPVER 下载 404）"; exit 1; }
-grep -q 'quant-latest.apk' scripts/deploy_guangzhou.sh || { echo "--- FAIL: APK 分发同步步丢失（§APPVER [3c]）"; exit 1; }
+test -f scripts/build_apk.sh || { echo "--- FAIL: APK 构建脚本缺失（§APPVER 无产物可分发）"; exit 1; }
 grep -q 'UpdateGate' mobile/app/src/main/java/com/liangzai/quant/MainActivity.kt || { echo "--- FAIL: 原生强制更新闸未接线（§APPVER）"; exit 1; }
 grep -qE 'versionCode = ([2-9]|[1-9][0-9])' mobile/app/build.gradle.kts || { echo "--- FAIL: APK 版本仍停在无更新通道的 1（§APPVER 跃迁回退）"; exit 1; }
-echo "ok - §ROOTQMT/§APPVER 专项守卫通过（行为锁 1 组 + 静态锁 7 道 + 鉴权负锁）"
+echo "ok - §ROOTQMT/§APPVER 专项守卫通过（行为锁 1 组 + 静态锁 4 道 + 鉴权负锁，分发腿缺口已登记）"
 
 echo "==> 48 §UPDLINK SSE 双关死锁根因修复 + 上行自监控（2026-09-22 PM批 H-4，P0）..."
 # 根因：同一客户端 channel 被 §A3 evict 与 handleFixSSE defer 两条路径双关 → 持 b.mu 时 panic →
@@ -1195,9 +1247,11 @@ grep -q 'from trading_calendar import' qmt_gateway/qmt_bridge.py || { echo "--- 
 if grep -nE '^    if now\.weekday\(\) >= 5:$' qmt_gateway/qmt_bridge.py | grep -vE '^[0-9]+:\s*#' | grep -q .; then
 	echo "--- FAIL: qmt_bridge 工作日启发式又做主判定（应只在无日历兜底分支）"; exit 1; fi
 grep -q 'closed_days' qmt_gateway/trading_calendar.py || { echo "--- FAIL: 交易日历读取模块丢失（§A5）"; exit 1; }
-# §A5 部署清单锁（09-21 qmt_bridge_strategy 漏列同族教训）：日历模块必须随 [2b] 下发，
+# §A5 部署清单锁（09-21 qmt_bridge_strategy 漏列同族教训）：日历模块必须随网关一起下发，
 # 否则现网网关 ImportError 静默降级 weekday 启发式——修复形同虚设且无任何报错。
-grep -q 'qmt_gateway/trading_calendar.py' scripts/deploy_guangzhou.sh || { echo "--- FAIL: 部署 [2b] 清单缺 trading_calendar.py（§A5 现网不会生效）"; exit 1; }
+# 广州面按文件枚举清单（漏一个就红），首尔面改为整目录 SCP：锁死"整目录"这一更稳的形态，
+# 枚举式清单不得复活（新增 .py 永远不可能再漏）。
+grep -q 'APP_DIR/qmt_gateway/\.' scripts/deploy_seoul.sh || { echo "--- FAIL: 部署未整目录下发 qmt_gateway/（§A5 日历模块随网关上线）"; exit 1; }
 # M-10 行为锁：交错轮询的迟到响应整包丢弃（工具语义 3 例 + Signals 整页交错回归 1 例）。
 ( cd web && npm test -- m10_stale_guard )
 # M-10 静态锁：守卫工具在位；三个轮询页均 import createStaleGuard 且真正 begin/isStale（漏一页=该页倒挂复活）。

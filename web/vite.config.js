@@ -36,7 +36,7 @@ const COMMIT = buildCommit()
 // 要拦的事故（2026-09-20 两次踩中，第二次就是本文件写下的原因）：
 //   本地先 `npm run build`、**之后**才 commit → 包内嵌指纹停在上一版，
 //   后端用新 SHA 构建上线 → 用户看到「前端与服务器版本不一致（本地 X / 服务器 Y）」横幅。
-//   deploy_guangzhou.sh [2c] 现在会比对 dist/BUILD_COMMIT 与待部署 SHA，不等就强制重建。
+//   部署脚本（scripts/deploy_seoul.sh [5/8]）上传前必须先 npm run build，产物指纹由本文件落盘。
 //
 // English: also stamp the fingerprint into dist/BUILD_COMMIT so the deploy script can verify
 // artifact/backend parity *before* uploading — scanning minified JS for a hex literal is guesswork.

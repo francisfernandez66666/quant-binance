@@ -1,5 +1,5 @@
 # ── 文件头注释（§ENH-A3 Prometheus 抓取配置）──────────────────────────────
-# 用途：双站（首尔 Linux/systemd + 广州 Win/NSSM，均 :8080）后端 /api/metrics/prometheus 指标抓取。
+# 用途：后端 /api/metrics/prometheus 指标抓取（首尔站 Linux/systemd，:8080）。广州面 2026-09-24 下线。
 # 投放位置：Prometheus 主机 /etc/prometheus/prometheus.yml（Windows 版放 prometheus.yml 同目录）。
 # 凭据：token 文件 /etc/prometheus/secrets/quant_token 单独投放，chmod 600，绝不写入本文件。
 #   token=管理员账号经 POST /api/auth/login 签发的会话令牌（TTL 30 天，滑动续期仅登录时；
@@ -23,10 +23,7 @@ scrape_configs:
       type: Bearer                          # 服务端兼容带/不带前缀，Bearer 拼法可过
       credentials_file: /etc/prometheus/secrets/quant_token
     static_configs:
-      # 占位符：<SEOUL_HOST>=首尔站 IP/域名，<GUANGZHOU_HOST>=广州站 IP/域名，投放时替换
+      # 占位符：<SEOUL_HOST>=首尔站 IP/域名，投放时替换
       - targets: ["<SEOUL_HOST>:8080"]
         labels:
           site: seoul
-      - targets: ["<GUANGZHOU_HOST>:8080"]
-        labels:
-          site: guangzhou

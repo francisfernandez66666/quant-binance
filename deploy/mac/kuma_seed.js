@@ -15,7 +15,7 @@ const PASSWORD = execSync(
 const MONITORS = [
     { name: "quant-site", type: "http", url: "https://quant-trading.top/", interval: 60, accepted_statuscodes: ["200"], expiryNotification: true },
     { name: "quant-api-health", type: "http", url: "https://quant-trading.top/api/health", interval: 60, accepted_statuscodes: ["200", "401"] },
-    { name: "quant-emergency-8080", type: "http", url: "http://81.71.69.17:8080/", interval: 300, accepted_statuscodes: ["200", "302", "404"] },
+    // 广州直连口探活项随部署面下线（2026-09-24 owner 裁决「广州不部署」）；新部署位选定后按站补监控项。
 ];
 
 const socket = io(URL, { transports: ["websocket"], forceNew: true });

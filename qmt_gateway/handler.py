@@ -80,7 +80,7 @@ def is_active_trading_session():
 
     非交易时段（盘前/盘后/周末/节假日）返回 False——此时 MiniQMT 被 qmtctl 关闭属预期，
     断连不上报熔断，避免每天收盘刷 high 告警污染信号（见
-    docs/MIGRATION_GUANGZHOU_ALLINONE.md §3.4）。
+    母仓 docs/MIGRATION_GUANGZHOU_ALLINONE.md §3.4）。
     §A5：节假日判定从「工作日即交易日」启发式升级为读 Go 日历 closed_days；
     日历不可得时保留旧口径（宁误宽松不误收紧——收紧会把真交易时段误判为休市，
     断连熔断静默化才是危险方向）。
@@ -329,7 +329,7 @@ class ReportHandler:
         """断线：记录并（交易时段）推送首尔（首尔侧据此熔断暂停下单）。
 
         非交易时段（盘前/盘后/周末/节假日）不上报——此时 MiniQMT 被 qmtctl 关闭属预期，
-        上报会每天触发引擎熔断误报（见 docs/MIGRATION_GUANGZHOU_ALLINONE.md §3.4）。
+        上报会每天触发引擎熔断误报（见 母仓 docs/MIGRATION_GUANGZHOU_ALLINONE.md §3.4）。
         """
         self.disconnected = True
         if is_active_trading_session():

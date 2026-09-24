@@ -11,7 +11,7 @@
   - GET /dispatch/pending → 订单/撤单，逐个执行后回报 order_result / cancel_result
   - query_stock_trades 回补成交 → POST /dispatch/result type=trade（网关按 trade_id 去重）
 
-适配策略（真机探测要点，见 docs/MIGRATION_QMT_DUAL_PATH.md §R3）：
+适配策略（真机探测要点，见母仓 docs/MIGRATION_QMT_DUAL_PATH.md §R3（本仓广州/QMT 部署面 2026-09-24 下线））：
   - QMT 内置环境预载 `from xtquant import xttrader, xtconstant`，无需 pip；
   - 所有 xttrader 交互集中在 XtAdapter，字段名/返回值形态跨构建有差异时只改这一处；
   - 内置环境可能无 requests → 全程 urllib.request；网络异常按步降级不阻塞主循环；

@@ -106,7 +106,7 @@ rm -rf "$DATA_DIR"
 mkdir -p "$DATA_DIR" "$PIDDIR"
 
 log "构建 quant 引擎与 qmt-mock 假柜台..."
-# §F6（2026-09-22）：与生产部署同款式注入 git 指纹（deploy_guangzhou.sh 步[1/5] / deploy_seoul.sh 步[1/8]
+# §F6（2026-09-22）：与生产部署同款式注入 git 指纹（deploy_seoul.sh 步[1/8]
 # 的 LDFLAGS="-X main.buildCommit=..."）。旧版裸 go build → UAT 栈 buildCommit 恒为 unknown，
 # 引擎启动自检（cmd/quant/main.go）走"未注入指纹"告警分支，A7 真栈用例与线上口径脱节。
 LDFLAGS="-X main.buildCommit=$(git -C "$ROOT" rev-parse --short HEAD 2>/dev/null || echo unknown)"

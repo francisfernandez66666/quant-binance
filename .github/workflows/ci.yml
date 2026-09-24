@@ -209,9 +209,10 @@ jobs:
           if grep -q 'researchTaskRetryCap' internal/store/research_tasks.go; then echo "旧异因混计上限复活（§M14）"; exit 1; fi
           grep -q 'ChainTaskSeqs' internal/scheduler/worker.go || { echo "夜链序位补缺丢失（§M15）"; exit 1; }
           grep -q 'SetAlertFunc' cmd/researchd/main.go || { echo "researchd 告警未接线（§M14）"; exit 1; }
-          # §H8/§F6 探针同源与构建指纹
-          test -f deploy/qmt-win/service_probe_config.ps1 || { echo "§H8 探针同源配置缺失"; exit 1; }
-          if grep -qE '127\.0\.0\.1:9091|127\.0\.0\.1:8080/api/status' deploy/qmt-win/all_service_watchdog.ps1 scripts/daily_ops_check.ps1; then echo "旧误熔探针形态复活（§H8）"; exit 1; fi
+          # §H8/§F6 探针口径与构建指纹（广州 watchdog 三件套随部署面下线，锁换成形态无关的一半：
+          # 误熔探针写法零命中 + 在役监控探鉴权口必带鉴权头）
+          if grep -rnE '127\.0\.0\.1:9091|127\.0\.0\.1:8080/api/status' ops 2>/dev/null | grep -vE ':[0-9]+:[[:space:]]*#' >/dev/null; then echo "旧误熔探针形态复活（§H8）"; exit 1; fi
+          grep -q 'Authorization' ops/gatus/config.yaml || { echo "§H8 gatus 探 /api/status 缺鉴权头（401 误熔复活）"; exit 1; }
           grep -q 'main.buildCommit' scripts/uat_bootstrap.sh || { echo "UAT 构建指纹注入丢失（§F6）"; exit 1; }
           echo "ok - §20260922 修复批静态锁全过"
 
@@ -238,10 +239,10 @@ jobs:
           grep -q '轮首快照' internal/engine/engine.go || { echo "M9 轮首快照语义丢失"; exit 1; }
           grep -q 'paper_sell_anchors.json' internal/engine/sell_anchor.go || { echo "M10 锚点落盘丢失（重启清零复活）"; exit 1; }
           grep -q 'validateInsertSurface' internal/store/store.go || { echo "M11 InsertRows 面校验丢失"; exit 1; }
-          # §M7 部署清单收编（web 注册 + 网关配置生成入链，静态锁总闸可跑则跑）
-          grep -q 'register_web_service.ps1' scripts/deploy_guangzhou.sh || { echo "M7b web 注册脱链"; exit 1; }
-          grep -q 'ensure_gateway_config.ps1' scripts/deploy_guangzhou.sh || { echo "M7c 网关配置生成脱链"; exit 1; }
-          bash ./scripts/check_deploy_static_locks.sh || { echo "部署口径静态锁漂移（M7）"; exit 1; }
+          # §M7 部署物料在位（广州面下线后收敛为首尔面：网关整目录 + 4 个 systemd 单元 + Caddy 配置）
+          grep -q 'APP_DIR/qmt_gateway/\.' scripts/deploy_seoul.sh || { echo "M7 网关未整目录下发"; exit 1; }
+          for u in quant quant-research pydata qmt-mock; do test -f "deploy/$u.service" || { echo "M7 缺 systemd 单元 $u.service"; exit 1; }; done
+          test -f deploy/Caddyfile || { echo "M7 缺 Caddy 配置物料"; exit 1; }
           # §M13 前端权限一致性（403 只认状态码；负锁过滤"旧写法不得复活"说明注释）
           if grep -nE "indexOf\('无权限'\)|includes\('无权限'\)" web/src/pages/Quant.jsx web/src/pages/Paper.jsx | grep -vE ':[0-9]+:[[:space:]]*//' >/dev/null; then echo "M13 中文文案判 403 复活"; exit 1; fi
           grep -q 'isForbidden' web/src/pages/Quant.jsx || { echo "M13 Quant 状态码判定丢失"; exit 1; }
@@ -264,14 +265,13 @@ jobs:
           grep -q 'security-crypto' mobile/app/build.gradle.kts || { echo "NATIVEAUTH 依赖丢失"; exit 1; }
           grep -q 'nativeAuthBridge' web/src/api/index.js || { echo "NATIVEAUTH 前端桥探测丢失"; exit 1; }
           if grep -rn "liangzai_token" web/src --include='*.js' --include='*.jsx' | grep -v __tests__ | grep -v 'src/api/index.js' | grep -vE ':[0-9]+:[[:space:]]*//' | grep -q .; then echo "NATIVEAUTH 业务代码直读 token 复活"; exit 1; fi
-          # §ROOTQMT 死键防回潮：清理脚本在位且挂部署链
-          test -f deploy/qmt-win/clean_root_qmt.ps1 || { echo "ROOTQMT 清理脚本缺失"; exit 1; }
-          grep -q 'clean_root_qmt' scripts/deploy_guangzhou.sh || { echo "ROOTQMT 清理脱部署链（防回潮失效）"; exit 1; }
-          # §APPVER 强制更新通道：公开端点（不得套鉴权）+ /dl 分发 + 原生闸 + 版本跃迁
+          # §ROOTQMT 死键防回潮：清理脚本随广州部署面下线（死键产物现场在被删的那台机器上），
+          # 本仓口径改由「引擎 Save 只写 {rules,d1}」+ §GZ-OFFLINE 防回潮锁兜住，新部署位再补现场腿。
+          # §APPVER 强制更新通道：公开端点（不得套鉴权）+ 构建腿在位 + 原生闸 + 版本跃迁
+          # ⚠ /dl 分发腿（Caddy 静态目录 + APK 随部署上传）原挂广州面，随之下线，待新部署位重接。
           grep -q 'GET /api/app/version' internal/server/server.go || { echo "APPVER 版本端点丢失"; exit 1; }
           if grep -n 'GET /api/app/version' internal/server/server.go | grep -q 'authMiddleware'; then echo "APPVER 端点被套鉴权（登录前检查死锁复活）"; exit 1; fi
-          grep -q 'handle /dl/\*' deploy/caddy/guangzhou.conf || { echo "APPVER Caddy 分发块丢失"; exit 1; }
-          grep -q 'quant-latest.apk' scripts/deploy_guangzhou.sh || { echo "APPVER APK 同步步丢失"; exit 1; }
+          test -f scripts/build_apk.sh || { echo "APPVER APK 构建脚本缺失"; exit 1; }
           grep -q 'UpdateGate' mobile/app/src/main/java/com/liangzai/quant/MainActivity.kt || { echo "APPVER 原生更新闸未接线"; exit 1; }
           grep -qE 'versionCode = ([2-9]|[1-9][0-9])' mobile/app/build.gradle.kts || { echo "APPVER 版本停在没有更新通道的 1"; exit 1; }
           echo "ok - §20260922-C 批静态锁全过"

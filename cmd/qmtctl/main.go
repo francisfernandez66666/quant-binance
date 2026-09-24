@@ -3,7 +3,7 @@
 // 与引擎共用 internal/data 的会话/交易日历模型（同花顺交易日历，含节假日/临时休市），
 // 决定当前是否应运行 QMT 交易端：交易日 08:45~15:05 运行，其余时段（含周末/节假日）关闭。
 // 用途：交易时段交易端在线承接下单；非交易时段关闭释放 ~1G 内存给 researchd 夜间研究，
-// 实现"时间分片硬互斥"（见 docs/MIGRATION_GUANGZHOU_ALLINONE.md §1/§3.3）。
+// 实现"时间分片硬互斥"（见母仓 docs/MIGRATION_GUANGZHOU_ALLINONE.md §1/§3.3（本仓广州面已下线））。
 //
 // 重要：这里拉起的是完整交易端 XtItClient.exe（带自动登录与交易界面，能记住密码自动登录
 // 券商柜台），而非 XtMiniQmt.exe（极简 miniQMT，无法自动登录交易）。自动化必须选前者，

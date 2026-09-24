@@ -1,5 +1,5 @@
 # ── 文件头注释（§ENH-A2 Gatus 状态页配置）────────────────────────────────
-# 用途：双站 /api/status 存活探测 + 失败开窗 ntfy 推送 + 公网可读状态页（默认仅回环）。
+# 用途：/api/status 存活探测（首尔站；广州面 2026-09-24 下线） + 失败开窗 ntfy 推送 + 公网可读状态页（默认仅回环）。
 # 投放位置：首尔站 /etc/gatus/config.yaml（与 Prometheus 同机或独立小机均可）。
 # 启动示例：GATUS_CONFIG_PATH=/etc/gatus/config.yaml QUANT_OPS_TOKEN=*** gatus
 #   或 systemd：EnvironmentFile=/etc/gatus/secret.env（0600，仅 owner 可读，放 QUANT_OPS_TOKEN）
@@ -33,19 +33,6 @@ endpoints:
     conditions:
       - "[STATUS] == 200"
       - "has([BODY].uptime) == true"               # handleFixStatus 恒下发 uptime/session 字段
-      - "has([BODY].session) == true"
-    alerts:
-      - type: ntfy
-
-  - name: quant-guangzhou-status
-    group: quant-binance
-    url: http://<GUANGZHOU_HOST>:8080/api/status
-    interval: 30s
-    headers:
-      Authorization: "Bearer ${QUANT_OPS_TOKEN}"
-    conditions:
-      - "[STATUS] == 200"
-      - "has([BODY].uptime) == true"
       - "has([BODY].session) == true"
     alerts:
       - type: ntfy
