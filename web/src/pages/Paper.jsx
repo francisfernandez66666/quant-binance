@@ -16,6 +16,12 @@ import {
 import * as api from '../api/index.js'
 import { showToast, confirmDialog } from '../ui.jsx'
 import MinuteView from '../components/MinuteView.jsx'
+// §市场分家-1：本页是 A股战法纸面盘（快照/撮合/净值四腿全 CN 链），订阅全局市场开关，
+// 美股/加密货币 tab 下整页早返回去向提示卡——币安纸面盘在「设置·交易」，两desk不共用数据。
+// English: §MKT-SPLIT-1 — this desk is the A-share paper engine; non-CN tabs early-return a
+// pointer card because the Binance paper desk lives under Settings · Trading.
+import { useMarket } from '../market.jsx'
+import { MARKET_LABELS } from '../utils.market.js'
 import StockDetailDrawer from '../components/StockDetailDrawer.jsx'
 import useSseRefresh from '../useSseRefresh.js'
 
@@ -741,6 +747,21 @@ export default function Paper() {
   function renderKline(params) {
     const row = params && params.row ? params.row : params
     return <MinuteView code={row.code} name={row.name} />
+  }
+
+  // §市场分家-1：全局市场开关（在一切 hooks 之后订阅，早返回不影响 hook 顺序）
+  const { market: mktTab } = useMarket()
+  if (mktTab !== 'ALL' && mktTab !== 'CN') {
+    return (
+      <div className="page">
+        <Card>
+          <div data-testid="paper-market-empty" style={{ padding: 24, textAlign: 'center', color: 'var(--app-muted-2)', lineHeight: 1.8 }}>
+            当前市场：<b style={{ color: 'var(--app-text)' }}>{MARKET_LABELS[mktTab]}</b>——本页是 A股战法模拟盘（N形/龙头等策略纸面撮合），不承载 {MARKET_LABELS[mktTab]}数据。
+            <br />{MARKET_LABELS[mktTab]}的行情/委托/纸面请在「设置 · 交易」接入币安账户后于对应页面查看；此处可切回「A股」或「全部」。
+          </div>
+        </Card>
+      </div>
+    )
   }
 
   return (

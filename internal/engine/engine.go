@@ -222,8 +222,11 @@ type Engine struct {
 	liveRouter *trading.BrokerRouter // §P2 实盘路由（CN+US+CRYPTO 控制器扇出；可空=未接入币安，CN 单通道旧语义）
 	// bnDispatch §战法批-4 币安链派发核（xasset 信号→US/CRYPTO 控制器委托；nil=该引擎没接币安链=零行为）。
 	bnDispatch *binanceDispatcher
-	realStore  *store.DB // 实盘账本库（live.db：real_positions/orders/fills 存取）
-	d1Store    *store.DB // D1 评分历史库（trading.db：d1_scores 落库，与研究数据同库）
+	// bnQuote §市场分家-1 US/CRYPTO 单票现价源（feed 快照+REST 回落，只读；nil=未接币安链，
+	// /api/binance/quote 对该账号恒 ok=false）。
+	bnQuote   *binanceQuoteSource
+	realStore *store.DB // 实盘账本库（live.db：real_positions/orders/fills 存取）
+	d1Store   *store.DB // D1 评分历史库（trading.db：d1_scores 落库，与研究数据同库）
 
 	// §SIGNAL_CONTROLLER 20260917：实盘买入确认状态机（原 buyConfirmReal + realBuyConfirmPass）
 	// 已迁到信号控制器（internal/signalctl）live 通道——战法白名单/黑名单/个股/板块黑名单/持续性

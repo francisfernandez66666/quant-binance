@@ -11,6 +11,12 @@ import LogModal from '../components/LogModal.jsx'
 import Disclaimer from '../components/Disclaimer.jsx'
 import IcpFooter from '../components/IcpFooter'
 import SentimentCard from '../components/SentimentCard.jsx'
+// §市场分家-1：本页全部腿（信号/热门个股/宏观与IPO日历/板块/资讯/战法胜率）都是 A股监控链，
+// 顶部切到美股/加密货币时整页早返回去向提示，不再把 A股首页冒充新市场仪表盘。
+// English: §MKT-SPLIT-1 — every Dashboard leg is the A-share monitor chain; non-CN tabs early-return
+// a pointer card instead of passing the CN dashboard off as a new-market overview.
+import { useMarket } from '../market.jsx'
+import { MARKET_LABELS } from '../utils.market.js'
 
 // 根据 IPO/上市日期计算倒计时或上市状态
 function ipoCountdown(c) {
@@ -323,6 +329,21 @@ export default function Dashboard() {
       </div>
     )
     return cardBody
+  }
+
+  // §市场分家-1：全局市场开关（一切 hooks 之后订阅，早返回不影响 hook 顺序）
+  const { market: mktTab } = useMarket()
+  if (mktTab !== 'ALL' && mktTab !== 'CN') {
+    return (
+      <div className="page">
+        <Card>
+          <div data-testid="dashboard-market-empty" style={{ padding: 24, textAlign: 'center', color: 'var(--app-muted-2)', lineHeight: 1.8 }}>
+            当前市场：<b style={{ color: 'var(--app-text)' }}>{MARKET_LABELS[mktTab]}</b>——本页仪表盘聚合的是 A股监控链（信号/热门板块/资讯/战法胜率），暂无 {MARKET_LABELS[mktTab]}版聚合面板。
+            <br />{MARKET_LABELS[mktTab]}请走「持仓管理」（行情/委托/纸面）与「交易派发台」；此处可切回「A股」或「全部」。
+          </div>
+        </Card>
+      </div>
+    )
   }
 
   /* 仪表盘页面主渲染：指标卡 → 热门个股与资讯双栏 → 战法胜率表 → 系统状态 */

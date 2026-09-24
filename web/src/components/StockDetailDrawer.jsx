@@ -15,6 +15,8 @@ import MinuteView from './MinuteView.jsx'
 // §BINANCE-P5（PLAN §11.2 新市场页面积试点）：US/CRYPTO 详情改挂 lightweight-charts 专业蜡烛图
 // English: §BINANCE-P5 — new-market (US/CRYPTO) detail body uses the professional candle chart.
 import XProChart from './XProChart.jsx'
+// §市场分家-1：头部现价的非 CN 轨（/api/binance/quote，feed 优先+REST 回落）
+import { fetchBinanceQuote } from '../api/binance.js'
 // §BINANCE-P4：代码→市场解析单一来源（纯函数模块，无环依赖）
 import { parseCode } from '../utils.market.js'
 
@@ -68,10 +70,20 @@ export default function StockDetailDrawer({ open, code, name, price, changePct, 
   useEffect(() => {
     if (!open || !code) { setQuote(null); return }
     let alive = true
-    // 拉取行情快照回填抽屉头部
+    // §市场分家-1 头部现价按市场分轨（与下方 K 线体分轨同姿势）：
+    // CN 走 /api/stock/lookup 四级链（一字不动）；US/CRYPTO 走 /api/binance/quote——
+    // 此前非 CN 标的也打 lookup 链，新浪/腾讯对 BTCUSDT/AAPL 必然打空且静默回 {price:0}，
+    // 抽屉头部靠行数据兜底、形同没接。ok=false 时保留入参兜底价，绝不显示 0。
+    const mkt = parseCode(code).market
     const load = () => {
-      api.fetchStockLookup(code)
-        .then((r) => { if (alive && r) setQuote(r) })
+      if (mkt === 'CN') {
+        api.fetchStockLookup(code)
+          .then((r) => { if (alive && r) setQuote(r) })
+          .catch(() => {})
+        return
+      }
+      fetchBinanceQuote(mkt, code)
+        .then((r) => { if (alive && r && r.ok) setQuote({ price: r.price, changePct: r.change_pct }) })
         .catch(() => {})
     }
     load()
@@ -92,7 +104,8 @@ export default function StockDetailDrawer({ open, code, name, price, changePct, 
   // 展示名：行情返回优先，回落入参名称/代码
   const showName = (quote && quote.name) || name || code
   const showPrice = quote && Number.isFinite(Number(quote.price)) && Number(quote.price) > 0 ? Number(quote.price) : price
-  const rawChg = changePct
+  // §市场分家-1 涨跌幅同价源：轮询回来的 changePct 优先，行数据入参兜底（CN lookup 不带则维持旧行为）
+  const rawChg = (quote && (quote.changePct ?? quote.change_pct)) ?? changePct
   const chg = Number.isFinite(Number(rawChg)) ? Number(rawChg) : null
   const chgUp = chg != null && chg >= 0
   // §BINANCE-P5：本标的所属市场（决定详情体走哪条 K 线链）——CN=自研分时/盘口，US/CRYPTO=专业蜡烛图

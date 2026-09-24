@@ -61,3 +61,16 @@ export async function fetchBinanceKline(market, code, count) {
   if (count) q.set('count', String(count))
   return request('/api/binance/kline?' + q.toString())
 }
+
+// —— §市场分家-1 详情抽屉头部现价的非 CN 轨（GET /api/binance/quote，authMiddleware）——
+// GET /api/binance/quote?market=US|CRYPTO&code=BTCUSDT|AAPL →
+//   有价 {ok:true, market, code, price, prev_close, change_pct, high, low, volume, amount,
+//         source:'feed'|'rest', age_ms}
+//   无价 {ok:false, market, code, reason}   ← 币安链未装配/池外且 REST 失败，前端如实显示"无现价快照"
+// 分轨铁律：CN 现价唯一通道是 api/index.js 的 /api/stock/lookup（新浪→东财四级链）；
+// 本口传 market=CN 后端直接 400，前端 parseCode 分支绝不把 A股代码打到这里。
+// English: the non-CN drawer quote leg — feed-first, REST-fallback; CN stays on stock/lookup.
+export async function fetchBinanceQuote(market, code) {
+  const q = new URLSearchParams({ market: String(market || ''), code: String(code || '') })
+  return request('/api/binance/quote?' + q.toString())
+}

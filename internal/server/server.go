@@ -241,6 +241,12 @@ type Server struct {
 	// English: per-(account, market) last dispatch report closure; nil omits the "dispatch" node entirely.
 	dispatchSource func(userID, market string) (any, bool)
 
+	// quoteSource §市场分家-1 US/CRYPTO 单票现价腿：(账号, 市场, 代码) → BinanceQuoteView 值。
+	// nil=未接币安链（/api/binance/quote 对该账号恒 ok=false）；装配层实现=engine 的
+	// feed 快照+REST 回落（server 不反向依赖 engine，同 fng/xevents/dispatch 惯例）。
+	// CN 现价永不走这条腿——/api/stock/lookup 的四级链一字不动。
+	quoteSource func(userID, market, code string) (any, bool)
+
 	// cnMaster §CN-MASTER A股总开关的 boot 快照（main.go 经 SetCNMaster 注入，运行期不再变化），
 	// 随 /api/status 的 cn_master 字段下发给前端做导航隐藏。展示口径必须与进程实际在跑的
 	// 循环一致，故用启动快照而非每请求热读 Rules（热轮换不改装配）。
@@ -677,6 +683,8 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("GET /api/binance/state", s.adminMiddleware(s.handleBinanceState))
 	// §BINANCE-P5 新市场（US/CRYPTO）历史 K 线只读面（研究库 daily 表）：CN 仍走 /api/kline，两链分轨。
 	s.mux.HandleFunc("GET /api/binance/kline", s.authMiddleware(s.handleBinanceKline))
+	// §市场分家-1 详情抽屉头部现价的非 CN 轨（CN→400 分轨，与 kline 同姿势；只读、登录态）。
+	s.mux.HandleFunc("GET /api/binance/quote", s.authMiddleware(s.handleBinanceQuote))
 	s.mux.HandleFunc("GET /api/binance/orders", s.adminMiddleware(s.handleBinanceOrders))
 	s.mux.HandleFunc("GET /api/binance/exchange_info", s.adminMiddleware(s.handleBinanceExchangeInfo))
 	s.mux.HandleFunc("POST /api/binance/cancel", s.adminMiddleware(s.handleBinanceCancel))

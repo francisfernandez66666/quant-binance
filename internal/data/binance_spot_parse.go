@@ -22,16 +22,23 @@ import (
 )
 
 // parseSpotMiniTicker 解析 @miniTicker / @24hrMiniTicker（字段 e,E,s,o,c,h,l,v,Q）。
+//
+// ⚠ Ev（事件名 "24hrMiniTicker"）必须显式吸收：encoding/json 找不到精确键时会按
+// **大小写不敏感**回退匹配，字符串键 "e" 会撞上时间戳字段 `json:"E" int64` 并抛
+// "cannot unmarshal string into ... int64"——真实币安帧必带 "e"，缺这个字段就是
+// "订阅成功、每帧解析失败、永远 0 命中"的静默假活（2026-09-24 §市场分家-1 现价腿
+// 单测实锤；反假绿纪律在 binance_us_quote.go 文件头同款）。
 func parseSpotMiniTicker(raw []byte) (binanceTick, error) {
 	var m struct {
-		T int64  `json:"E"`
-		S string `json:"s"`
-		O string `json:"o"`
-		C string `json:"c"`
-		H string `json:"h"`
-		L string `json:"l"`
-		V string `json:"v"`
-		Q string `json:"Q"`
+		Ev string `json:"e"` // 事件名：显式精确匹配接走，防大小写撞 "E"
+		T  int64  `json:"E"`
+		S  string `json:"s"`
+		O  string `json:"o"`
+		C  string `json:"c"`
+		H  string `json:"h"`
+		L  string `json:"l"`
+		V  string `json:"v"`
+		Q  string `json:"Q"`
 	}
 	if err := json.Unmarshal(raw, &m); err != nil {
 		return binanceTick{}, fmt.Errorf("miniTicker 解析失败: %w", err)
@@ -48,17 +55,19 @@ func parseSpotMiniTicker(raw []byte) (binanceTick, error) {
 }
 
 // parseSpotTicker 解析 @ticker（24hr 统计：o=24h 前开盘、c=最新、P=百分比涨跌、Q=计价额）。
+// ⚠ Ev 显式吸收同 miniTicker：真实帧带 "e"（事件名），不吃掉就会大小写撞车 "E" 整帧报废。
 func parseSpotTicker(raw []byte) (binanceTick, error) {
 	var m struct {
-		T int64  `json:"E"`
-		S string `json:"s"`
-		O string `json:"o"`
-		C string `json:"c"`
-		H string `json:"h"`
-		L string `json:"l"`
-		V string `json:"v"`
-		Q string `json:"Q"`
-		P string `json:"P"`
+		Ev string `json:"e"` // 事件名："24hrTicker"——显式精确匹配接走
+		T  int64  `json:"E"`
+		S  string `json:"s"`
+		O  string `json:"o"`
+		C  string `json:"c"`
+		H  string `json:"h"`
+		L  string `json:"l"`
+		V  string `json:"v"`
+		Q  string `json:"Q"`
+		P  string `json:"P"`
 	}
 	if err := json.Unmarshal(raw, &m); err != nil {
 		return binanceTick{}, fmt.Errorf("ticker 解析失败: %w", err)

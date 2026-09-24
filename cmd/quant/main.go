@@ -464,6 +464,16 @@ func main() {
 		rep, ok := e.DispatchReports()[market]
 		return rep, ok
 	})
+	// §市场分家-1 US/CRYPTO 单票现价闭包：/api/binance/quote 按（账号,市场,代码）读该引擎
+	// 现价源（feed 快照优先、REST 24h 回落，见 internal/engine/binance_quote.go）。
+	// 引擎未建/未接币安链/两档无价 → ok=false，抽屉头部如实显示"无现价快照"。
+	srv.SetQuoteSource(func(uid, market, code string) (any, bool) {
+		e := registry.GetOrCreate(uid)
+		if e == nil {
+			return nil, false
+		}
+		return e.BinanceQuote(context.Background(), market, code)
+	})
 
 	// §R6 P1-1 部署漂移自检：启动阶段汇总高影响配置的"声明态 vs 实际生效态"，与二进制指纹一并
 	// 落到 opslog + 启动日志，早期暴露 2026-09-01 三类线上事故（旧二进制缺修复 / LLM key 拼写/

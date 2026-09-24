@@ -7,6 +7,26 @@
 import React, { useState, useEffect, useMemo, useRef } from 'react'
 import { useNavigate } from 'react-router-dom'
 
+// §市场分家-1：直达个股的判定从「纯六位数字」放宽为三市场可识别形态（stockLikeQuery 返回规范化
+// 代码或 null）：CN 六位裸码/带 .SH.SZ.BJ 后缀；US 点分形态（AAPL.US、BRK.B）；CRYPTO 币安计价
+// 币对尾缀（BTCUSDT 等）。裸美股 ticker（AAPL）故意不算——面板查询是自由文本，纯字母词会误命中
+// 「查看 … 个股详情」把页面搜索挤掉。抽屉侧已按 parseCode 分轨取价/画图，此处只放宽入口。
+// English: §MKT-SPLIT-1 — the open-stock shortcut now accepts tri-market code shapes (CN 6-digit,
+// US dotted codes, CRYPTO quote-suffix pairs). Bare letter tickers stay ambiguous with page-name
+// searches on purpose; the drawer already branches by parseCode for quote/chart legs.
+const PALETTE_PAIR_RE = /(USDT|USDC|BUSD|FDUSD|TUSD|USDD|DAI|BTC|ETH|BNB|EUR|TRY|JPY|AUD)$/
+export function stockLikeQuery(q) {
+  const s = String(q || '').trim().toUpperCase()
+  if (!s) return null
+  if (/^\d{6}$/.test(s)) return s
+  if (/^\d{6}\.(SH|SZ|BJ)$/.test(s)) return s
+  // US 点分：字母数字+点、字母结尾（AAPL.US / BRK.B），排除「设置。」这类中文标点输入
+  if (s.indexOf('.') >= 0 && /^[A-Z0-9.]{2,12}$/.test(s) && /[A-Z]$/.test(s)) return s
+  // CRYPTO 币对：≥6 位纯大写数字字母 + 计价币尾缀 + 尾缀前至少 3 个字母（排除 "TESTBTC" 类误命中仍可控）
+  if (/^[A-Z0-9]{6,16}$/.test(s) && PALETTE_PAIR_RE.test(s) && /^[A-Z0-9]{3,}(USDT|USDC|BUSD|FDUSD|TUSD|USDD|DAI|BTC|ETH|BNB|EUR|TRY|JPY|AUD)$/.test(s)) return s
+  return null
+}
+
 // filterCommands 按查询串对命令做子序列匹配（大小写不敏感），返回带匹配序的过滤结果。空查询返回全部。
 // English: subsequence match (case-insensitive) of each command's label against the query; empty query
 // returns all. Preserves input order.
@@ -37,23 +57,24 @@ export default function CommandPalette({ pages = [], onOpenStock, onClose }) {
   const [query, setQuery] = useState('')
   const [active, setActive] = useState(0)
   const inputRef = useRef(null)
-  const codeQuery = /^\d{6}$/.test(query.trim())
+  // §市场分家-1：三市场代码形态统一判定（null=非代码，走页面模糊搜索）
+  const codeHit = stockLikeQuery(query)
 
-  // 命令 = 各页面跳转 + （六位代码时）查看个股详情
-  // English: commands = one navigate action per page + (when 6-digit) open-stock-detail.
+  // 命令 = 各页面跳转 + （识别为标的代码时）查看个股详情
+  // English: commands = one navigate action per page + (when query looks like a code) open-stock-detail.
   const items = useMemo(() => {
     const list = pages.map((p) => ({
       id: p.to, label: p.label, hint: p.to, group: '页面',
       run: () => { navigate(p.to); onClose() },
     }))
-    if (codeQuery && onOpenStock) {
+    if (codeHit && onOpenStock) {
       list.unshift({
-        id: 'stock:' + query.trim(), label: `查看 ${query.trim()} 个股详情`, hint: '个股', group: '个股',
-        run: () => { onOpenStock(query.trim()); onClose() },
+        id: 'stock:' + codeHit, label: `查看 ${codeHit} 个股详情`, hint: '个股', group: '个股',
+        run: () => { onOpenStock(codeHit); onClose() },
       })
     }
     return list
-  }, [pages, query, codeQuery, navigate, onOpenStock, onClose])
+  }, [pages, codeHit, navigate, onOpenStock, onClose])
 
   const results = useMemo(() => filterCommands(items, query), [items, query])
   useEffect(() => { setActive(0) }, [query])
@@ -80,7 +101,7 @@ export default function CommandPalette({ pages = [], onOpenStock, onClose }) {
           value={query}
           onChange={(e) => setQuery(e.target.value)}
           onKeyDown={onKeyDown}
-          placeholder="搜索页面或输入 6 位代码…"
+          placeholder="搜索页面，或输入代码（600519 / AAPL.US / BTCUSDT）…"
           aria-label="命令搜索"
           style={{ width: '100%', border: 'none', outline: 'none', padding: '16px 18px', fontSize: 15, background: 'transparent', color: 'var(--app-text)', borderBottom: '1px solid var(--app-divider)' }}
         />

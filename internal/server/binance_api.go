@@ -11,6 +11,7 @@ import (
 	"encoding/json"
 	"log"
 	"net/http"
+	"strings"
 	"time"
 
 	"quant-trading-v2/internal/data"
@@ -59,6 +60,63 @@ func (s *Server) SetXEventsSource(fn func(market string) (events []map[string]an
 // markets with no tick yet report ok=false.
 func (s *Server) SetDispatchSource(fn func(userID, market string) (any, bool)) {
 	s.dispatchSource = fn
+}
+
+// SetQuoteSource §市场分家-1 注入 US/CRYPTO 单票现价闭包（装配层=main.go 按账号读引擎
+// 的 feed 快照+REST 回落现价源）。nil=未注入，/api/binance/quote 恒 ok=false（零配置零行为，
+// 同 fng/dispatch 惯例）；CN 现价永不走本端点——那条腿只有 /api/stock/lookup 一家。
+// English: injects the per-(account, market, code) Binance quote closure; nil keeps the
+// endpoint reporting ok=false. The CN quote chain is untouched and stays on stock/lookup.
+func (s *Server) SetQuoteSource(fn func(userID, market, code string) (any, bool)) {
+	s.quoteSource = fn
+}
+
+// handleBinanceQuote GET /api/binance/quote?market=US|CRYPTO&code=：详情抽屉头部现价的
+// 非 CN 轨（市场分家：抽屉对美股/加密货币标的不再打 /api/stock/lookup 的 A股四级链）。
+// 契约：market 必填且只认 US/CRYPTO（CN→400 两链分轨，与 /api/binance/kline 同姿势）；
+// 拿不到有效价（feed 未订阅+REST 失败/未装配）→ 200 {"ok":false}——无证据如实报无，
+// 绝不回 0 价伪装、绝不借 CN 数据兜底。authMiddleware（登录态只读展示面，同 kline）。
+// English: the non-CN quote leg of the detail drawer. CN is rejected with 400 (track
+// separation); a missing quote answers ok=false — never a fabricated zero, never CN data.
+func (s *Server) handleBinanceQuote(w http.ResponseWriter, r *http.Request) {
+	q := r.URL.Query()
+	market := data.NormalizeMarketKey(q.Get("market"))
+	if market != "US" && market != "CRYPTO" {
+		writeError(w, http.StatusBadRequest, "本端点只服务 US/CRYPTO 现价，CN 请走 /api/stock/lookup")
+		return
+	}
+	code := strings.ToUpper(strings.TrimSpace(q.Get("code")))
+	if code == "" {
+		writeError(w, http.StatusBadRequest, "code 不能为空")
+		return
+	}
+	if s.quoteSource == nil {
+		writeJSON(w, 200, map[string]any{"ok": false, "market": market, "code": code,
+			"reason": "币安链未装配（无现价源）"})
+		return
+	}
+	view, ok := s.quoteSource(userIDFor(r), market, code)
+	if !ok {
+		writeJSON(w, 200, map[string]any{"ok": false, "market": market, "code": code,
+			"reason": "无现价快照：feed 未订阅该标的且 REST 取价失败"})
+		return
+	}
+	// view 为 engine.BinanceQuoteView 值（自带 json tag）；展平到响应顶层 + ok=true。
+	raw, err := json.Marshal(view)
+	if err != nil {
+		writeJSON(w, 200, map[string]any{"ok": false, "market": market, "code": code,
+			"reason": "现价视图序列化失败"})
+		return
+	}
+	var out map[string]any
+	if err := json.Unmarshal(raw, &out); err != nil {
+		writeJSON(w, 200, map[string]any{"ok": false, "market": market, "code": code,
+			"reason": "现价视图解码失败"})
+		return
+	}
+	out["ok"] = true
+	out["market"] = market
+	writeJSON(w, 200, out)
 }
 
 // handleBinanceState GET /api/binance/state：双市场控制器快照 + 执行器/接收器健康度。

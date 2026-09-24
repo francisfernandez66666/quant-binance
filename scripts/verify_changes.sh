@@ -1368,8 +1368,10 @@ if grep -rn 'WalkForward: nil' internal cmd --include='*.go' | grep -v _test.go 
 if grep -rn 'SlippagePassthrough:' internal/config/ --include='*.go' | grep -q .; then echo "--- FAIL: §ENH-B7 internal/config/ 出现 SlippagePassthrough 非零初始化（工厂必须保持 0=关）"; exit 1; fi
 # Go 零新依赖红线（§2.9）：图表依赖只准留在 web/，go.mod/go.sum 出现 lightweight 即违例。
 if grep -qi 'lightweight' go.mod go.sum; then echo "--- FAIL: §ENH-B5 go.mod/go.sum 出现 lightweight 依赖（Go 侧零新依赖红线）"; exit 1; fi
-# B5 试点范围锁：XProChart 仅组件+测试，未授权前不得进入 pages/ 现网页。
-if grep -rq 'XProChart' web/src/pages/; then echo "--- FAIL: §ENH-B5 XProChart 越出试点范围进入 pages/"; exit 1; fi
+# B5 试点范围锁：XProChart 原为「组件+测试」试点；§市场分家-1（2026-09-24 owner 缺陷单）
+# 只授权扩展 Positions.jsx 展开行（US/CRYPTO 专业蜡烛图，替代 CN 分时误挂）。白名单外的
+# pages/ 出现 XProChart 仍是越界——试点扩面要逐页授权，不允许借修复批整体解禁。
+if grep -rl 'XProChart' web/src/pages/ | grep -v '^web/src/pages/Positions.jsx$' | grep -q .; then echo "--- FAIL: §ENH-B5 XProChart 进入未授权页面（白名单仅 Positions.jsx）"; exit 1; fi
 # ---- A2/A3 观测面交付物：三文件在位 + 可解析 + 明文密钥负锁 ----
 test -f ops/gatus/config.yaml && test -f ops/grafana/dashboard.json && test -f ops/prometheus/prometheus.yml || { echo "--- FAIL: §ENH-A2/A3 ops/ 观测面三件套缺失"; exit 1; }
 ruby -ryaml -e 'YAML.safe_load(File.read(ARGV[0]))' ops/prometheus/prometheus.yml || { echo "--- FAIL: §ENH-A2 prometheus.yml YAML 解析失败"; exit 1; }
@@ -1457,6 +1459,36 @@ grep -q 'body.dispatch = {' web/src/components/BinanceConfigPanel.jsx || { echo 
 grep -q '未派发过' web/src/components/BinanceStatusCard.jsx || { echo "--- FAIL: §战法批-5 状态卡「从未派发」如实呈现丢失"; exit 1; }
 grep -q 'EDGARTickersPath = "/files/company_tickers.json"' internal/data/edgar_tickers.go || { echo "--- FAIL: §MR-EDGAR-TKR 映射表路径丢失"; exit 1; }
 echo "ok - §MR-4/战法批/CN-MASTER 专项守卫通过（行为回归 12 组 + 静态锁 12 道〔含币安节拍误包负锁〕）"
+
+echo "==> 63 §市场分家-1：顶部市场切换全局生效 + /api/binance/quote 现价腿 + 币安 WS 帧 E 字段碰撞修复（2026-09-24）..."
+# 背景：用户缺陷「切到美股/加密货币后全站仍是 A股信息」。后端补 US/CRYPTO 单票现价端点
+# （feed 优先→REST TTL 兜底，CN/缺 market 一律 400 分轨）；前端把全局开关接进 Signals/
+# Watchlist/Paper/Dashboard/Hotspot/EmotionReview/MsgCenter/Consult/命令面板/详情抽屉。
+# 附带实锤修复：币安真实帧的 "e"（事件名字符串）被 Go json 大小写不敏感回退灌进
+# struct 的 int64 E 字段 → miniTicker/ticker 每帧解析失败（订阅成功、永远 0 命中）。
+# ---- 行为锁①：§市场分家-1 现价源三态（feed 命中/REST 兜底+TTL/诚实失败）+ market 闸 ----
+go test -count=1 ./internal/engine/ -run 'TestQuoteSource|TestEngineQuote' 2>&1 | grep -q '^ok' || { echo "--- FAIL: §市场分家-1 现价源回归未过"; exit 1; }
+go test -count=1 ./internal/server/ -run 'TestQuoteEndpoint' 2>&1 | grep -q '^ok' || { echo "--- FAIL: §市场分家-1 /api/binance/quote 端点回归未过"; exit 1; }
+# 行为锁②：币安现货帧解析回归（真 "e" 字段帧必须可解——回归即整链 0 命中复辟）
+go test -count=1 ./internal/data/ -run 'TestParseSpot' 2>&1 | grep -q '^ok' || { echo "--- FAIL: §市场分家-1 现货帧解析回归未过"; exit 1; }
+# 行为锁③：前端全局过滤 8 例（面板代码识别/四页 tab 门/自选添加入口拒收/抽屉现价腿双向互斥）
+( cd web && npx vitest run src/__tests__/mkt_split_p1.test.jsx >/dev/null 2>&1 ) || { echo "--- FAIL: §市场分家-1 前端市场过滤 vitest 未通过"; exit 1; }
+# ---- 静态锁：后端接线三点 + 碰撞吸收字段 ----
+grep -q '"GET /api/binance/quote"' internal/server/server.go || { echo "--- FAIL: §市场分家-1 现价路由丢失"; exit 1; }
+grep -q 'srv.SetQuoteSource(' cmd/quant/main.go || { echo "--- FAIL: §市场分家-1 现价闭包未注入（端点恒「链未装配」）"; exit 1; }
+grep -q 'e.SetBinanceQuoteFeeds(bnFeeds)' internal/engine/registry.go || { echo "--- FAIL: §市场分家-1 feed 池未接引擎（现价只剩 REST 一条腿）"; exit 1; }
+# E 字段碰撞修复双锁：两个解析 struct 各留一个 Ev 吸收字段，删一个=对应帧族复活全灭
+[ "$(grep -c 'Ev string' internal/data/binance_spot_parse.go)" -ge 2 ] || { echo "--- FAIL: §市场分家-1 \"e\" 事件名吸收字段丢失（帧解析碰撞复活）"; exit 1; }
+# ---- 静态锁：前端分轨与入口守卫 ----
+grep -q "if (mkt === 'CN') {" web/src/components/StockDetailDrawer.jsx || { echo "--- FAIL: §市场分家-1 抽屉现价腿市场分轨丢失（新市场回退 CN 四级链）"; exit 1; }
+grep -q '仅支持 A股' web/src/pages/Watchlist.jsx || { echo "--- FAIL: §市场分家-1 自选池添加入口非 CN 拒收丢失（BTCUSDT 混池路径复活）"; exit 1; }
+grep -q 'signals-market-empty' web/src/pages/Signals.jsx || { echo "--- FAIL: §市场分家-1 信号页非 CN 去向提示卡丢失"; exit 1; }
+grep -q 'consult-market-locked' web/src/pages/Consult.jsx || { echo "--- FAIL: §市场分家-1 咨询页非 CN 拒答锁丢失（A股人设静默作答复活）"; exit 1; }
+# 负锁：命令面板旧「纯六位才算代码」判定不得复活（新市场代码被它挡在门外）
+if grep -Fq '/^\d{6}$/.test(query.trim())' web/src/components/CommandPalette.jsx; then echo "--- FAIL: §市场分家-1 命令面板旧六位代码判定复活"; exit 1; fi
+# 负锁：Watchlist 添加入口 api.addWatchlist 之前必须已过市场拒收闸（守卫后置=混池条目先入库再报错）
+if awk '/addMkt !== .CN./{guard=NR} /api\.addWatchlist\(code\)/{if(!guard||guard>NR){print "BAD";exit}}' web/src/pages/Watchlist.jsx | grep -q BAD; then echo "--- FAIL: §市场分家-1 自选添加守卫被挪到入库调用之后（顺序红锁）"; exit 1; fi
+echo "ok - §市场分家-1 专项守卫通过（行为回归 3 组 + vitest 文件锁 1 + 静态锁 8 道〔含面板旧判定/守卫顺序 2 负锁〕）"
 
 echo ""
 echo "==> 全部通过"

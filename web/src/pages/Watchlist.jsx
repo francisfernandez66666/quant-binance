@@ -7,6 +7,11 @@ import * as api from '../api/index.js'
 import KLineChart from '../components/KLineChart.jsx'
 import DepthPanel from '../components/DepthPanel.jsx'
 import StockDetailDrawer from '../components/StockDetailDrawer.jsx'
+// §市场分家-1：自选池评分/分时/盘口三腿全是 CN 链（新浪/东财多维打分），
+// 顶部切到美股/加密货币时列表按 match 清空并给去向提示；新增标的按 parseCode 拒收非 CN，
+// 防止 BTCUSDT 这类混池条目灌进 A股 5s 监控池打空（GAP §G-8 预警的路径就在添加入口）。
+import { parseCode, MARKET_LABELS } from '../utils.market.js'
+import { useMarket } from '../market.jsx'
 
 // 自选股列表的 localStorage 缓存键（账号后缀由 cacheKeyForAccount() 拼接）
 const CACHE_KEY = 'wl_cache_v1'
@@ -73,6 +78,11 @@ export default function Watchlist() {
   // §修复 P2#23：受控排序状态——点击表头排序后持久保留，避免 30s 数据轮询整体替换把排序重置
   // English: P2#23 — controlled sort state keeps the user's column sort across the 30s data poll.
   const [sort, setSort] = useState(null)
+  // §市场分家-1：订阅顶部全局市场开关（全部|A股|美股|加密货币）——本池的行情/评分/
+  // 分时/盘口四腿全是 CN 链，切到非 CN 后列表按 match 过滤为空并给去向提示卡。
+  // English: §MKT-SPLIT-1 — subscribe to the global market tab; the watchlist legs are CN-only,
+  // so non-CN tabs filter the list to empty and render a "where to go instead" hint card.
+  const { market: mktTab, match: mktMatch } = useMarket()
 
   // 初始化：读取缓存、加载数据、启动 30s 轮询
   useEffect(() => {
@@ -88,8 +98,9 @@ export default function Watchlist() {
   useEffect(() => { persistCache(stocks) }, [stocks])
 
   // 按当前排序键计算展示列表，无排序键时按最高维度分倒序
+  // §市场分家-1：先按全局市场开关过滤（自选行无 market 字段，match 回落 parseCode 推断）
   const sortedEvals = (() => {
-    const arr = [...stocks]
+    const arr = stocks.filter((s) => mktMatch(s.market, s.code))
     return arr.sort((a, b) => {
       const sa = Math.max(a.n_score || 0, a.dragon_score || 0, a.db_score || 0, a.dr_score || 0, a.m_score || 0)
       const sb = Math.max(b.n_score || 0, b.dragon_score || 0, b.db_score || 0, b.dr_score || 0, b.m_score || 0)
@@ -183,6 +194,15 @@ export default function Watchlist() {
   async function add() {
     const code = (newCode || '').trim()
     if (!code || adding) return
+    // §市场分家-1：添加入口按 parseCode 拒收非 CN——自选池后端只挂 CN 行情/评分链，
+    // BTCUSDT 这类代码一旦入池会灌进 A股 5s 监控池永远打空（GAP §G-8 的混池路径）。
+    // English: §MKT-SPLIT-1 — reject non-CN codes at the add entry; the watchlist backend only
+    // wires CN quote/evaluation legs, so a BTCUSDT row would sit forever empty in the A-share poll pool.
+    const addMkt = parseCode(code).market
+    if (addMkt !== 'CN') {
+      MessagePlugin.error(`自选股池当前仅支持 A股，「${code}」属于${MARKET_LABELS[addMkt] || addMkt}。美股/加密货币请在「设置 · 交易」接入币安账户后，到对应持仓/委托页查看。`)
+      return
+    }
     setAdding(true)
     try {
       // 调用后端添加接口，返回新股票信息
@@ -314,9 +334,20 @@ export default function Watchlist() {
         </div>
       </Card>
 
-      {/* 自选股表格：可排序列、展开行显示分时图与盘口面板 */}
-      {stocks.length > 0 ? renderStockTable() : (
-        <Card><div className="muted" style={{ padding: 24, textAlign: 'center' }}>暂无自选股，输入代码添加</div></Card>
+      {/* 自选股表格：可排序列、展开行显示分时图与盘口面板
+          §市场分家-1：判空改看过滤后的 sortedEvals（旧版看 stocks.length，非 CN tab 下会渲染空表且无提示） */}
+      {sortedEvals.length > 0 ? renderStockTable() : (
+        <Card>
+          {mktTab !== 'ALL' && mktTab !== 'CN' ? (
+            // 非 CN tab：多维评分链只覆盖 A股，给去向提示而非伪装「暂无自选」
+            <div data-testid="watchlist-market-empty" style={{ padding: 24, textAlign: 'center', color: 'var(--app-muted-2)', lineHeight: 1.8 }}>
+              当前市场：<b style={{ color: 'var(--app-text)' }}>{MARKET_LABELS[mktTab]}</b>——自选股多维评分（N形/龙头/双凸/龙回头/动量）目前仅覆盖 A股。
+              <br />美股/加密货币的行情与交易请走「设置 · 交易」的币安接入；此处可切回「A股」或「全部」。
+            </div>
+          ) : (
+            <div className="muted" style={{ padding: 24, textAlign: 'center' }}>暂无自选股，输入代码添加</div>
+          )}
+        </Card>
       )}
 
       {/* 评分图例：颜色含义 + 各维度操作阈值说明 */}

@@ -11,6 +11,11 @@ import LogModal from '../components/LogModal.jsx'
 import StockDetailDrawer from '../components/StockDetailDrawer.jsx'
 import { on } from '../sseBus.js'
 import { Loading } from '../ui.jsx'
+// §市场分家-1：顶部市场切换 Tab 为全局过滤器——本看板信号全部产自 CN 引擎
+// （dash.FinalSignals），切到美股/加密货币时应如实显示空态并给出该市场的信号去向，
+// 而不是继续铺 A股信号列表（业主拍板：切换后只见对应市场信息，不共用）。
+import { useMarket } from '../market.jsx'
+import { MARKET_LABELS } from '../utils.market.js'
 
 // 顶部快捷筛选：按 remind_level 划分（all/strong/observe/mute）
 const FILTERS = [
@@ -114,6 +119,8 @@ export default function Signals() {
   // English: P2#23 — controlled sort so every column is header-sortable (previously the table had no
   // sorters at all) and the user's chosen sort survives the 5s signal-list poll.
   const [sort, setSort] = useState(null)
+  // §市场分家-1 顶部市场切换的全局过滤器（'ALL' 恒真=存量行为零变更）
+  const { market: mktTab, match: mktMatch } = useMarket()
 
   // 从信号列表中提取全部战法名称作为筛选下拉选项（去重）
   const strategyOptions = Array.from(new Set(signals.map((s) => s.strategy).filter(Boolean)))
@@ -124,7 +131,10 @@ export default function Signals() {
     ? signals.filter((s) => activeDir === 'all' || (s.direction || '做多') === activeDir)
     : signals.filter((s) => s.direction !== '做空')
   // 按等级筛选、战法筛选，并过滤掉「预期差」非标准评级信号
+  // §市场分家-1 先过全局市场闸：本看板信号均为 CN 引擎产物（行内无 market 字段，
+  // match 走代码形态推断=CN），切到 US/CRYPTO 时列表必然清空——空态由非 CN 提示卡接管。
   let filteredSignals = dirScoped
+    .filter((s) => mktMatch(s.market, s.code))
     .filter((s) => (activeFilter !== 'all' ? s.remind_level === activeFilter : true))
     .filter((s) => (activeStrategy !== 'all' ? s.strategy === activeStrategy : true))
     // 过滤掉「预期差」战法（非标准评级信号，不在列表展示）
@@ -473,7 +483,21 @@ export default function Signals() {
         </div>
       )}
 
-      {/* 信号表格：展示筛选后的策略信号列表，支持表头排序、展开行时图、行点击触发移动端面板 */}
+      {/* 信号表格：展示筛选后的策略信号列表，支持表头排序、展开行时图、行点击触发移动端面板。
+          §市场分家-1 市场分家：本表数据源是 CN 引擎看板（/api/signals），切到美股/加密货币
+          时不再铺 A股信号——如实给"该市场信号去向"提示卡（信号→派发直达委托，成交看持仓/交易台）。 */}
+      {mktTab !== 'ALL' && mktTab !== 'CN' ? (
+        <Card>
+          <div data-testid="signals-market-empty" style={{ padding: '28px 16px', textAlign: 'center', color: 'var(--app-text-2)', fontSize: 13, lineHeight: 1.8 }}>
+            <div style={{ fontSize: 15, fontWeight: 700, marginBottom: 6 }}>当前市场：{MARKET_LABELS[mktTab] || mktTab}——暂无独立信号看板</div>
+            <div>
+              {mktTab === 'CRYPTO' ? '加密货币' : '美股'}信号由战法引擎（事件打分+技术腿）产出后<b>直接进入派发台下单/纸面成交</b>，
+              不落本看板；成交与委托请在「持仓」「交易台」按市场查看，派发摘要在「设置 · 交易」的派发卡。
+            </div>
+            <div style={{ color: 'var(--app-muted-2)', fontSize: 12, marginTop: 8 }}>切回「A股」或「全部」查看 A股策略信号</div>
+          </div>
+        </Card>
+      ) : (
       <Card>
         <Table
           rowKey="code"
@@ -500,6 +524,7 @@ export default function Signals() {
           empty={loading ? '加载信号中…' : loadErr ? '信号加载失败，请点上方「重试」' : '暂无信号'}
         />
       </Card>
+      )}
 
       {/* 移动端底部操作面板：点击行时弹出，提供买入/模拟买入/忽略/收藏/分时等快捷操作 */}
       {sheetSignal && (

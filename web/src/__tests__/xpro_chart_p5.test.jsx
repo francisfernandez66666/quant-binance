@@ -52,7 +52,10 @@ vi.mock('lightweight-charts', () => {
 
 // ── 桩 fetch 层：受控/自拉两条路都走它，URL 参数即端点契约 ──
 const fetchBinanceKline = vi.fn()
-vi.mock('../api/binance.js', () => ({ fetchBinanceKline: (...a) => fetchBinanceKline(...a) }))
+// §市场分家-1 配套：抽屉现价腿改按市场分轨后，binance 模块多了 fetchBinanceQuote 消费点——
+// 整模块桩必须同步补该导出（缺它时抽屉挂载即 TypeError，P5 分轨锁全红）。回包恒 ok=false：
+// 现价缺失走诚实空位，本文件只锁图表分轨，不锁现价数值。
+vi.mock('../api/binance.js', () => ({ fetchBinanceKline: (...a) => fetchBinanceKline(...a), fetchBinanceQuote: async () => ({ ok: false }) }))
 // 抽屉的实时价轮询与本批无关，桩掉避免 jsdom 里真发请求
 vi.mock('../api/index.js', () => ({ fetchStockLookup: () => Promise.resolve(null) }))
 vi.mock('../components/MinuteView.jsx', () => ({ default: ({ code }) => <div data-testid="minuteview-stub">{code}</div> }))

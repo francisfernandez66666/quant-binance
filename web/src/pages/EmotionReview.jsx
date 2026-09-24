@@ -14,6 +14,9 @@
 import React, { useEffect, useMemo, useState } from 'react'
 import { Card, Button } from 'tdesign-react'
 import * as api from '../api/index.js'
+// §市场分家-1：全局市场开关订阅（非 CN tab 早返回，见组件内 §MKT-SPLIT-1 注释）
+import { useMarket } from '../market.jsx'
+import { MARKET_LABELS } from '../utils.market.js'
 
 // 六相位配色（与 MarketStatusBar / SentimentCard 同表）
 const EMOTION_COLOR = {
@@ -110,6 +113,23 @@ export default function EmotionReview() {
 
   // 当前悬停日（hover 索引对应序列项，未悬停或越界为 null）
   const hoverDay = hover != null && series[hover] ? series[hover] : null
+
+  // §市场分家-1：涨停家数/情绪相位/模拟盘净值三条腿全是 A股链，非 CN tab 整页早返回去向提示。
+  // English: §MKT-SPLIT-1 — limit-up count / emotion phase / CN paper equity are all CN legs; non-CN
+  // tabs early-return a pointer card.
+  const { market: mktTab } = useMarket()
+  if (mktTab !== 'ALL' && mktTab !== 'CN') {
+    return (
+      <div className="page">
+        <Card>
+          <div data-testid="emotion-market-empty" style={{ padding: 24, textAlign: 'center', color: 'var(--app-muted-2)', lineHeight: 1.8 }}>
+            当前市场：<b style={{ color: 'var(--app-text)' }}>{MARKET_LABELS[mktTab]}</b>——情绪回看（涨停家数/情绪相位/A股模拟盘净值）目前仅覆盖 A股。
+            <br />加密货币市场情绪（恐惧贪婪指数）在「设置 · 交易」的币安面板可见；此处可切回「A股」或「全部」。
+          </div>
+        </Card>
+      </div>
+    )
+  }
 
   return (
     <div className="page">

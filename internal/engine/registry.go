@@ -1098,6 +1098,9 @@ func (r *Registry) build(userID string) *Engine {
 				},
 				data.NewXEventScorer(nil),
 			))
+			// §市场分家-1 现价腿：把在位行情 feed 表交给引擎只读查询面（/api/binance/quote）。
+			// 空表也装配——feed 未订阅时现价格退化为 REST-only，唯独不再回落 CN 链。
+			e.SetBinanceQuoteFeeds(bnFeeds)
 		}
 		e.SetLiveRouter(liveRouter)
 		// 回报接收器随引擎启动（进程级生命周期，与引擎共存亡；单腿失败内部降级不阻塞）。

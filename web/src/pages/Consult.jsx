@@ -8,6 +8,12 @@ import Disclaimer from '../components/Disclaimer.jsx'
 import * as api from '../api/index.js'
 import { showToast } from '../ui.jsx'
 import Markdown from '../components/Markdown.jsx'
+// §市场分家-1：咨询后端是 A股顾问链（六位码正则取数 + 「A股股票投资顾问」人设，engine.go
+// 2500/2868/llm.go:1135），美股/加密货币 tab 下拒答而非静默按 A股人设作答。
+// English: §MKT-SPLIT-1 — the consult backend is the A-share advisor chain; under US/CRYPTO tabs
+// the input is disabled with an honest note instead of silently answering with the A-share persona.
+import { useMarket } from '../market.jsx'
+import { MARKET_LABELS } from '../utils.market.js'
 
 // 将 ISO 时间格式化为 HH:mm:ss，用于消息气泡展示
 function fmtTime(t) {
@@ -30,6 +36,8 @@ export default function Consult() {
   const [messages, setMessages] = useState([])
   const [draft, setDraft] = useState('')
   const [loading, setLoading] = useState(false)
+  // §市场分家-1：全局市场开关——非 CN tab 下咨询输入区禁用并给拒答说明（本链路只懂 A股）
+  const { market: mktTab } = useMarket()
   const chatBox = useRef(null) // 聊天消息容器引用（自动滚动到底部）
 
   // 带数据咨询默认开（§生产 20260916：AI 顾问必须拿到个股近期+今日实测数据再回答）；挂载后以 GET /api/consult/pro-mode 为准
@@ -219,6 +227,15 @@ export default function Consult() {
 
   // 渲染底部输入区域：多行文本框 + 发送按钮，支持 Enter 发送、Shift+Enter 换行
   function renderInputArea() {
+    // §市场分家-1：非 CN tab 整区替换为拒答提示——后端只挂 A股取数与人设，
+    // 放开输入会得到「问 AAPL 答 A股」的静默错配（比禁用更伤信任）。
+    if (mktTab !== 'ALL' && mktTab !== 'CN') {
+      return (
+        <div data-testid="consult-market-locked" style={{ marginTop: 12, padding: '10px 12px', borderRadius: 6, background: 'var(--app-surface-2)', color: 'var(--app-muted-2)', fontSize: 13, lineHeight: 1.7 }}>
+          股票咨询目前仅支持 <b>A股</b>（自动取数与顾问人设均为 A股链路）。当前市场：{MARKET_LABELS[mktTab]}——美股/加密货币分析请走行情/持仓页的专业图表与提醒；如需咨询可切回「A股」或「全部」。
+        </div>
+      )
+    }
     // 发送按钮：加载中或无输入时禁用
     const sendBtn = (
       <Button theme="primary" onClick={onSend} disabled={loading || !draft.trim()}>

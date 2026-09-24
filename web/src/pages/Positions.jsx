@@ -7,6 +7,9 @@ import React, { useState, useEffect, useRef, useMemo } from 'react'
 import { Tabs, Card, Table, Dialog, Form, Input, InputNumber, Button, Tag, MessagePlugin } from 'tdesign-react'
 import * as api from '../api/index.js'
 import MinuteView from '../components/MinuteView.jsx'
+// §市场分家-1：行展开分时图只属 CN 源；US/CRYPTO 行改挂专业日 K 蜡烛图（与详情抽屉分轨同源，
+// 此前对币对/美股行挂 MinuteView 会打 /api/minute 的 A股链，出「暂无分时数据」空图）
+import XProChart from '../components/XProChart.jsx'
 import StockDetailDrawer from '../components/StockDetailDrawer.jsx'
 import { on } from '../sseBus.js'
 import { createStaleGuard } from '../utils/staleGuard.js' // §M-10 轮询后到丢弃
@@ -752,9 +755,12 @@ export default function Positions() {
                 expandOnRowClick={false}
                 expandedRowKeys={Array.from(klineOpen)}
                 onExpandChange={(keys) => setKlineOpen(new Set(keys))}
-                //  行展开渲染分时图 
+                //  行展开渲染分时图（§市场分家-1：分时源只有 CN 一条腿——US/CRYPTO 行改挂
+                //  专业日 K 蜡烛图，不再让美股/币对行打 A股分时链出空图说"暂无分时数据"） 
                 expandedRow={({ row }) => (
-                  <MinuteView code={row.code} name={row.name} />
+                  rowMarket(row) === 'CN'
+                    ? <MinuteView code={row.ts_code || row.code} name={row.name} />
+                    : <XProChart code={row.ts_code || row.code} market={rowMarket(row)} name={row.name} />
                 )}
               />
             </Card>

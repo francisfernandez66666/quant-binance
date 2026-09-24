@@ -7,6 +7,12 @@ import * as api from '../api/index.js'
 import StockDetailDrawer from '../components/StockDetailDrawer.jsx'
 import useSseRefresh from '../useSseRefresh.js'
 import { confirmDialog } from '../ui.jsx'
+// §市场分家-1：消息中心按全局市场开关过滤（提醒由 CN 监控链与币安派发链共用产出，
+// 行内 code 用 parseCode 推断所属市场）；非 CN tab 且无消息时给分市场话术而非「暂无消息」。
+// English: §MKT-SPLIT-1 — filter the alert feed by the global market tab (rows carry mixed
+// CN-monitor and Binance-dispatch origins; market is inferred from the code).
+import { useMarket } from '../market.jsx'
+import { MARKET_LABELS } from '../utils.market.js'
 
 
 // 消息等级过滤选项：key 对应过滤逻辑，label 为按钮文案
@@ -53,6 +59,8 @@ export default function MsgCenter() {
   // §PERM-GATE 20260918：删除/清空/模拟卖出的后端守卫均为 admin（server.go:599/625/626），
   // 成员显示按钮必 403；与 Quant/Paper 姿势对齐，非管理员隐藏这三个操作入口。
   const admin = api.isAdmin()
+  // §市场分家-1：订阅全局市场开关（mktMatch 用于 filteredAlerts 首道过滤，mktTab 用于空态话术）
+  const { market: mktTab, match: mktMatch } = useMarket()
   const PAGE_SIZE = 50
 
   // 按交易信号中的战法名称统计可选战法
@@ -68,6 +76,8 @@ export default function MsgCenter() {
   // 根据等级与战法筛选消息列表
   const filteredAlerts = useMemo(() => {
     let list = alerts
+    // §市场分家-1：先按全局市场开关过滤（无 market 字段的行按 code 形态推断，CN 监控链等价保留）
+    list = list.filter(a => mktMatch(a.market, a.code))
     // §SHORT-4 做空消息显隐：关闭时过滤掉做空方向与四做空战法消息
     if (!shortEnabled) {
       const bearTactics = ['高位滞涨', '放量破位', '龙头断板', '利好兑现砸盘']
@@ -90,7 +100,7 @@ export default function MsgCenter() {
       list = list.filter(a => a.strategy !== '预期差')
     }
     return list
-  }, [alerts, activeFilter, activeStrategy, shortEnabled])
+  }, [alerts, activeFilter, activeStrategy, shortEnabled, mktMatch])
 
   // §F5 分页：筛选条件变化回到首页；page 越界时钳制（删除/筛选后总数变小）。
   useEffect(() => { setPage(1) }, [activeFilter, activeStrategy, shortEnabled])
@@ -325,9 +335,15 @@ export default function MsgCenter() {
             ⚠ 消息加载失败：{alertsError}
             <div><Button size="small" variant="outline" theme="warning" style={{ marginTop: 10 }} onClick={load}>重试</Button></div>
           </div>
+        ) : (mktTab !== 'ALL' && mktTab !== 'CN' ? (
+          // §市场分家-1：非 CN tab 的空态区分——多半是该市场暂无提醒，而非全站无消息
+          <div data-testid="msgcenter-market-empty" style={{ textAlign: 'center', padding: 60, color: 'var(--app-text-2)', lineHeight: 1.8 }}>
+            当前市场：<b style={{ color: 'var(--app-text)' }}>{MARKET_LABELS[mktTab]}</b>，暂无该市场的提醒。
+            <br />币安链的成交/风控回报产生后会自动出现在此处；A股监控提醒可切回「A股」或「全部」查看。
+          </div>
         ) : (
           <div style={{ textAlign: 'center', padding: 60, color: 'var(--app-text-2)' }}>暂无消息</div>
-        )
+        ))
       )}
       {filteredAlerts.length > 0 && alertsError && (
         <div style={{ marginBottom: 8, padding: '6px 10px', borderRadius: 6, background: '#fff7e6', border: '1px solid #ffd591', color: 'var(--td-warning-color)', fontSize: 12 }}>

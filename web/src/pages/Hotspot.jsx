@@ -6,6 +6,11 @@ import { Card, Table, Dialog, Tag, Button, Select, MessagePlugin } from 'tdesign
 import * as api from '../api/index.js'
 import { on } from '../sseBus.js'
 import { fetchSignalLogs, fetchStageRecords } from '../api/index.js'
+// §市场分家-1：本页四条腿（板块异动/全市场评分/日历/资讯）全为 A股监控链，非 CN tab 整页
+// 早返回去向提示，避免「切到加密货币仍看一屏 A股板块」。
+// English: §MKT-SPLIT-1 — every Hotspot leg is the CN monitor chain; non-CN tabs early-return a pointer card.
+import { useMarket } from '../market.jsx'
+import { MARKET_LABELS } from '../utils.market.js'
 
 // ── 工具函数 ──
 // 截断异动原因为简短描述
@@ -375,6 +380,21 @@ export default function Hotspot() {
   ]
   // 将资讯列表转成表格行数据（格式化时间并解析情绪/方向/影响标签、板块、个股）
   const newsData = newsItems.map((n, i) => ({ id: 'n' + i, time: fmtNewsTime(n.datetime), title: n.title, tags: newsTags(n), sectors: n.sectors, stocks: n.stocks }))
+
+  // §市场分家-1：全局市场开关（一切 hooks 之后订阅，早返回不影响 hook 顺序）
+  const { market: mktTab } = useMarket()
+  if (mktTab !== 'ALL' && mktTab !== 'CN') {
+    return (
+      <div className="page">
+        <Card>
+          <div data-testid="hotspot-market-empty" style={{ padding: 24, textAlign: 'center', color: 'var(--app-muted-2)', lineHeight: 1.8 }}>
+            当前市场：<b style={{ color: 'var(--app-text)' }}>{MARKET_LABELS[mktTab]}</b>——本页热点板块/全市场评分/异动溯源均为 A股监控链产出，暂无 {MARKET_LABELS[mktTab]}同源数据。
+            <br />{MARKET_LABELS[mktTab]}的行情图表与委托请走「持仓管理」；此处可切回「A股」或「全部」。
+          </div>
+        </Card>
+      </div>
+    )
+  }
 
   return (
     <div className="page">
