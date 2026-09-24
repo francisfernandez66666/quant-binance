@@ -56,11 +56,15 @@ vi.mock('../api/index.js', async () => {
 })
 
 import Dashboard from '../pages/Dashboard.jsx'
+// §QMT-FROZEN：冻结裁决模块缓存的生产写入方是 App.jsx 状态轮询；测试直接喂同一入口，
+// 不 mock 判定逻辑本身（用例结束复位为 null，防跨用例泄漏）。
+import { setCnMaster, FROZEN_HINT_SHORT } from '../gatewayLinkState'
 
 describe('§LINTGATE 概览页「实盘链路」指示渲染', () => {
   beforeEach(async () => {
     cleanup()
     localStorage.clear()
+    setCnMaster(null) // §QMT-FROZEN：裁决缓存复位为「未知」，冻结用例显式置 false
     state.impl = okPayloads()
     const api = await import('../api/index.js')
     for (const name of Object.keys(state.impl)) {
@@ -75,7 +79,8 @@ describe('§LINTGATE 概览页「实盘链路」指示渲染', () => {
     render(<MemoryRouter><Dashboard /></MemoryRouter>)
     const line = await screen.findByText(/实盘链路/, {}, { timeout: 5000 })
     expect(line).toBeInTheDocument()
-    expect(line.textContent).toMatch(/实盘链路：● 自动 正常/)
+    // §QMT-FROZEN 措辞修正：熔断未触发如实说「从未触发」，不再用「正常」冒充熔断机制在运转
+    expect(line.textContent).toMatch(/实盘链路：● 自动 从未触发/)
   })
 
   // E2：熔断载荷 → 同一指示必须如实带「⚠熔断」（防有人把 qmtLine 改回常量占位伪健康）。
@@ -95,5 +100,17 @@ describe('§LINTGATE 概览页「实盘链路」指示渲染', () => {
     // 等首个轮询 tick 落定后再断言缺席（findBy 超时会直接判红，故用短延时）
     await new Promise((r) => setTimeout(r, 120))
     expect(container.textContent).not.toMatch(/实盘链路/)
+  })
+
+  // E4（§QMT-FROZEN）：cn_master=false → 即使 qmtState 从未拉到（网关侧 503/空），
+  // 实盘链路行也必须强制渲染并明说「冻结维护」——旧写法此时返回 ''，
+  // 「链路不存在」与「接口没数据」两种语义在界面上静默成同一种缺失。
+  it('E4 cn_master=false → 实盘链路行强制渲染冻结文案（qmtState 为 null 也不例外）', async () => {
+    setCnMaster(false)
+    state.impl.fetchQMTState = () => { throw Object.assign(new Error('503'), { status: 503 }) }
+    render(<MemoryRouter><Dashboard /></MemoryRouter>)
+    const line = await screen.findByText(/实盘链路/, {}, { timeout: 5000 })
+    expect(line.textContent).toContain('冻结维护')
+    expect(line.textContent).toContain(FROZEN_HINT_SHORT)
   })
 })

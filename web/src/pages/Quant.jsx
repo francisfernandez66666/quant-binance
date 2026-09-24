@@ -14,6 +14,9 @@ import { Card, Form, Input, Button, Tag, Table, MessagePlugin } from 'tdesign-re
 import * as api from '../api/index.js'
 import { confirmDialog } from '../ui.jsx'
 import { fmtCNY2 } from '../utils'
+// §QMT-FROZEN 链路三态（frozen/off/down/live）单源判定：链路状态卡的"假活相"统一由它决定，
+// 不在各字段里各写一份 enabled 判断（那样写会把"这条链路不再存在"显示成"网关开着但连不通"）。
+import { gatewayVerdict, LINK_FROZEN, FROZEN_HINT, FROZEN_HINT_SHORT, NOT_IN_EFFECT } from '../gatewayLinkState'
 // §BINANCE-P4（PLAN §11.2 Quant 执行路径卡扩）：QMT 状态卡之外并列 Binance 状态卡
 // （disclaimer/WS 订阅数/限速余量；端点未上线时 fail-soft 降级展示配置摘要）。
 import BinanceStatusCard from '../components/BinanceStatusCard.jsx'
@@ -863,8 +866,14 @@ export default function Quant() {
      English: render the link-status card — enabled/mode, gateway, circuit-breaker, downlink probe,
      uplink report freshness, and the §QMT-DUAL active path with a guarded (confirm-in-switchBrokerTo) switch. */
   function renderChainStatusCard() {
-    // 首轮轮询未到达：state 为 null，显示占位避免读取未定义字段
-    if (!state) {
+    // §QMT-FROZEN：三态裁决先行——frozen（广州机不再是部署目标）≠ off（链路未启用）
+    // ≠ down（启用了却失联）：冻结时即便 state 从未拉到（/api/qmt/state 503）也必须出卡，
+    // 旧「加载中…」占位在冻结场景下会永远转圈，等于另一种假活。
+    const qmtVerdict = gatewayVerdict(state)
+    const qmtFrozen = qmtVerdict === LINK_FROZEN
+    const st = state || {}
+    // 首轮轮询未到达且链路未冻结：state 为 null，显示占位避免读取未定义字段
+    if (!state && !qmtFrozen) {
       return (
         <Card title="链路状态" style={{ marginBottom: 14 }}>
           <span style={{ fontSize: 13, color: 'var(--app-muted-2)' }}>链路状态加载中…（每 10s 轮询）</span>
@@ -879,67 +888,90 @@ export default function Quant() {
       </div>
     )
     // 运行模式中文标签（auto/manual，未知值原样展示）
-    const modeLabel = state.mode === 'auto' ? '全自动' : (state.mode === 'manual' ? '手动确认' : (state.mode || '—'))
-    // 熔断：已熔断展示红 Tag + 原因/时间，正常展示绿 Tag
-    const breaker = state.tripped ? (
+    const modeLabel = st.mode === 'auto' ? '全自动' : (st.mode === 'manual' ? '手动确认' : (st.mode || '—'))
+    // 熔断：已熔断展示红 Tag + 原因/时间；未熔断如实说「从未触发」——
+    // 旧「正常」绿 Tag 把「时间戳为零、从未有过一次触发」冒充成熔断机制在健康运转（假活相）。
+    const breaker = qmtFrozen ? (
+      <Tag theme="default">{NOT_IN_EFFECT}（链路冻结，健康探测不再运行）</Tag>
+    ) : st.tripped ? (
       <>
         <Tag theme="danger">已熔断</Tag>
         <span style={{ fontSize: 12, color: 'var(--app-up)', marginLeft: 8 }}>
-          {state.trip_reason || '原因未知'}{state.trip_at ? `（${state.trip_at}）` : ''}
+          {st.trip_reason || '原因未知'}{st.trip_at ? `（${st.trip_at}）` : ''}
         </span>
       </>
-    ) : <Tag theme="success">正常</Tag>
+    ) : <Tag theme="default">从未触发</Tag>
     // 下行探测（quant→gateway 连通性）：在线态 + 延迟 + 最近探测时间。
     // 零值时间戳（0001-…/缺失）= 引擎自启动还没探过测（探测只在连续竞价窗口跑，
     // 见 scoring_loop pushRealAdvice 的 IsContinuousTrade 门——桥心跳由 QMT tick 驱动，
     // 盘前/竞价/午休静默属正常，计入失联会每天误熔）——休市属正常，
     // 不能报"失联"（与真断线告警混淆）。
-    const probeNever = !state.last_probe_at || String(state.last_probe_at).startsWith('0001-')
+    const probeNever = !st.last_probe_at || String(st.last_probe_at).startsWith('0001-')
     const probe = (
       <span style={{ fontSize: 12 }}>
-        {probeNever
-          ? <Tag theme="default" title="下行探测仅在连续竞价时段（9:30-11:30 / 13:00-14:57）运行；休市/刚重启后无探测记录属正常">休市未探测</Tag>
-          : (state.last_probe_ok ? <Tag theme="success">连通</Tag> : <Tag theme="danger">失联</Tag>)}
-        {!probeNever && typeof state.last_latency_ms === 'number' ? <span style={{ marginLeft: 8 }}>延迟 {state.last_latency_ms}ms</span> : null}
-        {!probeNever && state.last_probe_at ? <span style={{ marginLeft: 8, color: 'var(--app-text-2)' }}>· {state.last_probe_at}</span> : null}
+        {/* §QMT-FROZEN：冻结优先于"休市未探测"——探测链本身不再有人跑，把它说成"等开盘就好"
+            会把人留在一条已经不会被部署的链路上。 */}
+        {qmtFrozen
+          ? <Tag theme="default">{NOT_IN_EFFECT}（链路已冻结，不再下行探测）</Tag>
+          : probeNever
+            ? <Tag theme="default" title="下行探测仅在连续竞价时段（9:30-11:30 / 13:00-14:57）运行；休市/刚重启后无探测记录属正常">休市未探测</Tag>
+            : (st.last_probe_ok ? <Tag theme="success">连通</Tag> : <Tag theme="danger">失联</Tag>)}
+        {!qmtFrozen && !probeNever && typeof st.last_latency_ms === 'number' ? <span style={{ marginLeft: 8 }}>延迟 {st.last_latency_ms}ms</span> : null}
+        {!qmtFrozen && !probeNever && st.last_probe_at ? <span style={{ marginLeft: 8, color: 'var(--app-text-2)' }}>· {st.last_probe_at}</span> : null}
       </span>
     )
-    // 上行回报（gateway→quant 心跳/成交回执）新鲜度
-    const report = state.last_report_at ? (
+    // 上行回报（gateway→quant 心跳/成交回执）新鲜度。
+    // §QMT-FROZEN：冻结下"暂无回报（非交易时段属正常）"是错误借口——不是等开盘，是永远不会再有回报。
+    const report = qmtFrozen ? (
+      <span style={{ fontSize: 12, color: 'var(--app-text-2)' }}>无数据（网关不再上报）</span>
+    ) : st.last_report_at ? (
       <span style={{ fontSize: 12 }}>
-        最近 {state.last_report_at}
-        {state.last_report_kind ? <span style={{ color: 'var(--app-text-2)' }}>（{state.last_report_kind}）</span> : null}
+        最近 {st.last_report_at}
+        {st.last_report_kind ? <span style={{ color: 'var(--app-text-2)' }}>（{st.last_report_kind}）</span> : null}
       </span>
     ) : <span style={{ fontSize: 12, color: 'var(--app-text-2)' }}>暂无回报（非交易时段属正常）</span>
-    // §QMT-DUAL 执行路径：双通道在线态 + active 高亮 + 切换按钮（switchBrokerTo 内含二次确认，防误切）
+    // §QMT-DUAL 执行路径：双通道在线态 + active 高亮 + 切换按钮（switchBrokerTo 内含二次确认，防误切）。
+    // §QMT-FROZEN：冻结时面板与按钮保留但禁用（owner 规则：实现而非删除）——按钮指向广州网关的
+    // 切换端点，永远 503；不禁用就等于邀请运维去切一条不存在的链路。
     const active = broker && broker.broker === 'queued' ? 'queued' : 'xt'
     const path = (
       <span style={{ fontSize: 12, display: 'inline-flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
-        <Tag theme={active === 'xt' ? 'primary' : 'default'}>miniQMT兼容{broker && broker.xt_connected ? ' ●' : ' ○'}</Tag>
-        <Tag theme={active === 'queued' ? 'primary' : 'default'}>QMT桥兜底{broker && broker.queued_connected ? ' ●' : ' ○'}</Tag>
-        <Button size="xs" variant="outline" theme="warning" loading={switchingBroker} disabled={active === 'xt'} onClick={() => switchBrokerTo('xt')}>切到 miniQMT</Button>
-        <Button size="xs" variant="outline" theme="warning" loading={switchingBroker} disabled={active === 'queued'} onClick={() => switchBrokerTo('queued')}>切到 QMT桥</Button>
-        <span style={{ color: 'var(--app-text-2)' }}>当前：{active === 'queued' ? 'QMT桥兜底' : 'miniQMT兼容'}</span>
+        <Tag theme={qmtFrozen ? 'default' : (active === 'xt' ? 'primary' : 'default')}>miniQMT兼容{!qmtFrozen && broker && broker.xt_connected ? ' ●' : ' ○'}</Tag>
+        <Tag theme={qmtFrozen ? 'default' : (active === 'queued' ? 'primary' : 'default')}>QMT桥兜底{!qmtFrozen && broker && broker.queued_connected ? ' ●' : ' ○'}</Tag>
+        <Button size="xs" variant="outline" theme="warning" loading={switchingBroker} title={qmtFrozen ? FROZEN_HINT_SHORT : undefined} disabled={qmtFrozen || active === 'xt'} onClick={() => switchBrokerTo('xt')}>切到 miniQMT</Button>
+        <Button size="xs" variant="outline" theme="warning" loading={switchingBroker} title={qmtFrozen ? FROZEN_HINT_SHORT : undefined} disabled={qmtFrozen || active === 'queued'} onClick={() => switchBrokerTo('queued')}>切到 QMT桥</Button>
+        {/* 冻结时 broker 快照多半是兜底值（active 默认 'xt'），照读会伪造"当前：miniQMT兼容" */}
+        <span style={{ color: 'var(--app-text-2)' }}>{qmtFrozen ? `当前：${NOT_IN_EFFECT}（链路冻结）` : <>当前：{active === 'queued' ? 'QMT桥兜底' : 'miniQMT兼容'}</>}</span>
       </span>
     )
     return (
       <Card title="链路状态" style={{ marginBottom: 14 }}>
-        {/* 实盘链路行：启用态 + 运行模式 */}
-        {row('实盘链路', <>
-          {state.enabled ? <Tag theme="success">已启用</Tag> : <Tag theme="default">未启用</Tag>}
+        {/* §QMT-FROZEN 冻结横幅：每页一次，先说清"下面全是未生效、不是正常运行"再列字段，
+            否则运维会把一排占位值读成链路亚健康。 */}
+        {qmtFrozen && (
+          <div style={{ fontSize: 12, color: 'var(--td-warning-color)', background: 'var(--app-bg-2, #fff7e6)', border: '1px solid var(--td-warning-color, #e37318)', borderRadius: 6, padding: '8px 10px', marginBottom: 10 }}>
+            {FROZEN_HINT}
+          </div>
+        )}
+        {/* 实盘链路行：启用态 + 运行模式；冻结时配置里的 enabled 是广州时代残留，不再作数 */}
+        {row('实盘链路', qmtFrozen ? <>
+          <Tag theme="default">{NOT_IN_EFFECT}</Tag>
+          <span style={{ fontSize: 12, color: 'var(--app-text-2)', marginLeft: 8 }}>模式：{NOT_IN_EFFECT}</span>
+        </> : <>
+          {st.enabled ? <Tag theme="success">已启用</Tag> : <Tag theme="default">未启用</Tag>}
           <span style={{ fontSize: 12, color: 'var(--app-text-2)', marginLeft: 8 }}>模式：{modeLabel}</span>
         </>)}
-        {/* 网关地址行：广州单机网关 URL */}
-        {row('网关地址', state.gateway_url || '—')}
+        {/* 网关地址行：广州单机网关 URL；冻结时打印它只会勾人去排查一台已下线的机器 */}
+        {row('网关地址', qmtFrozen ? <span style={{ color: 'var(--app-text-2)' }}>{NOT_IN_EFFECT}（广州执行机已下线）</span> : (st.gateway_url || '—'))}
         {/* 熔断行：健康探测触发的自动熔断（与 kill-switch 人工紧急停止相互独立） */}
         {row('熔断', breaker)}
         {/* §M12-A（2026-09-22）资金三态横幅：口径不可得（对账回报超30分钟/未接账本）时自动买入
             已 fail-close 暂停——不提示的话运维侧只会看到"没有买入"，容易误判成没有信号。
             English: §M12-A banner — auto-buy is fail-closed while the cash basis is stale/unknown. */}
-        {state.cash_stale ? row('可用资金', <span style={{ fontSize: 12 }}>
+        {st.cash_stale ? row('可用资金', <span style={{ fontSize: 12 }}>
           <Tag theme="warning">口径不可得</Tag>
           <span style={{ marginLeft: 8, color: 'var(--app-up)' }}>
-            对账回报过期，自动买入已暂停（手动下单不受影响）；最近原始值 {Number(state.cash || 0).toFixed(2)}
+            对账回报过期，自动买入已暂停（手动下单不受影响）；最近原始值 {Number(st.cash || 0).toFixed(2)}
           </span>
         </span>) : null}
         {/* §U-2 kill-switch（人工紧急停止）状态与入口：置位=拒绝一切新单+撤销在途委托，立即生效 */}
@@ -995,8 +1027,12 @@ export default function Quant() {
       <Card title="当日委托" style={{ marginBottom: 14 }}>
         <div style={{ fontSize: 11, color: 'var(--app-text-2)', marginBottom: 10 }}>状态由网关回报单调推进（已报→部成/已成/已撤）；未成交委托可撤，10s 刷新</div>
         {/* §M-9（2026-09-22 修复批）三态分离：loading（orders==null 且无错误）/
-            error（可重试提示，不再无限「加载中」）/ 空（今日暂无委托）/ 有数据（表格）。 */}
-        {orders == null && ordersError ? (
+            error（可重试提示，不再无限「加载中」）/ 空（今日暂无委托）/ 有数据（表格）。
+            §QMT-FROZEN：冻结时 /api/qmt/orders 的 503 是永久态——「⚠…重试」横幅会把一条
+            不会再部署的链路说成"网络抖了一下"，改为如实的无数据说明（面板保留）。 */}
+        {orders == null && gatewayVerdict(state) === LINK_FROZEN ? (
+          <div style={{ color: 'var(--app-text-2)', fontSize: 13, padding: '6px 2px' }}>无数据（A股链路已冻结，网关不再上报委托）</div>
+        ) : orders == null && ordersError ? (
           <div style={{ color: 'var(--td-warning-color)', fontSize: 13, padding: '6px 2px' }}>
             ⚠ {ordersError}
             <Button size="xs" variant="outline" theme="warning" style={{ marginLeft: 10 }} onClick={loadOrders}>重试</Button>

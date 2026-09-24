@@ -7,6 +7,9 @@ import { Card, Table, Tag, Button } from 'tdesign-react'
 import * as api from '../api/index.js'
 import { on } from '../sseBus.js'
 import { createStaleGuard } from '../utils/staleGuard.js' // §M-10 轮询后到丢弃
+// §QMT-FROZEN：系统卡「实盘链路」行走三态裁决（frozen/off/down/live）——
+// 冻结是"这条链路不存在"，不是"接口暂时没数据"，两者必须说不同的话。
+import { gatewayVerdict, LINK_FROZEN, FROZEN_HINT_SHORT } from '../gatewayLinkState'
 import LogModal from '../components/LogModal.jsx'
 import Disclaimer from '../components/Disclaimer.jsx'
 import IcpFooter from '../components/IcpFooter'
@@ -158,13 +161,17 @@ export default function Dashboard() {
   )
 
   // 拼接实盘/QMT 链路状态摘要文本（探测正常/模式/是否熔断）
+  // §QMT-FROZEN：三态分流——frozen 恒渲染冻结说明（哪怕 qmtState 从未拉到，旧写法此时
+  // 返回 '' 整行静默消失，"缺失"与"没有这条链路"两种语义混在一起）；
+  // off（未启用）保持不渲染（§LINTGATE E3 锁）；熔断未触发如实说「从未触发」而非「正常」。
   const qmtLine = useMemo(() => {
+    if (gatewayVerdict(qmtState) === LINK_FROZEN) return FROZEN_HINT_SHORT
     const s = qmtState
     if (!s || !s.enabled) return ''
     const parts = []
     parts.push(s.last_probe_ok ? '●' : '○')
     parts.push(s.mode === 'auto' ? '自动' : '手动')
-    parts.push(s.tripped ? '⚠熔断' + (s.trip_reason ? ':' + s.trip_reason : '') : '正常')
+    parts.push(s.tripped ? '⚠熔断' + (s.trip_reason ? ':' + s.trip_reason : '') : '从未触发')
     return parts.join(' ')
   }, [qmtState])
 

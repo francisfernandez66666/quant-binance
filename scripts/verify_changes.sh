@@ -941,7 +941,53 @@ if missing:
     print("\n".join(missing)); sys.exit(1)
 print("ok - 部署物料在位总闸通过（SCP 引用 + go build 目标 + 4 个 systemd 单元）")
 PY
-echo "ok - §M7 专项守卫通过（部署物料总闸，广州形态锁已随面下线）"
+# 43b §OPSLOAD 运维装载步入链（2026-09-24 广州面下线后补的最后一里）。
+# 原始教训：watchdog.sh / backup.sh 写了一年多，只活在头注的手工商装说明里，部署链从不上传、
+# 更不装载——每迁一次机器都要人肉记一次；漏配的后果是"服务挂了没人知道 / 库从没备份过"，
+# 而界面上完全看不出来。这里锁六件事：① 装载步在链上；② 出厂默认关（默认开启=替所有未来部署
+# 擅自加戏，须显式决策）；③ 两个脚本随部署上传（cron 不能指向远端不存在的文件）；④ crontab 走
+# 按标记幂等合并（整表覆盖会吃掉同机其他项目的定时任务）；⑤ 运维变量必须经 set -a 导出给子进程、
+# 且只写 /etc/quant-ops.env（[4/8] 对 /etc/quant.env 是整文件覆盖，并进去下次部署就没了几项）；
+# ⑥ cron 行内不得再套 sh -c——它与 ssh 远程命令的外层单引号打架，本批沙箱实抓到过一次坏形态。
+python3 - <<'PY' || { echo "--- FAIL: 运维装载步口径漂移（§OPSLOAD）"; exit 1; }
+import pathlib, sys
+lines = pathlib.Path("scripts/deploy_seoul.sh").read_text(encoding="utf-8").splitlines()
+# 判据一律按"语句形态"取，不按全文件子串：首跑反向验证时，"是否上传/是否幂等"两条被头注里的
+# scripts/watchdog.sh 与收尾提示里打印的 sudo crontab -l 各自满足，成了假绿（同 §23 那次同形）。
+bad = []
+
+
+def anyline(pred, why):
+    if not any(pred(l) for l in lines):
+        bad.append(why)
+
+
+anyline(lambda l: "运维装载" in l and l.lstrip().startswith("echo "),
+        "装载步 [7b/8] 的实跑回声消失（该步被从部署链摘掉，运维 cron 又回到手工商装）")
+for flag in ("OPS_WATCHDOG", "OPS_BACKUP"):
+    anyline(lambda l, f=flag: l.startswith(f + "=") and ':-0}"' in l,
+            f"{flag} 的出厂缺省不再是 0（默认开启=替所有未来部署擅自加戏）")
+anyline(lambda l: l.startswith("$SCP") and "watchdog.sh" in l and "backup.sh" in l,
+        "watchdog.sh/backup.sh 不再随部署上传（cron 会指向远端不存在的脚本）")
+anyline(lambda l: "crontab -l" in l and "grep -vF" in l and "crontab -'" in l,
+        "crontab 幂等合并丢失（按标记删旧行再追加）——退回整表覆盖会吃掉同机其他项目的定时任务")
+anyline(lambda l: l.startswith("gen_wrapper()") or "set -a" in l,
+        "转交包装器或 set -a 丢失：`. env` 不导出则 watchdog/backup 收到空值、静默回落内置默认")
+if sum(1 for l in lines if "set -a" in l and ". /etc/quant-ops.env" in l) < 1:
+    bad.append("set -a 没有包住 /etc/quant-ops.env 的 source（运维变量导不出去）")
+if sum(1 for l in lines if "sudo tee /etc/quant.env " in l or "sudo tee /etc/quant.env>" in l) != 1:
+    bad.append("/etc/quant.env 的写入点不再是恰好 1 处（[4/8]）——运维项并进去会被下次部署整文件覆盖抹掉")
+anyline(lambda l: "sudo tee /etc/quant-ops.env" in l,
+        "/etc/quant-ops.env 不再由本步生成（运维变量落点丢失）")
+for l in lines:
+    if "cron_ensure" in l and "sh -c" in l and not l.lstrip().startswith("#"):
+        bad.append(f"cron 行内套了 sh -c（与 ssh 远程命令的外层单引号冲突，装出来是坏行）：{l.strip()[:80]}")
+        break
+if bad:
+    print("\n".join(bad)); sys.exit(1)
+print("ok - 运维装载步守卫通过（在链 + 默认关 + 随部署上传 + 幂等合并 + set -a 导出 + 独立 env + 无嵌套 sh -c）")
+PY
+echo "ok - §M7 专项守卫通过（部署物料总闸 + 运维装载步，广州形态锁已随面下线）"
 
 echo "==> 44 §M12/§M13 移动壳凭据面 + 前端权限一致性 + researchd 主链冒烟（2026-09-22 修复批二波，代理K/L/J）..."
 # M13：成员账号进 Quant/Paper 页——①403 后轮询定时器照跑（opslog 灌噪声）；②判 403 用
@@ -1996,7 +2042,77 @@ if grep -n 'setQMTState' web/src/pages/Dashboard.jsx | grep -vE '^[0-9]+:[[:spac
 # 实跑：全 src 的 error 必须为 0（warn 不阻塞）。
 if ! ( cd web && npx eslint src --quiet ); then
 	echo "--- FAIL: eslint --quiet 判红（存在未定义符号级 error，本门禁只允许 error 阻塞）"; exit 1; fi
-echo "ok - §LINTGATE 守卫通过（静态锁 5 道 + 行为锁 1 组 + 负锁 1 道 + lint 实跑）"
+# ── §QMT-FROZEN（2026-09-24 冻结裁决后续批）：链路冻结后不得再显示假活相 ──
+# 现象：裁决「广州执行机不再是部署目标」之后，网关永不再上报，但配置里的历史 enabled=true
+#       还在——于是界面把"这台机器上根本不会再有网关"说成"网关开着但一切正常/等开盘就好"，
+#       运维去排查一条不存在的链路。修法=三态（frozen/off/down）单源裁决 + 三处展示位分流。
+# 行为锁：三态裁决语义单测 + 量化页冻结态渲染回归（含「按钮保留但禁用、点了不发切换请求」）。
+if ! ( cd web && npx vitest run src/__tests__/gateway_link_state.test.js src/__tests__/quant_frozen_panel.test.jsx ) >/dev/null 2>&1; then
+	echo "--- FAIL: §QMT-FROZEN 三态裁决/冻结面板行为锁未通过"; exit 1; fi
+# 等值锁（形态无关，故用 python 而非固定 grep 串）：
+#   ①三处展示位（量化链路卡+委托卡 / 持仓实盘头部 / 仪表盘系统行）必须全部经 gatewayVerdict
+#     取裁决——任一页回落到自己写 `enabled ? 已启用` 的二态判断即红（那就是本批修掉的病灶）；
+#   ②冻结旗标只有一条来路：App.jsx 拉 /api/status 时转发给模块，缺这条腿则永远判不出 frozen；
+#   ③面向用户的文案不得再指向不存在的配置文件（本仓实读 config.json）——判据先剥掉注释
+#     再查串，否则「旧提示让人去改 config.toml」这种说明文字会把负锁喂成假红、
+#     反之整文件包含子串会把正锁喂成假绿（§OPSLOAD 同批踩过的坑）。
+python3 - <<'PY'
+import pathlib, re, sys
+bad = []
+def read(p):
+    return pathlib.Path(p).read_text(encoding="utf-8")
+def code(text):
+    # 剥掉 /* */ 与 // 注释，只在真实代码/文案上判据（负锁不被"旧写法不得复活"说明喂红）
+    t = re.sub(r"/\*.*?\*/", "", text, flags=re.S)
+    return re.sub(r"//[^\n]*", "", t)
+pages = {
+    "web/src/pages/Quant.jsx": "量化页链路状态卡",
+    "web/src/pages/Positions.jsx": "持仓页实盘头部",
+    "web/src/pages/Dashboard.jsx": "仪表盘系统状态行",
+}
+def slice_code(c, start, end=None, tail_lines=8):
+    # 按"展示位"切一段真实代码来判，而不是整文件数子串：Quant.jsx 有链路卡+委托卡两处分流，
+    # 整文件计数会让"链路卡那处被删掉、只剩委托卡"照样绿（反向验证踩过 ①/①b 两枪）。
+    i = c.find(start)
+    if i < 0:
+        return None
+    if end is not None:
+        j = c.find(end, i + len(start))
+        return c[i:j] if j > 0 else c[i:]
+    return "\n".join(c[i:].splitlines()[:tail_lines])
+SITES = [
+    ("web/src/pages/Quant.jsx", "量化页链路状态卡", "function renderChainStatusCard", "function renderOrdersCard", None),
+    ("web/src/pages/Dashboard.jsx", "仪表盘系统状态行", "const qmtLine", None, 8),
+    ("web/src/pages/Positions.jsx", "持仓页实盘头部", "const realLinkVerdict", None, 4),
+]
+for p, why, anchor, end, tail in SITES:
+    body = slice_code(code(read(p)), anchor, end, tail or 8)
+    if body is None:
+        bad.append(f"{p}（{why}）的锚点 {anchor} 不见了——三态分流失去落点")
+        continue
+    if "=== LINK_FROZEN" not in body or "gatewayVerdict(" not in body:
+        bad.append(f"{p}（{why}）不再按冻结态分流（二态判断复活，冻结会被显示成「未启用/正常/休市未探测」）")
+app = read("web/src/App.jsx")
+if not re.search(r"setGatewayLinkCnMaster\(\s*st\.cn_master\s*\)", app):
+    bad.append("App.jsx 不再把 /api/status 的 cn_master 转发给链路判定模块（冻结态永远判不出来）")
+gl = read("web/src/gatewayLinkState.js")
+for need, why in [
+    (r"LINK_FROZEN\s*=\s*'frozen'", "冻结态常量"),
+    (r"NOT_IN_EFFECT\s*=\s*'未生效'", "未生效占位"),
+    (r"cnMaster === false\) return LINK_FROZEN", "冻结优先于未启用/失联的判定顺序"),
+    (r"typeof v === 'boolean' \? v : null", "cn_master 未知（非显式布尔）不判冻结的兜底"),
+]:
+    if not re.search(need, gl):
+        bad.append(f"gatewayLinkState.js 缺 {why}（三处展示位失去单源）")
+for p in pages:
+    for l in code(read(p)).splitlines():
+        if "config.toml" in l:
+            bad.append(f"{p} 用户可见文案仍指向 config.toml（本仓实读 config.json，改了也无人读）")
+if bad:
+    print("\n".join(bad)); sys.exit(1)
+print("ok - §QMT-FROZEN 等值锁通过（三态单源 3 展示位 + cn_master 转发腿 + 判定顺序 + config.json 口径）")
+PY
+echo "ok - §LINTGATE 守卫通过（静态锁 5 道 + 行为锁 2 组 + 负锁 1 道 + §QMT-FROZEN 等值锁 + lint 实跑）"
 
 echo ""
 echo "==> 全部通过"

@@ -23,6 +23,9 @@ import { showToast } from '../ui.jsx'
 // English: §BINANCE-P4 — market-aware filtering/formatting for the real-positions table.
 import { fmtMoneyM, fmtQty, parseCode } from '../utils.market.js'
 import { useMarket } from '../market.jsx'
+// §QMT-FROZEN：实盘持仓头三态判定（frozen/off/down/live）——冻结=广州执行机不再是部署目标，
+// 头部的「已启用/正常/网关 URL」此时全是配置残影，必须改口「未生效/无数据」。
+import { gatewayVerdict, LINK_FROZEN, FROZEN_HINT, NOT_IN_EFFECT } from '../gatewayLinkState'
 
 // 持仓与资金数据的 localStorage 缓存键
 const CACHE_KEY = 'pos_cache_v1'
@@ -103,6 +106,11 @@ export default function Positions() {
   const realEnabled = !!qmtState.enabled
   // 实盘网关是否熔断（熔断后禁止下单）
   const realTripped = !!qmtState.tripped
+  // §QMT-FROZEN：链路三态裁决（cn_master 由 App.jsx 状态轮询写入 gatewayLinkState 模块缓存，
+  // 本页不另发请求）。冻结 ≠ 未启用 ≠ 失联：冻结时配置里的 enabled 是广州时代残留，
+  // 头部不得再据此渲染"已启用/正常/网关 URL"这类看起来像活着的值。
+  const realLinkVerdict = gatewayVerdict(qmtState)
+  const realFrozen = realLinkVerdict === LINK_FROZEN
   // 当前实盘下单参数（持仓+方向）
   const [realAction, setRealAction] = useState(null)
   // 实盘下单价格/数量/策略
@@ -800,15 +808,29 @@ export default function Positions() {
           ) : (
           <>
           <div style={{ display: 'flex', gap: 10, flexWrap: 'wrap', alignItems: 'center', marginBottom: 12 }}>
-            <span style={{ color: qmtState.enabled ? 'var(--app-down)' : 'var(--app-muted)' }}>{qmtState.enabled ? '已启用' : '未启用'}</span>
-            <span className="muted">模式: {qmtState.mode || 'manual'}</span>
-            <span style={{ color: qmtState.tripped ? 'var(--app-up)' : 'var(--app-down)' }}>熔断: {qmtState.tripped ? '已熔断' : '正常'}</span>
-            {qmtState.gateway_url && <span className="muted">网关 {qmtState.gateway_url}</span>}
+            {/* §QMT-FROZEN：冻结横幅每页仅此一处；启用态/模式/熔断/网关 URL 全部改读「未生效」，
+                旧写法把配置残影（enabled=true、熔断正常、广州 URL）当成实时健康展示给运维。 */}
+            {realFrozen && (
+              <span style={{ width: '100%', fontSize: 12, color: 'var(--td-warning-color)', background: 'var(--app-bg-2, #fff7e6)', border: '1px solid var(--td-warning-color, #e37318)', borderRadius: 6, padding: '6px 10px' }}>
+                {FROZEN_HINT}
+              </span>
+            )}
+            {realFrozen ? (
+              <span className="muted">{NOT_IN_EFFECT}（链路冻结）</span>
+            ) : (
+              <>
+                <span style={{ color: qmtState.enabled ? 'var(--app-down)' : 'var(--app-muted)' }}>{qmtState.enabled ? '已启用' : '未启用'}</span>
+                <span className="muted">模式: {qmtState.mode || 'manual'}</span>
+                {/* 未熔断如实说「从未触发」（时间戳为零=熔断机制从未有过一次触发），不再用「正常」冒充在运转 */}
+                <span style={{ color: qmtState.tripped ? 'var(--app-up)' : 'var(--app-down)' }}>熔断: {qmtState.tripped ? '已熔断' : '从未触发'}</span>
+                {qmtState.gateway_url && <span className="muted">网关 {qmtState.gateway_url}</span>}
+              </>
+            )}
             {realAccount && (
               <span style={{ color: 'var(--app-accent)', fontWeight: 600 }}>
                 可用资金 {realAccount.updated_at
                   ? '¥' + (realAccount.available_cash || 0).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })
-                  : '—（网关未上报）'}
+                  : (realFrozen ? '无数据（链路冻结，网关不再上报）' : '—（网关未上报）')}
               </span>
             )}
             {/* 实盘资产总值（网关上报时显示） */}
@@ -818,12 +840,14 @@ export default function Positions() {
             <Button size="small" variant="outline" theme="primary" onClick={loadReal} style={{ marginLeft: 'auto' }}>刷新</Button>
           </div>
 
-          {/* 实盘持仓表格或空态：有持仓渲染表格，无持仓显示启用状态 */}
+          {/* 实盘持仓表格或空态：有持仓渲染表格，无持仓显示启用状态。
+              §QMT-FROZEN：冻结时「等待网关回报」是错误借口（回报永不会来）；未启用分支的配置
+              文件名同步纠错——本仓实际读 config.json，旧提示让人去改不存在的 config.toml。 */}
           {!realPositions.length ? (
             <Card>
               <div style={{ padding: 24, textAlign: 'center' }}>
-                <p className="muted">{realEnabled ? '暂无实盘持仓' : '实盘未启用（config.toml 中 qmt.enabled=true 并配置网关）'}</p>
-                {realEnabled && <p className="muted">等待 QMT 网关回报 /api/qmt/report 推送持仓对账</p>}
+                <p className="muted">{realFrozen ? '暂无实盘数据（A股链路已冻结，网关不再上报）' : (realEnabled ? '暂无实盘持仓' : '实盘未启用（config.json 中 qmt.enabled=true 并配置网关）')}</p>
+                {!realFrozen && realEnabled && <p className="muted">等待 QMT 网关回报 /api/qmt/report 推送持仓对账</p>}
               </div>
             </Card>
           ) : (

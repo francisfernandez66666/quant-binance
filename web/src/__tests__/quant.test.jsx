@@ -44,8 +44,9 @@ describe('Quant 页挂载（§链路状态卡回归）', () => {
     // 卡片与各行标签存在
     expect(screen.getByText('链路状态')).toBeInTheDocument()
     await waitFor(() => expect(screen.getByText('熔断')).toBeInTheDocument())
-    // state 异步到位后：熔断=正常、下行=连通、执行路径 active=miniQMT兼容
-    await waitFor(() => expect(screen.getByText('正常')).toBeInTheDocument())
+    // state 异步到位后：熔断=从未触发（§QMT-FROZEN 措辞修正：旧「正常」把时间戳为零的
+    // 从未触发冒充成熔断机制在健康运转）、下行=连通、执行路径 active=miniQMT兼容
+    await waitFor(() => expect(screen.getByText('从未触发')).toBeInTheDocument())
     expect(screen.getByText('连通')).toBeInTheDocument()
     expect(screen.getByText(/当前：miniQMT兼容/)).toBeInTheDocument()
     // 网关地址回显

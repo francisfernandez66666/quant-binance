@@ -23,6 +23,9 @@ import { dispatch as sseDispatch } from './sseBus.js'
 import { isNative, canNotify, requestPermission, notify as sendNotify, notifyThrottled } from './notify.js'
 import { showToast, showNotify } from './ui.jsx'
 import { sseOpsAlert, versionMismatchNotice } from './utils.js'
+// §QMT-FROZEN：/api/status 的 cn_master 同时写入链路判定模块缓存——
+// 页面（量化/持仓/仪表盘）经 gatewayVerdict 复用这一份 boot 快照，不再各自 fetch。
+import { setCnMaster as setGatewayLinkCnMaster } from './gatewayLinkState'
 // §BINANCE-P4（PLAN §11.2 全局）：市场维度——顶栏市场 Tab（全部|A股|美股|加密货币），
 // 当前市场经 MarketProvider 下发（?m= 持久化），持仓/量化等页据此过滤与格式化。
 // English: §BINANCE-P4 — global market switcher (All|CN|US|Crypto) with ?m= persistence.
@@ -234,6 +237,9 @@ export default function App() {
       setActiveWindow(st.active)
       // §CN-MASTER：只认显式布尔（旧服务端缺字段=undefined→维持 null 全显，不误藏入口）
       setCnMaster(typeof st.cn_master === 'boolean' ? st.cn_master : null)
+      // §QMT-FROZEN：同一份 cn_master 转发给链路判定模块（frozen≠off≠down 的唯一裁决源），
+      // 页面不再为此单独发请求；缺字段写 null=未知，模块侧不据此判冻结。
+      setGatewayLinkCnMaster(st.cn_master)
       // §A7：APK/页面向导比对——服务器 build_commit 与本地构建指纹不一致即顶栏横幅告警
       setVersionNotice(versionMismatchNotice(APP_BUILD_COMMIT, st.build_commit))
     } catch (_) { setServerOnline(false); setVersionNotice(null) }

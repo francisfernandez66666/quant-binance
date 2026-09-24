@@ -110,6 +110,25 @@ jobs:
             echo "setQMTState 未定义符号调用复活（被空 catch 吞掉的运行时炸弹）"; exit 1; fi
           test -f web/eslint.config.js || { echo "§LINTGATE eslint 配置丢失（no-undef 门禁失效）"; exit 1; }
 
+      - name: §QMT-FROZEN 冻结链路三态分流静态锁（源码形态，行为面在上面的 npm test）
+        run: |
+          # 2026-09-24 裁决「广州执行机不再是部署目标」后，网关永不再上报，但配置里的历史
+          # enabled=true 还在——界面若按二态判，就把"根本不会再有网关"说成"网关开着且正常"。
+          # 三处展示位（量化链路卡/持仓实盘头部/仪表盘系统行）必须全部走 gatewayLinkState 单源。
+          test -f web/src/gatewayLinkState.js || { echo "§QMT-FROZEN 裁决模块丢失"; exit 1; }
+          grep -q "if (cnMaster === false) return LINK_FROZEN" web/src/gatewayLinkState.js \
+            || { echo "§QMT-FROZEN 冻结不再是最优先判定（冻结会被显示成未启用/失联）"; exit 1; }
+          for f in Quant Positions Dashboard; do
+            grep -q "gatewayVerdict(" "web/src/pages/$f.jsx" \
+              || { echo "§QMT-FROZEN web/src/pages/$f.jsx 不再按三态裁决分流（二态判断复活）"; exit 1; }
+          done
+          grep -q "setGatewayLinkCnMaster(st.cn_master)" web/src/App.jsx \
+            || { echo "§QMT-FROZEN App.jsx 不再把 cn_master 转发给裁决模块（冻结态永远判不出来）"; exit 1; }
+          # 操作员文案口径：本仓实读 config.json，指向 config.toml 的提示等于让人改一个不存在的文件
+          # （判据只看真实文案，注释里提"旧口径写的是 config.toml"不算复活）。
+          if grep -rn "config\.toml" web/src/pages/*.jsx | grep -vE '(//|\*/|/\*)' | grep -q .; then
+            echo "§QMT-FROZEN 用户可见文案又指向 config.toml（本仓配置实读 config.json）"; exit 1; fi
+
   # §FIX-5 UAT 自举脚本静态守卫：全栈 UAT 流程必须可从本地一键复跑。
   # 背景：mock+engine+前端+seed 的启动流程此前只内联在 nightly-e2e.yml，本机无处可跑；
   # 脚本退化成空脚本/被误删将导致 UAT 再次不可复跑——用静态守卫锁死。
@@ -243,6 +262,11 @@ jobs:
           grep -q 'APP_DIR/qmt_gateway/\.' scripts/deploy_seoul.sh || { echo "M7 网关未整目录下发"; exit 1; }
           for u in quant quant-research pydata qmt-mock; do test -f "deploy/$u.service" || { echo "M7 缺 systemd 单元 $u.service"; exit 1; }; done
           test -f deploy/Caddyfile || { echo "M7 缺 Caddy 配置物料"; exit 1; }
+          # §OPSLOAD 运维装载步入链（2026-09-24 广州面下线后补的最后一里；细则在 verify 第 43 段）：
+          # 看门狗/备份脚本必须随部署上传、开关缺省必须是关、运维变量必须 set -a 导出给子进程。
+          grep -q 'OPS_WATCHDOG="${OPS_WATCHDOG:-0}"' scripts/deploy_seoul.sh || { echo "OPSLOAD 看门狗开关缺省不再是 0"; exit 1; }
+          grep -q '^\$SCP.*watchdog\.sh.*backup\.sh' scripts/deploy_seoul.sh || { echo "OPSLOAD 运维脚本不再随部署上传"; exit 1; }
+          grep -q 'set -a' scripts/deploy_seoul.sh || { echo "OPSLOAD 运维变量导出丢失"; exit 1; }
           # §M13 前端权限一致性（403 只认状态码；负锁过滤"旧写法不得复活"说明注释）
           if grep -nE "indexOf\('无权限'\)|includes\('无权限'\)" web/src/pages/Quant.jsx web/src/pages/Paper.jsx | grep -vE ':[0-9]+:[[:space:]]*//' >/dev/null; then echo "M13 中文文案判 403 复活"; exit 1; fi
           grep -q 'isForbidden' web/src/pages/Quant.jsx || { echo "M13 Quant 状态码判定丢失"; exit 1; }
