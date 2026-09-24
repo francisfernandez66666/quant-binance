@@ -20,6 +20,7 @@
 #     + 2026-09-23 §BINANCE Phase 2 执行/回报/隔离（BinanceExecutor 契约 golden 7 格/binance_report 三条腿/§15.2 ForMarket 隔离/运维端点 6 条，见 58）
 #     + 2026-09-23 §BINANCE Phase 3+4 行情/状态双 WS+StdWsDial（纯标准库 RFC6455）/§9 第 15 闸 market_halt 证据链/xasset 三腿/前端市场维度+历史K线（见 59）
 #     + 2026-09-23 §ENH 增强批 A+B（PLAN_ENHANCE_20260923：FNG 情绪腿/EDGAR+CryptoPanic 事件腿/观测面三件套/lightweight-charts 试点/walk-forward/滑点回灌挂价，见 60）
+#     + 2026-09-24 §抄母仓 可抄榜批（母仓分叉后锤实的 8 项缺陷按序移植：§DISCIPLINE 延持终态失明/§PICKILL-SCOPE 跨 checkout 误杀/§UAT-PORTS e2e 端口单源/§NOTIFYADMIN 推送探测端点收权/§ALERTROUTE 指标告警出站+7×24 节拍/§DEADGAUGE 死规则通用守卫，见 64~69）
 # ...
 # §全链路 UAT 修复批（2026-09-18 §UAT_FULLCHAIN_VERIFY）专项（见 11/11）：
 #   费用腿       ：成交回报 fee/stamp_tax 五路径透传（xt 回调/桥行/网关装配/mock/Go 落库），
@@ -1602,6 +1603,121 @@ grep -q 'Retry-After' internal/server/handlers_fix.go || { echo "--- FAIL: §N-2
 if grep -A 3 'func (s \*Server) handleFixNotifyTest' internal/server/handlers_fix.go | grep -q 'writeJSON(w, 200, map\[string\]string{"status": "ok"})$'; then
   echo "--- FAIL: §N-2 notify-test 又回退成永远 ok 的空 stub"; exit 1; fi
 echo "ok - §NOTIFYADMIN 专项守卫通过（行为锁 1 组 + 静态锁 4 道 + 负锁 2 道）"
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 68：§抄母仓-5（2026-09-24）指标型告警出口 + 7×24 评估节拍（母仓 bddcccb §高-3 / §ALERTDRIVE）
+# English: section 68 locks the ported metric-alert egress and its 24/7 evaluation heartbeat.
+# ══════════════════════════════════════════════════════════════════════════════
+echo "==> 68 §ALERTROUTE 指标告警出站路由 + 7×24 评估节拍（抄母仓 §高-3，2026-09-24）..."
+# 现象（母仓锤实、本仓同构）：alerter.go 的阈值规则每轮都在评估，但 RunAlertEvaluation 拿到事件后
+# 只 log.Printf 就结束 ⇒ 「规则触发 = 没有任何人知道」，而且 R7 验收单当初勾过 ✅（声称已做）。
+# 修法：AlertRoute(push/daily/log) 路由表 + 冷却窗（触发 30min／恢复 10min）+ alert/resolved 成对
+# （被冷却窗挡下的销案挂起、到期补发，绝不只报不销）+ 跨日日汇总补发 + SetAlertSink 依赖倒置注入
+# （metrics 包不 import notify，避免 engine→metrics→notify→engine 注入环）；未接线时首轮一条明确
+# Warn + 每条兜底日志——告警系统自己哑了必须吵。范围照 owner 口径收窄：只接指标型，事件型腿不动。
+#
+# §ALERTDRIVE（本批相对母仓的增量，理由如下，不是顺手加的）：本仓唯一调用点在内
+# internal/engine/scoring_loop.go 的 A股 scoreCycle，而 §CN-MASTER 出厂把 A股总开关关成 false
+# ——那条节拍在缺省配置下根本不跑，等于「出口接好了、没人合闸」，§高-3 的静默失效换个形态复发。
+# 因此把评估兜底节拍挂到 7×24 的币安维护拍（cmd/quant/main.go bnMaint）。两个调用点并存后，
+# Alerter.states 是无锁 map，CN 开态下并发进入是 Go runtime 级 fatal，故串行化做在包内（evalMu）。
+if [ "$(go test -count=1 ./internal/metrics/ -run 'TestPushRule|TestResolved|TestDailySummary|TestUnwiredSink|TestSinkReceives|TestRoutingCovers|TestRunAlertEvaluation|TestConfigureAlertRouting' -v 2>&1 | grep -c '^--- PASS')" -lt 8 ]; then
+  echo "--- FAIL: §高-3 出站行为锁跑到 8 例以下（-run 过滤器打空=恒绿，先确认用例名）"; exit 1; fi
+# -race 锁：先落变量再判定（直接 `go test | grep -q` 时 grep 提前退场会让上游吃 SIGPIPE，
+# 在 set -o pipefail 下变成恒失败——本段实跑就是这样假红过一次）。
+race_out=$(go test -race -count=1 ./internal/metrics/ 2>&1 || true)
+printf '%s\n' "$race_out" | grep -q '^ok' \
+  || { echo "--- FAIL: §高-3 §ALERTDRIVE 并发/竞态锁未过（-race）"; exit 1; }
+grep -q 'func DefaultAlertRouting()' internal/metrics/alert_routing.go \
+  || { echo "--- FAIL: 默认路由表丢失（规则无出口=评估了但没人知道）"; exit 1; }
+grep -q 'metrics.SetAlertSink(' cmd/quant/main.go \
+  || { echo "--- FAIL: 生产进程未注入 sink（路由表成为死码）"; exit 1; }
+grep -q 'AlertSinkInjected()' internal/metrics/alert_routing.go \
+  || { echo "--- FAIL: 未接线自检丢失"; exit 1; }
+# p1 必须走既有高优通道（否则"熔断中"和"日汇总"同一优先级，等于没有优先级）。
+awk '/metrics\.SetAlertSink\(/,/^\t\}\)$/' cmd/quant/main.go | grep -q 'notify.LevelHigh' \
+  || { echo "--- FAIL: 注入闭包不再按 p1→LevelHigh 分档（必推类混入普通推送）"; exit 1; }
+# §ALERTDRIVE 静态锁①：评估入口自带互斥（两个驱动点并存的前提）。
+grep -q 'var evalMu sync.Mutex' internal/metrics/alerter.go \
+  || { echo "--- FAIL: 评估互斥锁丢失（scoreCycle 与 bnMaint 并发进无锁 states map）"; exit 1; }
+awk '/^func RunAlertEvaluation\(\)/{f=1} f{print} f&&/^}$/{exit}' internal/metrics/alerter.go \
+  | grep -q 'evalMu.Lock()' \
+  || { echo "--- FAIL: RunAlertEvaluation 未持 evalMu（锁定义了个寂寞）"; exit 1; }
+# §ALERTDRIVE 静态锁②：7×24 兜底节拍真的挂在币安维护拍里（而不是挂在 A股时段门后）。
+if ! awk '/bnMaint := time.NewTicker/,/^\t\}\(\)$/' cmd/quant/main.go | grep -q 'metrics.RunAlertEvaluation()'; then
+  echo "--- FAIL: §ALERTDRIVE 币安 7×24 维护拍不再驱动告警评估（A股开关一关告警就没人评估）"; exit 1; fi
+# 负锁：告警评估的兜底节拍不得被 A股总开关包住（与 §MR-2/§CN-MASTER 红锁同族）。
+if awk '/bnMaint := time.NewTicker/,/^\t\}\(\)$/' cmd/quant/main.go | grep -q 'cnEnabled'; then
+  echo "--- FAIL: §ALERTDRIVE 币安维护拍被 cnEnabled 误包（关 A股连带杀告警心跳，红锁）"; exit 1; fi
+# 负锁：旧形态「拿到事件只 log.Printf 就结束」不得复活（同族教训：只在注释里说改过、代码没改）。
+if awk '/^func runAlertEvaluationLocked\(\)/{f=1} f{print} f&&/^}$/{exit}' internal/metrics/alerter.go \
+     | grep -qE '^\tlog\.Printf\(' ; then
+  echo "--- FAIL: 评估主体又退回只写日志不出站（静默失效复活）"; exit 1; fi
+echo "ok - §ALERTROUTE 专项守卫通过（行为锁 8 例 + -race + 静态锁 6 道 + 负锁 2 道）"
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 69：§抄母仓-4（2026-09-24）每条告警规则必须有真实赋值点（母仓 9ff5061 §DEADGAUGE）
+# English: section 69 ports the general dead-rule guard: every alert rule's metric needs a real writer.
+# ══════════════════════════════════════════════════════════════════════════════
+echo "==> 69 §DEADGAUGE 死规则通用守卫：每条规则量规都要有赋值点（抄母仓 §DEADGAUGE）..."
+# 现象：默认告警规则里三条（order_fail_rate / settlement_diff / llm_cooldown）自注册以来
+#       全仓找不到一处 SetGauge 赋值 ⇒ 评估器每轮读到 0 ⇒ gt 规则永不触发。这不是"没出过事"，
+#       是"出了事也不会响"：p1「交割单对账出现差异」「下单失败率>5%」在现网等价于不存在。
+#       同一形态此前被抓过两次（audit N-1 的 quote_staleness_sec、§CB 的 uplink_staleness_sec），
+#       每次都靠人肉发现——本段把它变成机器锁。
+# 修法：① 三条各接真实源（order_rate.go 用既有累计计数器做 5 分钟窗增量换算、settlement.go 用
+#         三方对账三类差异条数之和、scoring_loop 用 llm.Client.KeysInCooldown）；
+#       ② 通用守卫：从规则表反解全部 Metric 名，逐条要求非测试代码里存在 SetGauge("<名>") 赋值点；
+#       ③ 负锁锁住三个已知假绿形态。
+g_trading=$(go test -count=1 ./internal/trading/ -run 'TestSettleDayFeedsDiffGauge|TestSettleDaySkipBranchesWriteZero' 2>&1 || true)
+printf '%s\n' "$g_trading" | grep -q '^ok' \
+  || { echo "--- FAIL: §DEADGAUGE 交割差异量规行为锁未过"; exit 1; }
+if [ "$(go test -count=1 ./internal/metrics/ -run 'TestOrderFailRate|TestRunAlertEvaluationRefreshesDerivedGauge' -v 2>&1 | grep -c '^--- PASS')" -lt 5 ]; then
+  echo "--- FAIL: §DEADGAUGE 下单失败率窗口换算行为锁<5 例"; exit 1; fi
+if [ "$(go test -count=1 ./internal/llm/ -run 'TestKeysInCooldown' -v 2>&1 | grep -c '^--- PASS')" -lt 2 ]; then
+  echo "--- FAIL: §DEADGAUGE LLM 冷却计数行为锁<2 例"; exit 1; fi
+if [ "$(go test -count=1 ./internal/engine/ -run 'TestRefreshFeedsLLMCooldownGauge|TestRefreshStalenessGauges' -v 2>&1 | grep -c '^--- PASS')" -lt 3 ]; then
+  echo "--- FAIL: §DEADGAUGE 打分链量规刷新行为锁<3 例"; exit 1; fi
+grep -q 'SetGauge("settlement_diff_count", int64(len(diff.MissingInLocal)+len(diff.ExtraInLocal)+len(diff.Mismatch)))' internal/trading/settlement.go \
+  || { echo "--- FAIL: 交割差异量规不再等于三类条数之和（退化成布尔/单类计数会漏报）"; exit 1; }
+grep -q 'func (c \*Client) KeysInCooldown() int' internal/llm/llm.go \
+  || { echo "--- FAIL: LLM 冷却计数入口丢失（llm_cooldown 又成死规则）"; exit 1; }
+grep -q 'metrics.SetGauge("llm_cooldown_count", llmCool)' internal/engine/scoring_loop.go \
+  || { echo "--- FAIL: 打分链未再喂 llm_cooldown_count"; exit 1; }
+grep -q 'SetGauge("order_fail_rate_milli", rate)' internal/metrics/order_rate.go \
+  || { echo "--- FAIL: 下单失败率量规赋值丢失"; exit 1; }
+# 通用守卫：规则表里每条 Metric 都要有赋值点。扫描面排除测试文件（测试直接 SetGauge 造场景，
+# 算赋值点就是假绿）与规则/路由定义本体（防有人把赋值塞进规则文件糊弄守卫）。
+rule_metrics=$(grep -oE 'Metric: "[a-z0-9_]+"' internal/metrics/alerter.go | sed -E 's/.*"([^"]+)"/\1/')
+[ -n "$rule_metrics" ] || { echo "--- FAIL: 规则表解析为空（规则被搬走 = 守卫失明）"; exit 1; }
+dead_rules=""
+for m in $rule_metrics; do
+	# 末尾 `|| true` 是必需的而不是装饰：某条量规没有赋值点时 grep 退出码 1，在
+	# `set -euo pipefail` 下会让整个赋值命令失败、脚本**静默中止**（连 FAIL 文案都打不出来，
+	# 表现成"跑到 69 就没了"）。判红交给下面的 `[ -n "$dead_rules" ]`，这里只负责数数。
+	n=$(find internal cmd -name '*.go' ! -name '*_test.go' ! -name 'alerter.go' ! -name 'alert_routing.go' \
+	    -print0 | xargs -0 grep -l "SetGauge(\"$m\"" 2>/dev/null | wc -l | tr -d ' ' || true)
+	[ "${n:-0}" -ge 1 ] || dead_rules="$dead_rules $m"
+done
+if [ -n "$dead_rules" ]; then
+	echo "--- FAIL: 以下量规有规则无赋值点（永不触发）：$dead_rules"; exit 1
+fi
+echo "  ok 通用守卫：$(echo "$rule_metrics" | wc -w | tr -d ' ') 条规则量规全部有赋值点"
+# 负锁①：派生量规必须在取快照之前刷新（写在后面 = 每轮读到的都是上一轮值，等于没修）。
+locked_body=$(awk '/^func runAlertEvaluationLocked\(\)/{f=1} f{print} f&&/^}$/{exit}' internal/metrics/alerter.go)
+pos_refresh=$(printf '%s\n' "$locked_body" | grep -n 'refreshOrderFailRateGauge()' | head -1 | cut -d: -f1)
+pos_snap=$(printf '%s\n' "$locked_body" | grep -n 'gaugeSnapshot()' | head -1 | cut -d: -f1)
+{ [ -n "$pos_refresh" ] && [ -n "$pos_snap" ] && [ "$pos_refresh" -lt "$pos_snap" ]; } \
+	|| { echo "--- FAIL: 刷新未发生在 gaugeSnapshot 之前（读到旧值）"; exit 1; }
+# 负锁②：禁止用「累计值直接相除」冒充窗口失败率（早期一次失败会永久挂着 5% 红线）。
+if grep -nE 'ordersRejected\.Load\(\) \* 1000 / \(ordersPlaced\.Load\(\) \+ ordersRejected\.Load\(\)\)' internal/metrics/*.go | grep -q .; then
+	echo "--- FAIL: 又用全生命周期累计比冒充 5 分钟窗口失败率"; exit 1
+fi
+# 负锁③：静默跳过分支不得"什么都不写"（不写 = 保留上一轮残值，对账降级日会持续误报）。
+if ! grep -q 'SetGauge("settlement_diff_count", 0)' internal/trading/settlement.go; then
+	echo "--- FAIL: 对账跳过分支不再清零（残值冒充当日差异）"; exit 1
+fi
+echo "ok - §DEADGAUGE 专项守卫通过（行为锁 4 组 + 静态锁 4 道 + 通用死规则守卫 1 条 + 负锁 3 道）"
 
 echo ""
 echo "==> 全部通过"

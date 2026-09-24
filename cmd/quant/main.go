@@ -49,6 +49,7 @@ import (
 	"quant-trading-v2/internal/engine"
 	"quant-trading-v2/internal/llm"
 	"quant-trading-v2/internal/llmcfg"
+	"quant-trading-v2/internal/metrics"
 	"quant-trading-v2/internal/newsagent"
 	"quant-trading-v2/internal/notify"
 	"quant-trading-v2/internal/opslog"
@@ -394,6 +395,20 @@ func main() {
 	srv.SetFetcher(fetcher)   // 报价接口优先读 5s 快照，缺失再降级拉取
 	srv.SetCoordinator(dc)    // HTTP 展示层统一走该降级链，保证跨页价格一致
 	srv.SetNotifier(notifier) // §C9-清扫：/api/notify-test 升级为逐通道真实探测，需注入全局通知器
+	// §高-3（抄母仓 bddcccb，2026-09-24 移植）指标型告警出口接线。此前 internal/metrics 的评估器
+	// 只 `log.Printf` 一条就返回，注册出来的指标规则**从不出站**（触发即无人知晓）。路由表与冷却窗
+	// 在 metrics 包内自持，这里只提供出口闭包：p1→LevelHigh 走既有高优通道、其余→LevelMedium。
+	// 一律经 Push —— M8 已把 WS/Webhook/推送网关三路内聚在 Push 里，绝不再直调 PushGateway，
+	// 否则就是当日「双发」事故的同族复犯。
+	// English: wires the metrics alert egress (previously evaluation-only). p1 maps to
+	// LevelHigh; everything goes through Push, never PushGateway (M8 already fans out 3 channels).
+	metrics.SetAlertSink(func(d metrics.AlertDelivery) {
+		lvl := notify.LevelMedium
+		if d.Level == "p1" {
+			lvl = notify.LevelHigh
+		}
+		notifier.Push(notify.Message{Level: lvl, Title: d.Title, Content: d.Body})
+	})
 	if cnEnabled {
 		log.Printf("[main] 实时行情采集已启动: 监控 %d 只(自选+持仓), 5s 轮询", len(baseStocks))
 	} else {
@@ -656,6 +671,16 @@ func main() {
 					e.MaintenanceBinanceOnce(time.Now())
 					e.DispatchBinanceOnce(time.Now())
 				}
+				// §ALERTDRIVE（项5 收尾）：指标告警评估的 7×24 兜底节拍。
+				// 为什么挂这里：RunAlertEvaluation 原来唯一的调用点在 A 股 scoreCycle（30s 节流），而本仓
+				// §CN-MASTER 出厂就把 A股总开关关掉——于是 §高-3 接好的告警出口在缺省配置下
+				// 根本没有踩节拍的人（评估永不跑 = 规则触发与否都无人知道，正是本批要消灭的形态）。
+				// 币安链全周无休，这一拍恰好是市场无关的心跳。CN 开态时两路并发进入由包内 evalMu
+				// 串行化；节拍本身的代价：最坏漏检延迟 = 一跳 60s（熔断规则 For=0s 首拍即 fire，
+				// 其余规则的持续窗 ≥60s 本就大于这一拍），重复触发的刷屏仍由路由器冷却窗把关。
+				// English: 7x24 fallback heartbeat for metric alert evaluation — the CN-only call site
+				// is gated off by default (§CN-MASTER), so without this the injected sink would never fire.
+				metrics.RunAlertEvaluation()
 			}
 		}
 	}()
