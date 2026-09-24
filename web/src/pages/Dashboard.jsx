@@ -175,7 +175,7 @@ export default function Dashboard() {
     try {
       const st = await api.fetchQMTState()
       if (qmtGuard.current.isStale(token)) return
-      setQMTState(st)
+      setQmtState(st)
     } catch (e) { /* 接口异常不影响整页 */ }
   }
 

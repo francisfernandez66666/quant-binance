@@ -90,6 +90,10 @@ jobs:
         working-directory: web
         run: npm ci
 
+      - name: Lint（§LINTGATE 前端未定义符号门禁：只判 error，warn 不阻塞）
+        working-directory: web
+        run: npm run lint -- --quiet
+
       - name: Test（§WS-I vitest 门禁：SSE 票据/认证/UI 组件回归）
         working-directory: web
         run: npm test
@@ -97,6 +101,14 @@ jobs:
       - name: Build（§R4-10 前端构建门禁：JSX 语法/路由懒加载分包/vendor 拆分回归）
         working-directory: web
         run: npm run build
+
+      - name: §LINTGATE 负锁（未定义符号形态不得复活）
+        run: |
+          # setQMTState（声明为 setQmtState）曾让概览页「实盘链路」整行静默不渲染：
+          # ReferenceError 被同函数空 catch 吞掉，lint --quiet 判红之外再加一道源码负锁。
+          if grep -n 'setQMTState' web/src/pages/Dashboard.jsx | grep -vE ':[0-9]+:[[:space:]]*(//|\*)' | grep -q .; then
+            echo "setQMTState 未定义符号调用复活（被空 catch 吞掉的运行时炸弹）"; exit 1; fi
+          test -f web/eslint.config.js || { echo "§LINTGATE eslint 配置丢失（no-undef 门禁失效）"; exit 1; }
 
   # §FIX-5 UAT 自举脚本静态守卫：全栈 UAT 流程必须可从本地一键复跑。
   # 背景：mock+engine+前端+seed 的启动流程此前只内联在 nightly-e2e.yml，本机无处可跑；

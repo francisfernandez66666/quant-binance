@@ -23,6 +23,7 @@
 #     + 2026-09-24 §抄母仓 可抄榜批（母仓分叉后锤实的 8 项缺陷按序移植：§DISCIPLINE 延持终态失明/§PICKILL-SCOPE 跨 checkout 误杀/§UAT-PORTS e2e 端口单源/§NOTIFYADMIN 推送探测端点收权/§ALERTROUTE 指标告警出站+7×24 节拍/§DEADGAUGE 死规则通用守卫，见 64~69）
 #     + 2026-09-24 §抄母仓 可抄榜项 6（§STRATEGY-MERGE 战法参数并发保存稀疏 merge + 版本冲突 409，见 70）
 #     + 2026-09-24 §抄母仓 可抄榜项 7（日K复权口径捆绑批，四节同批生效缺一不可：§ADJ 因子前向填充+路由唯一入口 / §KLINE-CHAIN-3 日K三级兜底链 / §ADJ-BASIS 口径位进研究断点键 / §ADJ-BASIS-3 事件缓存口径位与降级保守，见 71~74）
+#     + 2026-09-24 §抄母仓 可抄榜项 8（§LINTGATE 前端未定义符号静态门禁：no-undef 锁 error + 实盘链路渲染行为锁，见 75）
 # ...
 # §全链路 UAT 修复批（2026-09-18 §UAT_FULLCHAIN_VERIFY）专项（见 11/11）：
 #   费用腿       ：成交回报 fee/stamp_tax 五路径透传（xt 回调/桥行/网关装配/mock/Go 落库），
@@ -1911,6 +1912,37 @@ if grep -rn "adj_basis *= *''" internal/store/store.go internal/store/backtest_j
 if grep -rn 'ListEmotionStrategyMatrix(' internal/server/*.go | grep -vE ':[0-9]+:[[:space:]]*(//|\*)' | grep -vE 'research\.AdjBaselineVersion' | grep -q .; then
 	echo "--- FAIL: 情绪矩阵调用点未传 research.AdjBaselineVersion（口径位又变成可选参数）"; exit 1; fi
 echo "ok - §ADJ-BASIS-3 守卫通过（行为锁 2 组 + 主键锁 1 + 迁移锁 1 + 守恒锁 4 + 降级锁 2 + 聚合锁 3 + 负锁 2）"
+
+echo "==> 75 §LINTGATE 前端未定义符号静态门禁（可抄榜项 8，抄母仓 §N-1）..."
+# 现象：web/src/pages/Dashboard.jsx 的实盘状态轮询回调把 setQmtState 误写成 setQMTState（未声明
+#       符号）→ ReferenceError 被同函数的空 catch 吞掉 → qmtState 恒 null → 概览页「实盘链路」
+#       指示**永不渲染**，且每 15s 静默抛一次。类型检查不覆盖 .jsx、vitest 此前也没渲染过这张卡
+#       ⇒ 这类拼写型运行时炸弹只有静态 lint 抓得到，而仓库原本没有 lint 门。
+# 取舍（沿用母仓 owner 裁决）：最小集起步——no-undef 锁 error（未定义符号=运行时炸弹，正是本批
+#       事故形态）；no-unused-vars 降 warn（存量 130 条多为无害死码，error 会让门禁首日即红、
+#       失去可用性）。所以本段的实跑一律带 --quiet：只允许 error 阻塞。
+grep -q "'no-undef': 'error'" web/eslint.config.js \
+	|| { echo "--- FAIL: no-undef 未锁 error（同类拼写错误又能静默上线）"; exit 1; }
+# 桩规则锁：仓内 18 处行内 `eslint-disable react-hooks/exhaustive-deps` 指令靠 no-op 桩解析；
+# 删桩会让 ESLint 直接报「Definition for rule not found」——门禁因无关原因整红，比缺门禁更糟。
+grep -q 'react-hooks-stub-for-inline-directives' web/eslint.config.js \
+	|| { echo "--- FAIL: react-hooks 桩规则丢失（18 处行内 disable 指令令门禁首日整红）"; exit 1; }
+grep -q '"lint": "eslint src"' web/package.json \
+	|| { echo "--- FAIL: lint 脚本丢失（门禁无从挂起）"; exit 1; }
+grep -qE '"eslint": ' web/package.json \
+	|| { echo "--- FAIL: eslint 未落 devDependencies（CI 的 npm ci 装不到，门禁只在本地有效）"; exit 1; }
+grep -q 'npm run lint -- --quiet' .github/workflows/ci.yml \
+	|| { echo "--- FAIL: CI 未跑 lint（本地门禁不约束合并）"; exit 1; }
+# 行为锁：健康载荷下「实盘链路」必须真的渲染出来（防"整行静默不渲染"回退——改名不重要，断言才是锁）。
+if ! ( cd web && npx vitest run src/__tests__/n1_qmt_link.test.jsx ) >/dev/null 2>&1; then
+	echo "--- FAIL: §LINTGATE 实盘链路渲染行为锁未通过（E1 渲染/E2 熔断如实展示/E3 未启用不渲染）"; exit 1; fi
+# 负锁（滤注释行）：未声明符号的实调用形态绝迹。
+if grep -n 'setQMTState' web/src/pages/Dashboard.jsx | grep -vE '^[0-9]+:[[:space:]]*(//|\*)' | grep -q .; then
+	echo "--- FAIL: 又出现 setQMTState 实调用（未声明符号，会被空 catch 吞成静默失效）"; exit 1; fi
+# 实跑：全 src 的 error 必须为 0（warn 不阻塞）。
+if ! ( cd web && npx eslint src --quiet ); then
+	echo "--- FAIL: eslint --quiet 判红（存在未定义符号级 error，本门禁只允许 error 阻塞）"; exit 1; fi
+echo "ok - §LINTGATE 守卫通过（静态锁 5 道 + 行为锁 1 组 + 负锁 1 道 + lint 实跑）"
 
 echo ""
 echo "==> 全部通过"

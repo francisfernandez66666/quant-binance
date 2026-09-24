@@ -173,6 +173,8 @@ func TestResolvedIsPairedAndNeverOrphan(t *testing.T) {
 func TestDailySummaryOnRollover(t *testing.T) {
 	r, clk := newTestRouter(dayStart(2026, 9, 22, 9, 30))
 
+	// seq 是本用例的"事件 + 时钟推进"脚本：每步先投一个事件，再把假时钟推进 adv（0=不动）。
+	// 日汇总的判据全靠这串推进——跨日与否由时钟决定，不由真实时间决定，故用同一张表驱动。
 	seq := []struct {
 		ev  AlertEvent
 		adv time.Duration
