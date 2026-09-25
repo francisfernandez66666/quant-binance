@@ -71,9 +71,12 @@ echo "      编译 research/dataload/researchd (linux/amd64)..."
 # 子系统统一改造（docs/RESEARCH_TASK_QUEUE_PLAN.md 二期）：bt_strategy 已并入 research
 # （backtest-strategy 子命令），不再单独构建/分发；服务器上的旧二进制顺带清理。
 # English: since the phase-2 merge, bt_strategy lives inside the research binary — no separate build.
-GOOS=linux GOARCH=amd64 go build -o /tmp/research_linux ./cmd/research
-GOOS=linux GOARCH=amd64 go build -o /tmp/dataload_linux ./cmd/dataload
-GOOS=linux GOARCH=amd64 go build -o /tmp/researchd_linux ./cmd/researchd
+# §AUDITFIX925-D6d（2026-09-25 审计批）：副产物二进制同批注入 buildCommit——旧版只给 quant
+# 注指纹，research/researchd/dataload/qmt-mock 裸 build，版本漂移检测对半壁进程失效。
+# 对应 main 包已各自声明 buildCommit 变量并打启动日志（缺变量则 -X 静默空转＝假注入）。
+GOOS=linux GOARCH=amd64 go build -ldflags "${LDFLAGS}" -o /tmp/research_linux ./cmd/research
+GOOS=linux GOARCH=amd64 go build -ldflags "${LDFLAGS}" -o /tmp/dataload_linux ./cmd/dataload
+GOOS=linux GOARCH=amd64 go build -ldflags "${LDFLAGS}" -o /tmp/researchd_linux ./cmd/researchd
 $SCP /tmp/research_linux /tmp/dataload_linux /tmp/researchd_linux $SERVER_USER@$SERVER_IP:/tmp/
 $SSH "sudo mv /tmp/research_linux $DEPLOY_DIR/research && sudo mv /tmp/dataload_linux $DEPLOY_DIR/dataload && sudo mv /tmp/researchd_linux $DEPLOY_DIR/researchd && sudo rm -f $DEPLOY_DIR/bt_strategy"
 $SSH "sudo chmod +x $DEPLOY_DIR/research $DEPLOY_DIR/dataload $DEPLOY_DIR/researchd"
@@ -121,7 +124,7 @@ $SSH "sudo mkdir -p $QUANT_DATA_DIR /var/log/caddy /var/www/quant-web"
 $SSH "id quant >/dev/null 2>&1 || sudo useradd -r -s /usr/sbin/nologin quant"
 $SSH "sudo chown -R quant:quant $QUANT_DATA_DIR $DEPLOY_DIR"
 
-# ── 3b. baostock 研究数据 sidecar（Python venv，dataload 依赖 :8787）──
+# ── 3b. baostock 研究数据 sidecar（Python venv，dataload 依赖 :8788——§AUDITFIX925-D6c 统一端口口径）──
 echo "[3b/8] 部署 baostock sidecar (Python venv)..."
 $SSH "sudo mkdir -p $DEPLOY_DIR/pydata"
 $SCP "$APP_DIR/cmd/pydata/server.py" "$APP_DIR/cmd/pydata/requirements.txt" $SERVER_USER@$SERVER_IP:/tmp/
@@ -168,7 +171,12 @@ echo "      上传前端到 /var/www/quant-web..."
 $SSH "sudo rm -rf /var/www/quant-web/* && sudo mkdir -p /tmp/quant-web"
 $SCP -r "$APP_DIR/web/dist/." $SERVER_USER@$SERVER_IP:/tmp/quant-web/
 $SSH "sudo mv /tmp/quant-web/* /var/www/quant-web/ && sudo chown -R caddy:caddy /var/www/quant-web"
-$SSH "sudo sed -i 's/YOUR_DOMAIN_HERE.com/$SERVER_DOMAIN/g' /etc/caddy/Caddyfile"
+# §AUDITFIX925-D6b（2026-09-25 审计批）：旧写法 `s/YOUR_DOMAIN_HERE.com/$SERVER_DOMAIN/g` 是空转——
+# 仓库 deploy/Caddyfile 里 YOUR_DOMAIN_HERE 零命中，站点名硬编 quant-trading.top（:32），
+# 全新服务器上替换完 Caddy 仍按旧域名申请证书（静默错站）。现改为锚定「站点名行」整行替换：
+#   ^域名形态{空格}{ 的行在本文件唯一（:28 的 http://127.0.0.1:20928 含 :// 不会误伤）；
+#   备选分支同时吃「首次部署（默认站点名）」与「换域名重部署（上次注入的域名）」两种现状，幂等。
+$SSH "sudo sed -i -E 's/^(quant-trading\.top|[a-z0-9.-]+\.[a-z]+) \{$/'"$SERVER_DOMAIN"' {/' /etc/caddy/Caddyfile"
 $SSH "sudo chown -R caddy:caddy /var/log/caddy 2>/dev/null || true"
 $SSH "which caddy >/dev/null 2>&1 || (sudo apt-get update -qq && sudo apt-get install -y -qq caddy)"
 
@@ -197,7 +205,8 @@ $SSH "sudo mv /tmp/pydata.service /etc/systemd/system/pydata.service"
 # English: QMT gateway prep — uploads the Go mock gateway (unit disabled by default) and the M2 Python
 # gateway skeleton to the server.
 echo "[6b/8] 部署 QMT 网关（mock + M2 Python 骨架）..."
-GOOS=linux GOARCH=amd64 go build -o /tmp/qmt-mock_linux ./cmd/qmt-mock
+# §AUDITFIX925-D6d：qmt-mock 同批注指纹（口径见上方 research/dataload/researchd 构建行注释）
+GOOS=linux GOARCH=amd64 go build -ldflags "${LDFLAGS}" -o /tmp/qmt-mock_linux ./cmd/qmt-mock
 $SCP /tmp/qmt-mock_linux $SERVER_USER@$SERVER_IP:/tmp/qmt-mock_linux
 $SSH "sudo mv /tmp/qmt-mock_linux $DEPLOY_DIR/qmt-mock && sudo chmod +x $DEPLOY_DIR/qmt-mock"
 $SCP "$APP_DIR/deploy/qmt-mock.service" $SERVER_USER@$SERVER_IP:/tmp/qmt-mock.service
@@ -300,13 +309,19 @@ fi
     echo "      两项运维 cron 均未开启（脚本已上传 $DEPLOY_DIR/scripts/，需要时带 OPS_WATCHDOG=1/OPS_BACKUP=1 重跑）"
 
 # ── 8. 健康检查 ──
+# §AUDITFIX925-D6a（2026-09-25 审计批）：本段旧版三个失败分支全部只 echo ✗ 不置败——
+# if 条件里的失败在 set -e 下本就中止不了脚本，末命令是 echo → 后端没起来/pydata 没起/
+# HTTPS 没就绪都仍以 exit 0 报"部署成功"（假绿出口）。现收口为：失败计数 + 段尾显式判红。
+# 用显式 if 而非 `[ $N -gt 0 ] && exit 1`（后者在计数为 0 时自身返回 1，会踩 set -e 反杀）。
 echo "[8/8] 健康检查..."
+DEPLOY_FAILS=0
 sleep 3
 # 后端本机直连检查（不经 Caddy）
 if $SSH "curl -sf -o /dev/null -m 10 http://127.0.0.1:8080/setup"; then
     echo "  ✓ 后端进程已响应 (127.0.0.1:8080)"
 else
     echo "  ✗ 后端未就绪，请查看日志: journalctl -u quant -n 50"
+    DEPLOY_FAILS=$((DEPLOY_FAILS+1))
 fi
 # 独立研究服务 + baostock sidecar 状态
 for svc in pydata quant-research; do
@@ -314,6 +329,7 @@ for svc in pydata quant-research; do
         echo "  ✓ $svc 运行中"
     else
         echo "  ✗ $svc 未运行，查看: journalctl -u $svc -n 50"
+        DEPLOY_FAILS=$((DEPLOY_FAILS+1))
     fi
 done
 # HTTPS 检查（首次 ACME 申请可能要等几秒~几十秒）
@@ -324,8 +340,13 @@ for i in $(seq 1 60); do
         break
     fi
     sleep 1
-    [ "$i" = "60" ] && echo "  ✗ HTTPS 未就绪，检查: journalctl -u caddy -n 50（确认域名 DNS 已生效）"
+    [ "$i" = "60" ] && { echo "  ✗ HTTPS 未就绪，检查: journalctl -u caddy -n 50（确认域名 DNS 已生效）"; DEPLOY_FAILS=$((DEPLOY_FAILS+1)); }
 done
+# 段尾总判：任何一项 ✗ 都以非零退出收尾（部署工具链据此标红，不再"全部 echo 成功"）
+if [ "$DEPLOY_FAILS" -gt 0 ]; then
+    echo "==> 部署验收未通过：$DEPLOY_FAILS 项失败（详见上方 ✗ 行）"
+    exit 1
+fi
 
 echo "=============================================="
 echo " 部署完成。首次登录："

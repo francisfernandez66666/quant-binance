@@ -21,7 +21,7 @@ import (
 // BaostockClient 本地 sidecar 的 Go 客户端。
 // （BaostockClient is the Go client for the local baostock sidecar.）
 type BaostockClient struct {
-	base   string // 形如 http://127.0.0.1:8787
+	base   string // 形如 http://127.0.0.1:8788
 	client *http.Client
 }
 
@@ -29,7 +29,7 @@ type BaostockClient struct {
 // （NewBaostockClient builds the sidecar client.）
 func NewBaostockClient(base string) *BaostockClient {
 	if base == "" {
-		base = "http://127.0.0.1:8787"
+		base = "http://127.0.0.1:8788" // §AUDITFIX925-D6c：sidecar 缺省端口与 pydata.service 对齐（旧 8787 撞同机翻译助手）
 	}
 	return &BaostockClient{
 		base:   strings.TrimRight(base, "/"),

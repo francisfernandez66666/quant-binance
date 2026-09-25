@@ -781,7 +781,7 @@ func stepTask(step string, cfg config.SchedulerConfig, today string) (string, st
 	case "dataload":
 		pyurl := cfg.PyURL
 		if pyurl == "" {
-			pyurl = "http://127.0.0.1:8787"
+			pyurl = "http://127.0.0.1:8788" // §AUDITFIX925-D6c：兜底口径与 config 缺省一致（旧 8787 撞同机翻译助手）
 		}
 		return store.TaskDataload, mustJSON(map[string]any{"pyurl": pyurl}), true
 	case "sector_rebuild":
@@ -1049,7 +1049,7 @@ func (s *Scheduler) taskCommand(cfg config.SchedulerConfig, tk *store.ResearchTa
 		}
 		var p map[string]any
 		_ = json.Unmarshal([]byte(tk.Payload), &p)
-		pyurl := "http://127.0.0.1:8787"
+		pyurl := "http://127.0.0.1:8788" // §AUDITFIX925-D6c：payload 缺 pyurl 时的兜底，同上口径
 		if v, ok := p["pyurl"].(string); ok && v != "" {
 			pyurl = v
 		}

@@ -146,6 +146,28 @@ describe('sseOpsAlert', () => {
     expect(sseOpsAlert(null)).toBeNull()
     expect(sseOpsAlert('x')).toBeNull()
   })
+  // §AUDITFIX925-D4（2026-09-25 审计批）：币安熔断接警——此前后端广播 binance_halt 前端零消费。
+  // 形状锁照 qmt_halt 同族；tone/body 口径与后端广播字段（halted/cancelled/time）对齐。
+  it('binance_halt 置位=error、解除=success，撤单数入文案', () => {
+    const set = sseOpsAlert({ type: 'binance_halt', halted: true, cancelled: 3, time: '20:00:01' })
+    expect(set.tone).toBe('error')
+    expect(set.key).toBe('binance_halt') // 不复用 qmt_halt 的 key：两市场可同时熔断，复用会被 Toast 去重吞掉
+    expect(set.body).toContain('紧急停止')
+    expect(set.body).toContain('3 笔')
+    const clr = sseOpsAlert({ type: 'binance_halt', halted: false, cancelled: 0, time: '20:05:00' })
+    expect(clr.tone).toBe('success')
+    expect(clr.body).toContain('币安熔断已解除')
+  })
+  it('binance_halt 缺 cancelled/time 不炸（空值安全：撤单数落 0、时间括注省略）', () => {
+    const a = sseOpsAlert({ type: 'binance_halt', halted: true })
+    expect(a.tone).toBe('error')
+    expect(a.body).toContain('0 笔')
+    expect(a.body).not.toContain('（')
+  })
+  // 反证：新增 case 没把 default 改松——未知 type 必须仍然返回 null
+  it('反证：binance_x 未知型仍返回 null（default 未被放宽）', () => {
+    expect(sseOpsAlert({ type: 'binance_x', halted: true })).toBeNull()
+  })
 })
 
 // §A7（20260918 审计批）版本漂移告警判定：本地构建指纹 vs /api/status build_commit。

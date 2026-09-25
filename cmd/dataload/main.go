@@ -10,7 +10,7 @@
 //	  verify 打印各表行数
 //
 // flags：--db（默认 ~/.quant-trading-v2/trading.db）、--provider（baostock|tushare，默认
-// baostock）、--pyurl（baostock sidecar 地址，默认 http://127.0.0.1:8787）、--token
+// baostock）、--pyurl（baostock sidecar 地址，默认 http://127.0.0.1:8788，§AUDITFIX925-D6c）、--token
 // （仅 tushare 需要）、--start（YYYYMMDD，默认 20200101）、--end（YYYYMMDD，默认今天）、
 // --codes <文件>（finance 的研究池：每行一个 ts_code，# 注释）、--fin-start/--fin-end（年份）。
 // 支持断点续传：行情表按最近交易日续拉，财务表按单票最近报告期续拉。
@@ -37,13 +37,21 @@ var defaultDB = filepath.Join(os.Getenv("HOME"), ".quant-trading-v2", "trading.d
 // indexCodes 基准/风格指数（超出基准收益用）。
 var indexCodes = []string{"000300.SH", "000905.SH", "000852.SH"}
 
+// buildCommit 构建期注入的 git 提交指纹（口径同 cmd/quant，§AUDITFIX925-D6d）。
+var buildCommit = "unknown"
+
 // main 数据装载入口：解析 flags 与子命令，按 provider 分派到 baostock/tushare 实现，
 // 并完成库打开、校验与各子命令的错误处理。
 func main() {
 	log.SetFlags(log.LstdFlags | log.Lmicroseconds)
+	// §AUDITFIX925-D6d：启动即打印指纹，journalctl 可判定线上二进制与代码头是否一致。
+	log.Printf("[deploy] dataload 构建指纹: buildCommit=%s（未注入显示 unknown）", buildCommit)
 	dbPath := flag.String("db", defaultDB, "研究 SQLite 库路径")
 	provider := flag.String("provider", "baostock", "数据源: baostock|tushare")
-	pyurl := flag.String("pyurl", "http://127.0.0.1:8787", "baostock sidecar 地址")
+	// §AUDITFIX925-D6c（2026-09-25 审计批）：baostock sidecar 缺省端口从 8787 改 8788——
+	// 首尔服务器上 8787 被另一应用（翻译助手）占用，pydata.service 实际监听 8788；
+	// 旧缺省值在忘配 pyurl 时会把行情请求打到隔壁应用（全仓默认值已同批统一为 8788）。
+	pyurl := flag.String("pyurl", "http://127.0.0.1:8788", "baostock sidecar 地址")
 	token := flag.String("token", "", "Tushare Pro token（仅 tushare 需要）")
 	start := flag.String("start", "20200101", "起始日期 YYYYMMDD")
 	end := flag.String("end", time.Now().Format("20060102"), "结束日期 YYYYMMDD")

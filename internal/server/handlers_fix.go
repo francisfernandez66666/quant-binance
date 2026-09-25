@@ -600,15 +600,19 @@ func (s *Server) handleFixStatus(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// handleFixEngineHealth 处理 GET /api/engine_health 请求，返回流程引擎各子系统健康状况。
-// （handleFixEngineHealth handles GET /api/engine_health, returning the health status of each engine subsystem.）
-func (s *Server) handleFixEngineHealth(w http.ResponseWriter, r *http.Request) {
-	ctrl := s.ctrlFor(requestUserID(r))
+// engineHealthStatus 汇总流程引擎各子系统健康布尔（操作员账号口径）。
+// §AUDITFIX925-D9（2026-09-25 审计批）：从 handleFixEngineHealth 抽出为共享装配——
+// /api/health?deep=1 与 /api/engine_health 必须同源同口径，两处各算一份迟早漂移
+// （§H8 探针同源的教训就是"两份口径"造成的）。行为与抽出前逐字段一致。
+// English: shared subsystem-health builder; /api/health?deep=1 and /api/engine_health read
+// from this single source so the two probes can never diverge.
+func (s *Server) engineHealthStatus(uid string) map[string]bool {
+	ctrl := s.ctrlFor(uid)
 	// 模拟盘子系统：流程引擎的信号/估值分发目标，账户级引擎存在且启用即健康。
 	// English: paper subsystem — the pipeline's signal/mark dispatch target; healthy when the
 	// account-level engine exists and is enabled.
-	pe := s.paperEngineFor(requestUserID(r))
-	status := map[string]bool{
+	pe := s.paperEngineFor(uid)
+	return map[string]bool{
 		"news_agent":      ctrl != nil && ctrl.GetAllNewsEvents() != nil,
 		"strategy_engine": ctrl != nil && ctrl.GetStageRecords() != nil,
 		"sector_agent":    ctrl != nil && ctrl.GetHotRecords() != nil,
@@ -619,7 +623,12 @@ func (s *Server) handleFixEngineHealth(w http.ResponseWriter, r *http.Request) {
 		"aggregator":      ctrl != nil,
 		"paper":           pe != nil && pe.Enabled(),
 	}
-	writeJSON(w, 200, status)
+}
+
+// handleFixEngineHealth 处理 GET /api/engine_health 请求，返回流程引擎各子系统健康状况。
+// （handleFixEngineHealth handles GET /api/engine_health, returning the health status of each engine subsystem.）
+func (s *Server) handleFixEngineHealth(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, 200, s.engineHealthStatus(requestUserID(r)))
 }
 
 // handleFixAlerts 处理 GET /api/alerts 请求，返回系统告警列表。

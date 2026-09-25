@@ -34,7 +34,10 @@ _DATA_DIR = os.environ.get("QUANT_DATA_DIR", r"C:\var\lib\quant-trading-v2")
 _BIN_DIR = os.environ.get("QUANT_BIN_DIR", r"C:\opt\quant")
 DB = os.path.join(_DATA_DIR, "trading.db")
 DATALOAD = os.path.join(_BIN_DIR, "dataload.exe")
-PYDATA = "http://127.0.0.1:8787"
+# §AUDITFIX925-D6c（2026-09-25 审计批）：随全仓 pydata 端口口径统一 8787→8788。
+# 注意联动：cmd/pydata/server.py 的 --port 缺省值已同步改 8788——若哪台机器仍按旧缺省起
+# sidecar，它听的就已经是 8788，本常量指 8787 反而错位（旧常量才是这次的隐患源）。
+PYDATA = "http://127.0.0.1:8788"
 LOG = os.path.join(_BIN_DIR, "dataload_keepalive.log")
 IDX = [("sh.000300", "000300.SH"), ("sh.000905", "000905.SH"), ("sh.000852", "000852.SH")]
 

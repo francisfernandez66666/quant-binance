@@ -130,6 +130,17 @@ export function sseOpsAlert(msg) {
       return { key: 'trg', title: '量仔 实时放量急拉', tone: 'warning',
         body: (s.code || '') + ' ' + (s.name || '') + '：' + (s.msg || '') }
     }
+    // §AUDITFIX925-D4（2026-09-25 审计批）：币安链 kill-switch 熔断/解除事件接警。
+    // 后端 binance_api.go:294-298 广播 {type, halted, cancelled, time}，字段与 qmt_halt 同形；
+    // 此前前端零消费 → 熔断只靠状态卡 60s 轮询兜底（最长 60 秒告警盲区）。key 特意不复用
+    // qmt_halt：两市场可同时处于熔断态，复用会让 Toast 去重把其中一条吞掉。
+    case 'binance_halt':
+      // halted=true=置位熔断（伴随撤销币安在途单），false=解除；两者都必须让 UI 立刻知道
+      return msg.halted
+        ? { key: 'binance_halt', title: '量仔 币安链路熔断', tone: 'error',
+          body: '美股/加密货币实盘已紧急停止，在途委托撤销 ' + (msg.cancelled || 0) + ' 笔' + (msg.time ? '（' + msg.time + '）' : '') }
+        : { key: 'binance_halt', title: '量仔 币安链路恢复', tone: 'success',
+          body: '币安熔断已解除，恢复正常下单' + (msg.time ? '（' + msg.time + '）' : '') }
     default:
       return null
   }

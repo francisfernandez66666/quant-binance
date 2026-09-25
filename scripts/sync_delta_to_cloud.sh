@@ -18,7 +18,7 @@
 #   SERVER_USER      SSH 用户（默认 root）
 #   QUANT_DATA_DIR   云端数据目录（默认 /var/lib/quant-trading-v2）
 #   LOCAL_DB         本地研究库路径（默认 ~/.quant-trading-v2/trading.db）
-#   PYDATA_PORT      本地 pydata sidecar 端口（默认 8787）
+#   PYDATA_PORT      本地 pydata sidecar 端口（默认 8788，§AUDITFIX925-D6c 全仓统一口径）
 #   CLOUD_BIN        云端 dataload 路径（默认 /opt/quant/dataload）
 #   DATALOAD_BIN     本地 dataload 二进制路径（launchd 安装副本场景直指定，免编译）
 #   PYDATA_SERVER    pydata server.py 路径（同上；缺省用仓库内 $ROOT/cmd/pydata/server.py）
@@ -29,7 +29,7 @@ SERVER_IP="${SERVER_IP:?请设置 SERVER_IP（云端公网 IP）}"
 SERVER_USER="${SERVER_USER:-root}"
 QUANT_DATA_DIR="${QUANT_DATA_DIR:-/var/lib/quant-trading-v2}"
 LOCAL_DB="${LOCAL_DB:-$HOME/.quant-trading-v2/trading.db}"
-PYDATA_PORT="${PYDATA_PORT:-8787}"
+PYDATA_PORT="${PYDATA_PORT:-8788}"
 CLOUD_BIN="${CLOUD_BIN:-/opt/quant/dataload}"
 ADJFACTOR_ENABLED="${ADJFACTOR_ENABLED:-0}"
 

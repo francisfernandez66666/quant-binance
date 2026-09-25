@@ -8,7 +8,7 @@ tradestatus(停牌)/peTTM/pbMRQ/psTTM/pcfNcfTTM/isST；前后复权由 adjust_fa
 baostock 单账号同一时间只能开一个连接且不支持多线程 → 全部请求用 _bs_lock 串行化。
 akshare 作降级：仅覆盖 交易日历/股票列表/日线(新浪源, 避开东财)；财务降级暂不做（注明限制）。
 
-运行：python3 cmd/pydata/server.py [--host 127.0.0.1] [--port 8787]
+运行：python3 cmd/pydata/server.py [--host 127.0.0.1] [--port 8788]
 依赖：pip install baostock akshare pandas   （见 cmd/pydata/requirements.txt）
 """
 import argparse
@@ -501,7 +501,9 @@ def main():
     """
     ap = argparse.ArgumentParser()
     ap.add_argument("--host", default="127.0.0.1")
-    ap.add_argument("--port", type=int, default=8787)
+    # §AUDITFIX925-D6c（2026-09-25 审计批）：缺省端口 8787→8788，与 pydata.service 及 Go 侧
+    # 全部默认值统一（首尔服务器 8787 被翻译助手占用，旧缺省会在忘传 --port 时撞邻居）。
+    ap.add_argument("--port", type=int, default=8788)
     args = ap.parse_args()
 
     # 启动即登录（可用 BAOSTOCK_USER/BAOSTOCK_PASS 换账号），失败仅告警：请求时仍会再次报错

@@ -2321,5 +2321,90 @@ git check-ignore -q web/.auth/state.json \
 	|| { echo "--- FAIL: web/.auth 不再被忽略（共享会话 token 有进仓库的风险）"; exit 1; }
 echo "ok - §UAT-SESSION/§Z4 守卫通过（行为锁 2 组 + 静态锁 6 + 接线锁 6 + 负锁 3 + 入库卫生 1）"
 
+# ══════════════════════════════════════════════════════════════════════════════
+# 78 §AUDITFIX925：全量审计「马上能改」批七条修复的专项守卫（2026-09-25）
+# 覆盖：D4 币安熔断接警映射 / D2 币安 fetch 层契约等值 / D6a 部署验收假绿收口 /
+#       D6b Caddy 域名 sed 锚定 / D6c pydata 端口单源 8788 / D6d 四副产物构建指纹 /
+#       D9 /api/health?deep=1 与 engine_health 同源（默认体字节等价由 go 用例锁）。
+# 本段命令先经 /tmp 试跑件实跑全绿后挂入（新验收命令先实跑再入库）。
+# ══════════════════════════════════════════════════════════════════════════════
+echo "==> 78 §AUDITFIX925 审计批七条锁（D4 接警/D2 fetch 契约/D6a-d 部署面/D9 深探针）..."
+# ── 行为锁①：前端两族新用例（binance_halt 接警 + 币安 fetch 层等值契约）───────────────
+if ! ( cd web && npx vitest run src/__tests__/utils.test.js src/__tests__/binance_contract.test.js >/dev/null 2>&1 ); then
+	echo "--- FAIL: §AUDITFIX925 行为锁①未过（vitest：接警映射 / 币安 fetch 层契约等值断言）"; exit 1; fi
+# ── 行为锁②：/api/health 双形态（默认体字节等价 golden + deep 同源对拍）──────────────
+go test -count=1 ./internal/server -run 'TestHealth' 2>&1 | grep -E '^(--- FAIL|FAIL|ok)'
+# ── 静态锁：D4 接警腿在位（代码行本体，不怕注释剥离歧义）─────────────────────────────
+grep -q "case 'binance_halt'" web/src/utils.js \
+	|| { echo "--- FAIL: utils.js 币安熔断接警 case 丢失（告警盲区复活）"; exit 1; }
+grep -q 's.engineHealthStatus(requestUserID(r))' internal/server/server.go \
+	|| { echo "--- FAIL: /api/health?deep=1 不再与 /api/engine_health 同源装配（两口径漂移口子重开）"; exit 1; }
+# ── 静态锁：D2 fetch 层契约（剥注释后：路径拼接形态零命中、POST-exchange_info 零命中）──
+python3 - <<'PY' || { echo "--- FAIL: §AUDITFIX925-D2 负锁未通过"; exit 1; }
+import pathlib, re, sys
+t = pathlib.Path("web/src/api/binance.js").read_text(encoding="utf-8")
+t = re.sub(r"/\*.*?\*/", "", t, flags=re.S)
+t = re.sub(r"^\s*//.*$", "", t, flags=re.M)
+bad = []
+if "/api/binance/cancel/" in t:
+    bad.append("cancel 又回到 /cancel/{id} 路径拼接（后端实注册 POST /api/binance/cancel + body）")
+if re.search(r"exchange_info['\"][^)]*method:\s*'POST'", t):
+    bad.append("exchange_info 又回到 POST（后端实注册 GET）")
+if "data: { market, order_id: orderId }" not in t:
+    bad.append("cancel 的 body 契约（market+order_id）丢失")
+if bad:
+    print("\n".join(bad)); sys.exit(1)
+print("ok - §AUDITFIX925-D2 币安 fetch 层契约正/负锁通过")
+PY
+# ── 静态锁：D6a 验收判红（计数初值 + 自增腿 + 段尾总判缺一不可）──────────────────────
+# 3 处字面自增＝4 个失败分支（后端 / pydata+quant-research 共用 for 循环腿 / HTTPS），
+# 判红收口按"循环外不得少于一处自增"的 3 计数锁；旧假绿版这里一个自增都没有。
+[ "$(grep -c 'DEPLOY_FAILS=\$((DEPLOY_FAILS+1))' scripts/deploy_seoul.sh)" -ge 3 ] \
+	|| { echo "--- FAIL: deploy_seoul 验收段失败计数腿不足 3 处（某 ✗ 分支回退成只 echo）"; exit 1; }
+grep -q '部署验收未通过' scripts/deploy_seoul.sh \
+	|| { echo "--- FAIL: deploy_seoul 段尾总判丢失（脚本又从假绿出口收工）"; exit 1; }
+# ── 静态锁：D6b Caddy 域名替换（活动行不得再出现旧占位符；锚定站点行形态在位）─────────
+grep -qE '^[^#]*YOUR_DOMAIN_HERE' scripts/deploy_seoul.sh \
+	&& { echo "--- FAIL: YOUR_DOMAIN_HERE 空转 sed 复活（活动行，非注释）"; exit 1; } || true
+grep -q 'quant-trading\\.top' scripts/deploy_seoul.sh \
+	|| { echo "--- FAIL: Caddy 站点名锚定 sed 丢失（换域名必静默错站）"; exit 1; }
+# ── 静态锁：D6d 四副产物指纹（main 声明腿 + 脚本注入腿，成对缺一不可）────────────────
+for m in research researchd dataload qmt-mock; do
+	grep -q 'var buildCommit = "unknown"' cmd/$m/main.go \
+		|| { echo "--- FAIL: cmd/$m 缺 buildCommit 声明（-X 注进不存在的变量＝假注入）"; exit 1; }
+done
+[ "$(grep -cE 'go build -ldflags "\$\{LDFLAGS\}"' scripts/deploy_seoul.sh)" -eq 5 ] \
+	|| { echo "--- FAIL: deploy_seoul 注指纹的 go build 行应恰为 5（quant+四副产物）"; exit 1; }
+# ── 负锁：D6c 端口单源化（剥注释后 :8787 字符串残留零命中；verify 自身按 §H8 先例排除）─
+python3 - <<'PY' || { echo "--- FAIL: §AUDITFIX925-D6c 端口残留负锁未通过"; exit 1; }
+import pathlib, re, sys
+def strip(t, suffix):
+    if suffix == ".go":
+        # (?<!:) 保护 "http://" 里的双斜杠不被当注释切掉
+        t = re.sub(r"(?<!:)//.*$", "", t, flags=re.M)
+    else:
+        t = re.sub(r"#.*$", "", t, flags=re.M)
+    return t
+bad = []
+roots = ["internal", "cmd", "scripts", "deploy"]
+for root in roots:
+    for p in pathlib.Path(root).rglob("*"):
+        if p.suffix not in (".go", ".py", ".sh", ".service") or not p.is_file():
+            continue
+        if "_test.go" in p.name or p.name == "verify_changes.sh":
+            continue
+        body = strip(p.read_text(encoding="utf-8", errors="ignore"), p.suffix if p.suffix != ".service" else ".py")
+        for i, line in enumerate(body.splitlines(), 1):
+            if "127.0.0.1:8787" in line or "--port 8787" in line:
+                bad.append(f"{p}:{i} 残留旧端口字面量：{line.strip()}")
+if bad:
+    print("\n".join(bad)); sys.exit(1)
+print("ok - §AUDITFIX925-D6c 全仓 pydata 端口单源（活动代码零 8787）")
+PY
+# ── 正锁：新缺省值确实在位（负锁只证"旧的不在了"，等值锁证"新的真是 8788"）───────────
+grep -q 'PyURL:           "http://127.0.0.1:8788"' internal/config/config.go \
+	|| { echo "--- FAIL: config 缺省 PyURL 不是 8788（对齐 pydata.service 的等值断言）"; exit 1; }
+echo "ok - §AUDITFIX925 专项守卫通过（行为锁 2 组 + 静态/负向锁 9 道）"
+
 echo ""
 echo "==> 全部通过"

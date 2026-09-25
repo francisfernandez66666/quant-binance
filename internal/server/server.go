@@ -1618,7 +1618,25 @@ func (s *Server) permMiddleware(perm string, next http.HandlerFunc) http.Handler
 // ── API handlers ──
 
 // handleHealth 处理 GET /api/health：健康检查，恒返回 {"status":"ok"}。
+// §AUDITFIX925-D9（2026-09-25 审计批）：本端点被 uat_bootstrap/monitor_test 用作**就绪探针**
+// （HTTP 起来即就绪），默认响应必须保持字节等价，动不得。新增可选 ?deep=1：在同一鉴权口上
+// 追加引擎实况（子系统布尔集 + deep_ok），供外部存活监控区分"进程活着"与"引擎活着"。
+// deep_ok 只钉 aggregator 腿（ctrl!=nil）——这是"HTTP 在、引擎控制器没接线"这一假活类别的
+// 最小充分信号；其余子系统布尔仅作信息位，不因 CN 关态（news_agent 等本就为 false）误判红。
+// 口径约束（§H8 教训）：deep 探测必须带 token 走 JSON 判定，禁止裸 curl -f 把 401 当误熔。
+// English: default response stays byte-identical (readiness probe); optional ?deep=1 adds
+// subsystem booleans + deep_ok (aggregator leg) for liveness monitoring behind the same auth.
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Query().Get("deep") == "1" {
+		subs := s.engineHealthStatus(requestUserID(r))
+		deepOK := subs["aggregator"]
+		status := "degraded"
+		if deepOK {
+			status = "ok"
+		}
+		writeJSON(w, 200, map[string]any{"status": status, "deep_ok": deepOK, "subsystems": subs})
+		return
+	}
 	writeJSON(w, 200, map[string]string{"status": "ok"})
 }
 

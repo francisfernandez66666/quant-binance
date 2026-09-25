@@ -29,10 +29,17 @@ import (
 // （defaultDB is the default research SQLite DB path.）
 var defaultDB = filepath.Join(os.Getenv("HOME"), ".quant-trading-v2", "trading.db")
 
+// buildCommit 构建期注入的 git 提交指纹（口径同 cmd/quant，§AUDITFIX925-D6d 2026-09-25 审计批：
+// 部署脚本 research/dataload/researchd/qmt-mock 四条 build 行此前裸跑，版本漂移检测失效）。
+// 未注入显示 "unknown"；deploy_seoul.sh 以 -ldflags "-X main.buildCommit=…" 注入短 SHA。
+var buildCommit = "unknown"
+
 // main 入口：解析全局 flags（--db/--start/--end 等）后按子命令分发；
 // run-task 是任务队列的唯一执行入口（由 researchd worker 拉起）。
 func main() {
 	log.SetFlags(log.LstdFlags | log.Lmicroseconds)
+	// §AUDITFIX925-D6d：启动即打印指纹，journalctl 可判定线上二进制与代码头是否一致。
+	log.Printf("[deploy] research 构建指纹: buildCommit=%s（未注入显示 unknown）", buildCommit)
 	dbPath := flag.String("db", defaultDB, "研究 SQLite 库路径")
 	start := flag.String("start", "20200101", "起始日期 YYYYMMDD")
 	end := flag.String("end", time.Now().Format("20060102"), "结束日期 YYYYMMDD")

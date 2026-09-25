@@ -285,9 +285,14 @@ func round2(v float64) float64 {
 	return float64(int(v*100+0.5)) / 100
 }
 
+// buildCommit 构建期注入的 git 提交指纹（口径同 cmd/quant，§AUDITFIX925-D6d）。
+var buildCommit = "unknown"
+
 // main 启动 MiniQMT 模拟网关：解析命令行参数，初始化内存账本、HTTP 路由与鉴权中间件，
 // 监听 /health /state /order /cancel 接口，并把成交回报按 --delay 延时后推送回首尔服务器。
 func main() {
+	// §AUDITFIX925-D6d：启动即打印指纹，journalctl 可判定线上二进制与代码头是否一致。
+	log.Printf("[deploy] qmt-mock 构建指纹: buildCommit=%s（未注入显示 unknown）", buildCommit)
 	listen := flag.String("listen", ":8789", "网关监听地址")
 	token := flag.String("token", "mock-secret", "Bearer token（与首尔 qmt.token 一致）")
 	server := flag.String("server", "", "首尔服务器地址，成交回报推送到其 POST /api/qmt/report（留空不推送）")

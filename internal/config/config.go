@@ -766,7 +766,8 @@ type SchedulerConfig struct {
 	DataloadBin string `json:"dataload_bin"`
 	// 研究库路径（trading.db）
 	DB string `json:"db"`
-	// baostock sidecar 地址（默认 http://127.0.0.1:8787）
+	// baostock sidecar 地址（默认 http://127.0.0.1:8788；§AUDITFIX925-D6c 2026-09-25 统一：
+	// 首尔服务器 8787 被翻译助手占用，pydata.service 实听 8788，全仓缺省值同口径）
 	PyURL string `json:"pyurl"`
 	// 盘后/周末夜间作业
 	Nightly NightlyConfig `json:"nightly"`
@@ -932,8 +933,8 @@ func DefaultSchedulerConfig() SchedulerConfig {
 		DataloadBin:     "dataload",
 		PrimarySource:   "baostock", // 安全默认：旧表；对账门禁通过后配置切 hithink
 		ThsFactorsReady: false,
-		OptimizeEnabled: true, // §O1 夜间自动寻优默认开启（推荐制——结果需人工审批应用）
-		PyURL:           "http://127.0.0.1:8787",
+		OptimizeEnabled: true,                    // §O1 夜间自动寻优默认开启（推荐制——结果需人工审批应用）
+		PyURL:           "http://127.0.0.1:8788", // §AUDITFIX925-D6c：缺省端口与 pydata.service 对齐（旧 8787 撞翻译助手）
 		Nightly: NightlyConfig{
 			StartHHMM:        1530,
 			WeekendStartHHMM: 1530,

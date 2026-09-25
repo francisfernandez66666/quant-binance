@@ -27,10 +27,15 @@ import (
 	"quant-trading-v2/internal/store" // §ADJ P0-A：启动时经唯一入口装配数据源路由
 )
 
+// buildCommit 构建期注入的 git 提交指纹（口径同 cmd/quant，§AUDITFIX925-D6d）。
+var buildCommit = "unknown"
+
 // main 研究调度服务入口：固定进程时区为 Asia/Shanghai，确定数据目录，启动 scheduler 调度循环，
 // 并在收到 SIGTERM/SIGINT 时优雅停机（先抢占遗留作业再取消，保证断点续跑）。
 func main() {
 	log.SetFlags(log.LstdFlags | log.Lshortfile)
+	// §AUDITFIX925-D6d：启动即打印指纹，journalctl 可判定线上二进制与代码头是否一致。
+	log.Printf("[deploy] researchd 构建指纹: buildCommit=%s（未注入显示 unknown）", buildCommit)
 
 	// 时区加固：A 股按北京时间（与 cmd/quant 双保险，服务器在海外也不偏移）。
 	// English: force Asia/Shanghai so trading-session windows align with A-share hours even on

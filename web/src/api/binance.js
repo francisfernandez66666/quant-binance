@@ -11,8 +11,13 @@
 // 在建端点（PLAN §7 表，形状先行按 §6.2 契约消费，全部 fail-soft：404/未上线由调用处兜底）：
 //   GET  /api/binance/state    → {connected,halted,mode,testnet,ws_subscriptions,
 //                                 rate_limit_remaining,disclaimer_signed_at,...}
-//   GET  /api/binance/orders   → {orders:[{order_id,market,code,side,price,qty,amount,status,created_at}]}
-//   POST /api/binance/cancel/{id} / POST /api/binance/halt / POST /api/binance/exchange_info
+//   GET  /api/binance/orders   → 数组 [{...}]（非 {orders:[]}；market 可选过滤，CN 行不回流）
+//   POST /api/binance/cancel   → body {market, order_id}（无路径参数）
+//   POST /api/binance/halt     / GET /api/binance/exchange_info（刷新规则缓存）
+// §AUDITFIX925-D2（2026-09-25 审计批）：本注释旧版写的是 "POST /api/binance/cancel/{id}" 与
+// "POST /api/binance/exchange_info"——两处均与后端实注册路由不符（server.go:698-699），
+// 照抄者必撞 404/405。现已按后端真实契约逐一对齐，并以 vitest 契约用例（binance_contract.test.js）钉死。
+// English: header contract notes realigned to server routes (cancel takes body not path id; exchange_info is GET).
 // English: single fetch module for all Binance endpoints; when backend paths shift, fix them here only.
 import { request } from './index.js'
 
@@ -31,14 +36,20 @@ export async function fetchBinanceState() {
   return request('/api/binance/state')
 }
 
-// market 可选 'US'|'CRYPTO'：当日新市场委托（前端撤单数据源）
+// market 可选 'US'|'CRYPTO'：当日新市场委托（前端撤单数据源）。
+// §AUDITFIX925-D2 登记：后端契约正确（server.go:700 GET），但前端当前零页面消费——
+// 保留尺寸待撤单面板接线（勿删；删除需 owner 确认）。
 export async function fetchBinanceOrders(market) {
   const q = market && market !== 'ALL' ? '?market=' + encodeURIComponent(market) : ''
   return request('/api/binance/orders' + q)
 }
 
-export async function cancelBinanceOrder(orderId) {
-  return request('/api/binance/cancel/' + encodeURIComponent(orderId), { method: 'POST' })
+// 撤单：POST /api/binance/cancel，body {market, order_id}（后端按市场路由撤单、未注册市场拒撤）。
+// §AUDITFIX925-D2：旧实现把 order_id 拼进路径（后端无此路由，必 404）——已对齐真实契约。
+// 注意：未接实盘钥匙时后端回 503 "binance live channel not wired"（binance_api.go:239-242），
+// 属"通道未接线"不是故障，接 UI 时按 503 单独文案，勿混进网络错误。
+export async function cancelBinanceOrder(market, orderId) {
+  return request('/api/binance/cancel', { method: 'POST', data: { market, order_id: orderId } })
 }
 
 // kill-switch：镜像 /api/qmt/halt 语义（halted=true 置位撤在途，false 解除）
@@ -46,9 +57,12 @@ export async function binanceHalt(halted) {
   return request('/api/binance/halt', { method: 'POST', data: { halted: !!halted } })
 }
 
-// 运维：触发 exchangeInfo 规则缓存刷新（min_notional/stepSize 等）
-export async function refreshBinanceExchangeInfo() {
-  return request('/api/binance/exchange_info', { method: 'POST' })
+// 交易规则查询：GET /api/binance/exchange_info?symbol=BTCUSDT → {symbol,found,...rules}。
+// §AUDITFIX925-D2：旧实现写成 "POST 触发缓存刷新"——方法错（后端 GET，必 405）且语义错
+// （这是步长/最小名义额的只读查询面，规则缓存由执行器自带 10min TTL，无需前端触发）。
+// 未接钥匙回 503、CRYPTO 执行器未装配回 503，均按文案透出（server 路由挂 adminMiddleware）。
+export async function fetchBinanceExchangeInfo(symbol) {
+  return request('/api/binance/exchange_info?symbol=' + encodeURIComponent(String(symbol || '')))
 }
 
 // —— §BINANCE-P5 新市场历史 K 线（只读端点，路由挂 authMiddleware）——
