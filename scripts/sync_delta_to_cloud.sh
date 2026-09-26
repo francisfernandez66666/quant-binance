@@ -10,12 +10,14 @@
 #   6) 增量行数校验输出；失败保留 delta 文件便于重试（全流程幂等，直接重跑安全）
 #
 # 用法：
-#   SERVER_IP=43.108.86.140 bash scripts/sync_delta_to_cloud.sh          # 手动
+#   bash scripts/sync_delta_to_cloud.sh                                  # 手动（服务器地址读 scripts/ops.env）
+#   SERVER_IP=<你的服务器地址> bash scripts/sync_delta_to_cloud.sh        # 应急直传，优先于 ops.env
 #   launchd/cron 定时见 docs/DATA_SYNC_SCRIPT.md 第四节                   # 定时
 #
 # 环境变量（含默认）：
-#   SERVER_IP        云端公网 IP（必填）
-#   SERVER_USER      SSH 用户（默认 root）
+#   SERVER_IP        云端服务器地址（缺省读 scripts/ops.env 的 OPS_SSH_HOST，见模板
+#                    scripts/ops.env.example；§N7 2026-09-26 审计批：真实 IP 不再入仓）
+#   SERVER_USER      SSH 用户（默认取 ops.env 的 OPS_SSH_USER，再缺省 root）
 #   QUANT_DATA_DIR   云端数据目录（默认 /var/lib/quant-trading-v2）
 #   LOCAL_DB         本地研究库路径（默认 ~/.quant-trading-v2/trading.db）
 #   PYDATA_PORT      本地 pydata sidecar 端口（默认 8788，§AUDITFIX925-D6c 全仓统一口径）
@@ -25,15 +27,25 @@
 #   ADJFACTOR_ENABLED 是否每日补复权因子（默认 0=跳过；首次补齐后基本无新数据）
 set -euo pipefail
 
-SERVER_IP="${SERVER_IP:?请设置 SERVER_IP（云端公网 IP）}"
-SERVER_USER="${SERVER_USER:-root}"
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+
+# ── §N7（2026-09-26 全量审计批）敏感信息出仓 ──
+# 缺陷原文：真实公网 IP 曾以字面量出现在本脚本头注用法示例（已清除），且服务器地址只靠
+#   每次手工传 SERVER_IP，本机无安全落点（写进 crontab 行同样有出仓路径）。
+# 修法：ops.env（scripts/ops.env，已进 .gitignore；模板 scripts/ops.env.example）存在即 source，
+#   变量名统一 OPS_SSH_HOST/OPS_SSH_USER；显式 SERVER_IP/SERVER_USER 环境变量仍优先（应急口）。
+# source 用 if 块而非 `[ -f ] && . file`——后者在文件缺失时整句返回 1，会踩 set -e 反杀。
+if [ -f "$ROOT/scripts/ops.env" ]; then
+    . "$ROOT/scripts/ops.env"
+fi
+SERVER_IP="${SERVER_IP:-${OPS_SSH_HOST:-}}"
+SERVER_IP="${SERVER_IP:?请设置 SERVER_IP（云端服务器地址）：推荐 cp scripts/ops.env.example scripts/ops.env 填入 OPS_SSH_HOST，或显式传 SERVER_IP（§N7：真实 IP 不再入仓）}"
+SERVER_USER="${SERVER_USER:-${OPS_SSH_USER:-root}}"
 QUANT_DATA_DIR="${QUANT_DATA_DIR:-/var/lib/quant-trading-v2}"
 LOCAL_DB="${LOCAL_DB:-$HOME/.quant-trading-v2/trading.db}"
 PYDATA_PORT="${PYDATA_PORT:-8788}"
 CLOUD_BIN="${CLOUD_BIN:-/opt/quant/dataload}"
 ADJFACTOR_ENABLED="${ADJFACTOR_ENABLED:-0}"
-
-ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 DELTA_TMP="${DELTA_TMP:-/tmp/delta_quant}"
 TODAY=$(date +%Y%m%d)
 DELTA_FILE="$DELTA_TMP/delta_$TODAY.jsonl.gz"

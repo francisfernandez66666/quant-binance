@@ -157,7 +157,13 @@ class ReportHandler:
 
         :param store: 本地 SQLite 账本（Store 实例）。
         :param report_url: 首尔回报接收地址（引擎 /api/qmt/report）。
-        :param report_token: 回报鉴权 token（与首尔侧配置一致）。
+        :param report_token: 回报鉴权 token。**§N2（2026-09-26 全量审计）口径收口**：首尔侧
+               /api/qmt/report 只按唯一口令 rules.qmt.token 常量时间比对归因账号
+               （internal/server/qmt.go:145-156），本参数只允许"等于网关 token"或"空"两种形态；
+               配成第二个值 = 全量 401 = outbox 死信，故网关已在启动装配处 fail-fast 拒启
+               （见 gateway.report_token_conflicts / main 的 §N2 闸），本文件不再自带校验入口。
+               English: the Seoul side matches exactly one token per account; a divergent report
+               token means every push 401s, so the gateway refuses to boot with one.
         :param user_id: 多账号归属标识（§P1-9），回报/落库统一携带。
         :param max_outbox: outbox 落库行数上限，超限裁剪最旧。
         English: builds the report handler — persists events to the local store and

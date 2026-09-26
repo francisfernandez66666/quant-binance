@@ -58,7 +58,8 @@ func bsMock(t *testing.T) *httptest.Server {
 
 // TestBaostockTradeDays 验证交易日历接口解析：is_open 字段与日期字符串原样保留。
 func TestBaostockTradeDays(t *testing.T) {
-	c := NewBaostockClient(bsMock(t).URL)
+	// §N4：token 传空串 = 不发鉴权头，锁住"旧 sidecar（未启口令）照常工作"的兼容面。
+	c := NewBaostockClient(bsMock(t).URL, "")
 	rows, err := c.TradeDays("20200101", "20200105")
 	if err != nil {
 		t.Fatalf("TradeDays: %v", err)
@@ -76,7 +77,8 @@ func TestBaostockTradeDays(t *testing.T) {
 
 // TestBaostockAllStock 验证全市场股票列表解析及 baostock↔Tushare 代码双向互转。
 func TestBaostockAllStock(t *testing.T) {
-	c := NewBaostockClient(bsMock(t).URL)
+	// §N4：token 传空串 = 不发鉴权头，锁住"旧 sidecar（未启口令）照常工作"的兼容面。
+	c := NewBaostockClient(bsMock(t).URL, "")
 	rows, err := c.AllStock()
 	if err != nil {
 		t.Fatalf("AllStock: %v", err)
@@ -95,7 +97,8 @@ func TestBaostockAllStock(t *testing.T) {
 
 // TestBaostockKlineEmptyCells 验证停牌日空单元格解析为 0，且字段名大小写归一。
 func TestBaostockKlineEmptyCells(t *testing.T) {
-	c := NewBaostockClient(bsMock(t).URL)
+	// §N4：token 传空串 = 不发鉴权头，锁住"旧 sidecar（未启口令）照常工作"的兼容面。
+	c := NewBaostockClient(bsMock(t).URL, "")
 	rows, err := c.StockKline("sh.600000", "20200101", "20200110")
 	if err != nil {
 		t.Fatalf("StockKline: %v", err)
@@ -121,7 +124,8 @@ func TestBaostockKlineEmptyCells(t *testing.T) {
 
 // TestBaostockFina 验证财务数据接口解析：字符串日期原样保留、数值正确转换。
 func TestBaostockFina(t *testing.T) {
-	c := NewBaostockClient(bsMock(t).URL)
+	// §N4：token 传空串 = 不发鉴权头，锁住"旧 sidecar（未启口令）照常工作"的兼容面。
+	c := NewBaostockClient(bsMock(t).URL, "")
 	rows, err := c.FinaProfit("sh.600000", 2019, 4)
 	if err != nil {
 		t.Fatalf("FinaProfit: %v", err)
@@ -139,7 +143,8 @@ func TestBaostockFina(t *testing.T) {
 
 // TestBaostockErrorPrefix 验证业务错误（"error:" 前缀）被转为 Go error 返回。
 func TestBaostockErrorPrefix(t *testing.T) {
-	c := NewBaostockClient(bsMock(t).URL)
+	// §N4：token 传空串 = 不发鉴权头，锁住"旧 sidecar（未启口令）照常工作"的兼容面。
+	c := NewBaostockClient(bsMock(t).URL, "")
 	_, err := c.call("error", nil, nil)
 	if err == nil {
 		t.Fatal("期望业务错误，得到 nil")

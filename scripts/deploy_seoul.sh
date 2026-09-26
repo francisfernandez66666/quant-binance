@@ -2,12 +2,12 @@
 # 一键部署到首尔阿里云 Ubuntu 服务器：交叉编译 → 上传 → 安装 Caddy/systemd → 运维 cron 装载 → 健康检查。
 #
 # 用法（本地 macOS 上执行）：
-#   SERVER_IP=1.2.3.4 SERVER_DOMAIN=your-domain.com ./scripts/deploy_seoul.sh
-#   或先 export SERVER_IP=... SERVER_DOMAIN=... 再 ./scripts/deploy_seoul.sh
+#   ./scripts/deploy_seoul.sh                                   # 服务器地址读 scripts/ops.env（模板 ops.env.example）
+#   SERVER_IP=1.2.3.4 SERVER_DOMAIN=your-domain.com ./scripts/deploy_seoul.sh   # 显式传参优先
 #
 # 参数说明（均为必填，除注明外）：
-#   SERVER_IP         首尔服务器公网 IP（SSH 用）
-#   SERVER_USER       SSH 用户（默认 root）
+#   SERVER_IP         首尔服务器地址（SSH 用；缺省回落 ops.env 的 OPS_SSH_HOST，§N7 真实 IP 不入仓）
+#   SERVER_USER       SSH 用户（缺省回落 ops.env 的 OPS_SSH_USER，再缺省 root）
 #   SERVER_DOMAIN     域名（Caddy 用，必须已解析到 SERVER_IP；Caddy 首次启动会做 ACME 验证）
 #   LLM_API_KEY       LLM 服务 API Key（写入 /etc/quant.env）
 #   LLM_API_URL       LLM API 地址（可选，默认 https://api.siliconflow.cn/v1/chat/completions）
@@ -22,10 +22,23 @@
 
 set -euo pipefail
 
+# ── §N7（2026-09-26 全量审计批）敏感信息出仓 ──
+# 缺陷原文：本脚本注释曾字面泄露服务器公网 IP 与 SSH 非默认端口（随 git tracked 出仓）。
+# 修法：ops.env 存在即 source（入库模板 scripts/ops.env.example，真实文件已进 .gitignore），
+#   SERVER_IP/SERVER_USER 回落 OPS_SSH_HOST/OPS_SSH_USER；显式环境变量传参仍优先（旧用法不破坏）。
+#   端口不进命令行：SSH 加固口径（密钥 + 非默认端口）继续由本机 ~/.ssh/config 的 Host 段承载，
+#   连接方式与修复前逐字一致（§N7 铁律：只把字面值换成变量，不改连接方式）。
+# source 写成 if 块而非 `[ -f ] && . file`——后者在文件缺失时整句返回 1，会踩 set -e 反杀。
+APP_DIR="$(cd "$(dirname "$0")/.." && pwd)"
+if [ -f "$APP_DIR/scripts/ops.env" ]; then
+    . "$APP_DIR/scripts/ops.env"
+fi
+
 # ── 必填参数校验 ──
-: "${SERVER_IP:?请设置 SERVER_IP（首尔服务器公网 IP）}"
+SERVER_IP="${SERVER_IP:-${OPS_SSH_HOST:-}}"
+: "${SERVER_IP:?请设置 SERVER_IP（首尔服务器地址或 ~/.ssh/config 的 Host 别名）：推荐 cp scripts/ops.env.example scripts/ops.env 填入 OPS_SSH_HOST（§N7：真实 IP 不入仓）}"
 : "${SERVER_DOMAIN:?请设置 SERVER_DOMAIN（域名，需已解析到 SERVER_IP）}"
-SERVER_USER="${SERVER_USER:-root}"
+SERVER_USER="${SERVER_USER:-${OPS_SSH_USER:-root}}"
 LLM_API_KEY="${LLM_API_KEY:-}"
 LLM_API_URL="${LLM_API_URL:-https://api.siliconflow.cn/v1/chat/completions}"
 LLM_MODEL="${LLM_MODEL:-THUDM/GLM-Z1-9B-0414}"
@@ -39,9 +52,9 @@ OPS_WATCHDOG="${OPS_WATCHDOG:-0}"
 OPS_SERVICES="${OPS_SERVICES:-quant pydata quant-research}"
 OPS_BACKUP="${OPS_BACKUP:-0}"
 
-APP_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$APP_DIR"
-# §SSH 加固：密钥登录+端口 28022（~/.ssh/config 有 Host 43.108.86.140 seoul 别名自动匹配）
+# §SSH 加固：密钥登录 + 非默认端口（端口与 identity 配在本机 ~/.ssh/config 的 Host 段，
+# §N7 起端口/地址字面值不再入仓；OPS_SSH_HOST 直接填该 Host 里的地址或别名即可自动匹配）
 SSH="ssh -o StrictHostKeyChecking=accept-new $SERVER_USER@$SERVER_IP"
 SCP="scp -o StrictHostKeyChecking=accept-new"
 
@@ -212,6 +225,33 @@ $SSH "sudo mv /tmp/qmt-mock_linux $DEPLOY_DIR/qmt-mock && sudo chmod +x $DEPLOY_
 $SCP "$APP_DIR/deploy/qmt-mock.service" $SERVER_USER@$SERVER_IP:/tmp/qmt-mock.service
 $SSH "sudo mv /tmp/qmt-mock.service /etc/systemd/system/qmt-mock.service"
 # 默认关闭（联调时手动 enable --now qmt-mock）；token 由 /etc/qmt-mock.env 提供
+#
+# §N8（2026-09-26 全量审计批）假柜台 env 文件断链修复：
+#   缺陷原文：qmt-mock.service 的 EnvironmentFile=-/etc/qmt-mock.env 带可选前缀"-"（缺文件不报错），
+#   ExecStart 却吃 ${QMT_MOCK_TOKEN}/${QMT_MOCK_REPORT_TOKEN}/${QMT_MOCK_DELAY}，而本脚本此前
+#   从不生成该文件——"联调时手动 enable"那天会以空 token 静默裸奔：mock 的 Bearer 中间件对空 token
+#   只放行字面空密钥、/health 又整段豁免，形成「探活绿、交易死」的半死状态（比起不来更难查）。
+#   修法：部署时缺失才生成（umask 077 落 600 权限；双 32hex 随机 token；delay 3s），
+#   已存在绝不覆盖；生成失败不判红（mock 服务默认关闭，非现网依赖），但 echo 明示。
+#   if 条件包裹 ssh/heredoc 在 set -e 下安全（条件位失败不终止脚本）。
+if $SSH "sudo test -f /etc/qmt-mock.env"; then
+    echo "      /etc/qmt-mock.env 已存在，保持原样（本次部署不覆盖现有 mock 口令）"
+else
+    MOCK_ENV_TOKEN="$(od -An -tx1 -N16 /dev/urandom | tr -d ' \n')"
+    MOCK_ENV_REPORT_TOKEN="$(od -An -tx1 -N16 /dev/urandom | tr -d ' \n')"
+    if $SSH "sudo sh -c 'umask 077; cat > /etc/qmt-mock.env'" <<EOF
+# 由 scripts/deploy_seoul.sh [6b/8] 生成（§N8）：qmt-mock 联调口令，勿随镜像/仓库外传。
+QMT_MOCK_TOKEN=$MOCK_ENV_TOKEN
+QMT_MOCK_REPORT_TOKEN=$MOCK_ENV_REPORT_TOKEN
+QMT_MOCK_DELAY=3s
+EOF
+    then
+        echo "      /etc/qmt-mock.env 已生成（600 权限，双 token 随机）"
+        echo "      ⚠ mock 口令已生成：enable mock 联调时，须把该口令同步填入引擎 rules.qmt.token，或改用引擎现有 token 覆盖本文件——两侧不一致会 401（探活仍绿，见 §N8）"
+    else
+        echo "      [warn] /etc/qmt-mock.env 生成失败——mock 服务默认关闭，本项不判红；联调 enable 前必须手工创建该文件，否则将以空 token 启动（§N8 半死状态复现）"
+    fi
+fi
 $SSH "sudo mkdir -p $DEPLOY_DIR/qmt_gateway /tmp/qmt_gateway"
 # 先清空目标与暂存目录再复制（__pycache__/tests 等非空目录会让 mv 覆盖失败，set -e 中断部署）
 # English: clear target & staging first — non-empty dirs (pycache/tests) break plain mv overwrite.

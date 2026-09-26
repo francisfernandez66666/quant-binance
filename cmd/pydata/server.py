@@ -8,13 +8,25 @@ tradestatus(停牌)/peTTM/pbMRQ/psTTM/pcfNcfTTM/isST；前后复权由 adjust_fa
 baostock 单账号同一时间只能开一个连接且不支持多线程 → 全部请求用 _bs_lock 串行化。
 akshare 作降级：仅覆盖 交易日历/股票列表/日线(新浪源, 避开东财)；财务降级暂不做（注明限制）。
 
-运行：python3 cmd/pydata/server.py [--host 127.0.0.1] [--port 8788]
+运行：python3 cmd/pydata/server.py [--host 127.0.0.1] [--port 8788] [--token <口令>]
 依赖：pip install baostock akshare pandas   （见 cmd/pydata/requirements.txt）
+
+§N4（2026-09-26 全量审计 §三 N4）可选口令鉴权：
+  缺陷原文：本文件全文没有任何 token/Authorization 校验（审计实核 grep 计数 0），
+    防线只有"绑 127.0.0.1"这一条。同机单租户可控，但私有化多租户交付时，
+    同机上的任意进程都能白拿全市场研究数据（且 dataload --token 是 Tushare 专用、易误读）。
+  为何这样修：加**可选** --token（缺省空串=匿名放行，与现网行为逐字节等价，零行为变化）；
+    非空时所有请求路径必须带头 X-Pydata-Token 且逐字相等，否则 401。
+    Go 侧客户端（internal/data/baostock.go）以同样的可选入参携带该头，
+    口令来源链：--pytoken（显式） > QUANT_PYDATA_TOKEN（env） > config rules.data.pydata_token。
+  （English: an optional shared-secret header gate; empty token keeps today's anonymous
+  behaviour byte-for-byte.）
 """
 import argparse
 import concurrent.futures
 import csv
 import datetime
+import hmac
 import io
 import json
 import logging
@@ -44,6 +56,41 @@ log = logging.getLogger("pydata")
 # baostock 单连接限制 → 全局串行锁（English: baostock allows one connection per account,
 # so all requests are serialized behind a single lock.)
 _bs_lock = threading.Lock()
+
+# §N4（2026-09-26 全量审计）鉴权口令（缺省空 = 匿名放行，与现网逐字节等价）。
+# 实际值由 main() 从 --token 写入 _Handler.token（类级注入，与 qmt_gateway 同风格）。
+# English: optional shared secret; empty means anonymous pass (today's behaviour).
+TOKEN_HEADER = "X-Pydata-Token"
+
+
+def token_error_body(token_cfg, presented):
+    """口令不匹配时返回响应体文本，匹配/未启用口令返回 None。
+
+    缺陷原文：sidecar 全无鉴权，防线只有绑 127.0.0.1。
+    为何这样修（**响应形态选型说明**，对照 internal/data/baostock.go:69-71）：
+      Go 客户端判错**只看响应体是否以 "error:" 前缀开头**（`strings.HasPrefix(text, "error:")`），
+      它根本不读 resp.StatusCode；本服务既有错误协议也是这个形态
+      （_Handler.do_GET 的 `self._send(200, "error: %s" % e)`，注释写着"与 Tushare 风格一致"）。
+      所以拒绝响应**必须**是 "error: ..." 纯文本，才能被 Go 侧识别为错误；
+      若返回 JSON {"error":"unauthorized"}，Go 会把它当 CSV 解析成"一条一列的表头"→
+      静默返回空结果、err=nil，比现在更糟（鉴权失败退化成取数为空）。
+      状态码仍用 401（HTTP 语义正确，curl/监控/网关日志一眼可辨），体文本保持协议兼容。
+    English: rejects with an "error: ..." body (the only shape the Go client understands)
+    while still answering HTTP 401; a JSON body would be parsed as CSV and silently look
+    like an empty result set.
+
+    :param token_cfg: 生效口令（空串 = 未启用鉴权，一律放行）。
+    :param presented: 请求头里的 X-Pydata-Token 值（缺失为空串）。
+    :return: None = 放行；str = 拒绝，调用方以 401 + 该文本回包。
+    """
+    want = str(token_cfg or "")
+    if not want:
+        return None  # 未启用：匿名放行（现网行为）
+    got = str(presented or "")
+    # 常量时间比对（与 qmt_gateway 的 hmac.compare_digest 同口径，不留时序侧信道）
+    if got and hmac.compare_digest(got, want):
+        return None
+    return "error: unauthorized"
 
 
 def _bs_call(fn, *args, **kwargs):
@@ -461,15 +508,27 @@ _ROUTES = {
 
 
 class _Handler(BaseHTTPRequestHandler):
+    # §N4：生效口令（类级注入，main 从 --token 写入）。空串 = 匿名放行 = 现网行为不变。
+    token = ""
+
     def log_message(self, fmt, *args):  # 精简 access log
         """精简访问日志：把基类默认 stderr 输出改为 info 级别记录。"""
         log.info("req " + fmt % args)
 
     def do_GET(self):
-        """处理 GET 请求：按路径路由到对应业务函数，业务错误以 error: 前缀返回 200。
-        未识别的路由返回 404。"""
+        """处理 GET 请求：先过 §N4 口令闸（未配口令时直接放行，行为与现网一致），
+        再按路径路由到对应业务函数，业务错误以 error: 前缀返回 200。未识别的路由返回 404。"""
         u = urlparse(self.path)
         name = u.path.strip("/") or "health"
+        # §N4：口令非空时**所有路径**（含 /health）都要校验 X-Pydata-Token——
+        # 探测端点同样能泄露"这台机器上有研究数据服务"，不做例外。
+        # 拒绝响应体是 "error: unauthorized"（Go 客户端唯一的错误协议形态），
+        # 状态码用 401，选型理由见 token_error_body 的注释。
+        denied = token_error_body(self.token, self.headers.get(TOKEN_HEADER, ""))
+        if denied is not None:
+            log.warning("reject %s: 口令缺失或不匹配（header %s）", u.path, TOKEN_HEADER)
+            self._send(401, denied)
+            return
         params = {k: v[0] for k, v in parse_qs(u.query).items()}
         try:
             fn = _ROUTES.get(name)
@@ -504,7 +563,24 @@ def main():
     # §AUDITFIX925-D6c（2026-09-25 审计批）：缺省端口 8787→8788，与 pydata.service 及 Go 侧
     # 全部默认值统一（首尔服务器 8787 被翻译助手占用，旧缺省会在忘传 --port 时撞邻居）。
     ap.add_argument("--port", type=int, default=8788)
+    # §N4（2026-09-26 全量审计）可选口令：缺省取环境变量 QUANT_PYDATA_TOKEN，未设置即空串
+    # = 匿名放行（与现网逐字节等价）。Go 侧读同一个环境变量（internal/config 数据段
+    # pydata_token 亦可），来源链口径与 qmt_gateway 的 QUANT_GATEWAY_TOKEN 惯例一致：
+    # 显式旗标 > 环境变量 > 配置文件。
+    ap.add_argument("--token", default=os.environ.get("QUANT_PYDATA_TOKEN", ""),
+                    help="可选共享口令；非空时所有请求须带 %s 头（缺省空=匿名放行）" % TOKEN_HEADER)
     args = ap.parse_args()
+
+    # §N4：口令注入处理器类（类级共享，与 qmt_gateway 的 _Handler.gateway 同风格）。
+    # 两端都做首尾裁剪：Go 客户端同样 TrimSpace（internal/data/baostock.go），否则
+    # "配置里手滑多敲一个空格"就会变成永不归位的 401——正是 N2 要避免的那类静默失败。
+    # 绑到非回环地址却没配口令时显式告警——这正是审计点名的"防线只有 127.0.0.1"形态。
+    _Handler.token = str(args.token or "").strip()
+    if _Handler.token:
+        log.info("pydata 口令鉴权已启用（请求须带 %s 头）", TOKEN_HEADER)
+    elif args.host not in ("127.0.0.1", "::1", "localhost"):
+        log.warning("§N4：监听 %s 且未配 --token，任何可达该端口的进程都能匿名取全市场研究数据；"
+                    "请配 --token（或环境变量 QUANT_PYDATA_TOKEN）与 Go 侧口令保持一致", args.host)
 
     # 启动即登录（可用 BAOSTOCK_USER/BAOSTOCK_PASS 换账号），失败仅告警：请求时仍会再次报错
     # （English: log in at startup — credentials via env, else anonymous; failure only warns,

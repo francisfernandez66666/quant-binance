@@ -119,6 +119,9 @@ export default function Positions() {
   const [realFormStrategy, setRealFormStrategy] = useState('')
   // 实盘下单提交中标记（防重复提交）
   const [realSubmitting, setRealSubmitting] = useState(false)
+  // §AUDITFIX926-D1 价格偏离二次确认状态：后端 400+code=price_deviation 时置为
+  // { msg: 后端人话文案, body: 原请求体, sell: 是否卖出侧 }，null=无待确认。
+  const [deviationAsk, setDeviationAsk] = useState(null)
   // 实盘轮询定时器（进入实盘标签时启动）
   const realTimer = useRef(null)
   // §M-10（2026-09-22 PM 批清扫）轮询请求代号守卫：纸面 load 与实盘 loadReal 各自独立代号，
@@ -549,24 +552,39 @@ export default function Positions() {
       MessagePlugin.warning('卖出必须整手（100 的倍数）；如需清仓请用清仓动作')
       return
     }
+    // 构造实盘下单请求参数并走统一提交核（含价格偏离二次确认分流）
+    await runRealSubmit({
+      code: a.pos.ts_code,
+      side: sell ? '卖出' : '买入',
+      action: realActionLabel(a.dir),
+      qty,
+      price,
+      strategy: realFormStrategy,
+      reason: 'manual:' + a.dir,
+    }, sell)
+  }
+  // §AUDITFIX926-D1 实盘提交核：下单被后端以「价格偏离现价超 ±15%」拒绝（400 + 机器码
+  // code=price_deviation）时，不再一句话 toast 了事——弹出二次确认框展示后端人话文案
+  // （含委托价/现价/偏离百分比），用户确认后带 confirm_deviation=true 原样重发。
+  // 兼容口径：旧后端不吐 code 字段 → 走原 toast 分支，行为与改造前逐字一致；
+  // 确认框打开期间执行弹窗保留在底层，取消确认即可回弹窗改价再提交。
+  async function runRealSubmit(body, sell) {
     setRealSubmitting(true)
-    // 构造实盘下单请求参数并提交
     try {
-      const res = await api.executeRealAction({
-        code: a.pos.ts_code,
-        side: sell ? '卖出' : '买入',
-        action: realActionLabel(a.dir),
-        qty,
-        price,
-        strategy: realFormStrategy,
-        reason: 'manual:' + a.dir,
-      })
-      MessagePlugin.success((sell ? '卖出' : '买入') + '委托已提交 ' + a.pos.ts_code + ' ' + qty + ' 股' + (res.order_id ? '（单号 ' + res.order_id + '）' : ''))
+      const res = await api.executeRealAction(body)
+      MessagePlugin.success((sell ? '卖出' : '买入') + '委托已提交 ' + body.code + ' ' + body.qty + ' 股' + (res.order_id ? '（单号 ' + res.order_id + '）' : ''))
       setRealAction(null)
+      setDeviationAsk(null)
       // 委托提交后 2s 刷新实盘持仓，等待网关回报
       setTimeout(loadReal, 2000)
-    } catch (e) { MessagePlugin.error('下单失败: ' + (e.message || '')) }
-    finally { setRealSubmitting(false) }
+    } catch (e) {
+      // 机器码分流：价格偏离 → 二次确认；其余错误维持原 toast 语义
+      if (e && e.code === 'price_deviation') {
+        setDeviationAsk({ msg: e.message || '委托价偏离现价超 ±15%，请核对价格后确认提交', body, sell })
+      } else {
+        MessagePlugin.error('下单失败: ' + (e.message || ''))
+      }
+    } finally { setRealSubmitting(false) }
   }
 
   // 展开/收起指定代码的分时图（维护已展开代码集合）
@@ -1026,6 +1044,18 @@ export default function Positions() {
             <div className="muted">预估金额：¥{(realFormQty * realFormPrice).toFixed(2)}</div>
           )}
         </Form>
+      </Dialog>
+
+      {/* §AUDITFIX926-D1 价格偏离二次确认弹窗：文案直接用后端返回（含委托价/现价/偏离%），
+          确认=带 confirm_deviation=true 原体重发；取消=关掉本框回到执行弹窗改价。 */}
+      <Dialog visible={!!deviationAsk} header="价格偏离确认" onClose={() => setDeviationAsk(null)}
+        onConfirm={async () => {
+          const d = deviationAsk
+          if (!d) return
+          await runRealSubmit({ ...d.body, confirm_deviation: true }, d.sell)
+        }}
+        confirmBtn={realSubmitting ? '提交中…' : '确认按此价提交'} cancelBtn="返回改价">
+        <div style={{ fontSize: 13, lineHeight: 1.6 }}>{deviationAsk?.msg}</div>
       </Dialog>
 
       {/* §F3 全局个股详情抽屉：代码点开，实时价 + 分时/盘口 + 该标的持仓 */}

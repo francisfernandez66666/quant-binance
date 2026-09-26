@@ -3,7 +3,15 @@
 # 研究子进程内存是否 <900M（不 OOM）、各步骤是否正常、是否产出候选。
 # 用法：bash scripts/verify_nightly.sh
 set -u
-HOST=root@43.108.86.140
+# §N7（2026-09-26 全量审计批）敏感信息出仓：
+#   缺陷原文：此处原为 `HOST=root@<公网服务器IP字面量>`，服务器地址随 git tracked 出仓。
+#   修法：真实地址移入 scripts/ops.env（入库模板 scripts/ops.env.example，本体已进 .gitignore），
+#   存在即 source；变量名统一 OPS_SSH_USER/OPS_SSH_HOST；调用方已导出 HOST 时仍以其为准（应急口）。
+ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
+if [ -f "$ROOT_DIR/scripts/ops.env" ]; then
+  . "$ROOT_DIR/scripts/ops.env"
+fi
+HOST="${HOST:-${OPS_SSH_USER:-root}@${OPS_SSH_HOST:?缺少服务器地址：请 cp scripts/ops.env.example scripts/ops.env 并填入 OPS_SSH_HOST（缺陷背景见 2026-09-26 审计 N7，IP 字面量不再入仓）}}"
 LOG=/tmp/nightly_verify.log
 echo "===== $(date '+%F %T') 收盘后夜间作业验证 =====" | tee "$LOG"
 

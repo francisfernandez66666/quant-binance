@@ -1053,7 +1053,18 @@ func (s *Scheduler) taskCommand(cfg config.SchedulerConfig, tk *store.ResearchTa
 		if v, ok := p["pyurl"].(string); ok && v != "" {
 			pyurl = v
 		}
-		return bin, []string{"--db", dbPath, "--pyurl", pyurl, "daily"}, nil
+		args := []string{"--db", dbPath, "--pyurl", pyurl}
+		// §N4（2026-09-26 全量审计）：pydata sidecar 的可选口令从这里下发给 dataload
+		// （dataload 是 sidecar 的唯一 Go 客户端）。取 config rules.data.pydata_token，
+		// 空串时**一个参数都不加**——子进程按"显式 > env QUANT_PYDATA_TOKEN > config"自行解析，
+		// 与现网匿名访问形态逐字节一致（默认零行为变化）。
+		// English: forwards the optional pydata shared secret to the dataload child; empty
+		// config value adds no flag at all, keeping today's anonymous behaviour byte-identical.
+		if tok := strings.TrimSpace(config.NewManager(s.cfgPath).Get().Data.PyDataToken); tok != "" {
+			args = append(args, "--pytoken", tok)
+		}
+		args = append(args, "daily")
+		return bin, args, nil
 	}
 	bin, err := s.resolveBin(cfg.ResearchBin)
 	if err != nil {

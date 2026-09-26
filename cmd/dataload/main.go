@@ -11,7 +11,8 @@
 //
 // flags：--db（默认 ~/.quant-trading-v2/trading.db）、--provider（baostock|tushare，默认
 // baostock）、--pyurl（baostock sidecar 地址，默认 http://127.0.0.1:8788，§AUDITFIX925-D6c）、--token
-// （仅 tushare 需要）、--start（YYYYMMDD，默认 20200101）、--end（YYYYMMDD，默认今天）、
+// （仅 tushare 需要）、--pytoken（§N4，仅 baostock sidecar 的可选口令，缺省空=匿名）、
+// --start（YYYYMMDD，默认 20200101）、--end（YYYYMMDD，默认今天）、
 // --codes <文件>（finance 的研究池：每行一个 ts_code，# 注释）、--fin-start/--fin-end（年份）。
 // 支持断点续传：行情表按最近交易日续拉，财务表按单票最近报告期续拉。
 // （dataload loads historical data into the research SQLite DB. Provider baostock is the
@@ -20,11 +21,13 @@
 package main
 
 import (
+	"encoding/json"
 	"flag"
 	"fmt"
 	"log"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"quant-trading-v2/internal/data"
@@ -53,6 +56,10 @@ func main() {
 	// 旧缺省值在忘配 pyurl 时会把行情请求打到隔壁应用（全仓默认值已同批统一为 8788）。
 	pyurl := flag.String("pyurl", "http://127.0.0.1:8788", "baostock sidecar 地址")
 	token := flag.String("token", "", "Tushare Pro token（仅 tushare 需要）")
+	// §N4（2026-09-26 全量审计）：pydata sidecar 的**可选**共享口令（请求头 X-Pydata-Token）。
+	// 名字刻意与 --token 分开——--token 是 Tushare 专用，审计报告 N4 原文就点名
+	// 「dataload --token 是 Tushare 专用易误读」。缺省空 = 不发头 = 与现网匿名访问逐字节等价。
+	pytoken := flag.String("pytoken", "", "pydata sidecar 口令（可选；显式 > env QUANT_PYDATA_TOKEN > config rules.data.pydata_token）")
 	start := flag.String("start", "20200101", "起始日期 YYYYMMDD")
 	end := flag.String("end", time.Now().Format("20060102"), "结束日期 YYYYMMDD")
 	codesFile := flag.String("codes", "", "finance 研究池文件（每行一个 ts_code）")
@@ -84,7 +91,7 @@ func main() {
 		log.Printf("[dataload] 数据源路由按默认装配（旧表 baostock），继续运行: %v", err)
 	}
 
-	bsClient := data.NewBaostockClient(*pyurl)
+	bsClient := data.NewBaostockClient(*pyurl, resolvePyDataToken(*pytoken))
 
 	// 子命令分发：每个子命令都按 --provider 二选一（tushare 直连 / baostock 经 Python 网关），
 	// 两条实现落库口径一致，切换数据源不改变下游语义。
@@ -426,4 +433,48 @@ func nextDay(yyyymmdd string) string {
 		return yyyymmdd
 	}
 	return t.AddDate(0, 0, 1).Format("20060102")
+}
+
+// resolvePyDataToken 定出 pydata sidecar 口令，优先级：显式 --pytoken > 环境变量
+// QUANT_PYDATA_TOKEN > 配置文件 rules.data.pydata_token（§N4，2026-09-26 全量审计）。
+//
+// 缺陷原文：cmd/pydata/server.py 全文零鉴权，防线只有「绑 127.0.0.1」；sidecar 现已支持
+// 可选共享口令，客户端必须能把口令取到并随请求带上。
+// 为何这样修：三级来源链各对一种运维形态——一次性调试（旗标）、临时换口令（env）、
+// 研究服务常驻（config，由 scheduler 下发 --pytoken）。全部缺省时返回空串，
+// data.BaostockClient 便一个头都不发，与现网匿名访问逐字节等价（默认零行为变化）。
+// env 排在配置文件之前，与仓内既有惯例一致：QUANT_DATA_DIR / TUSHARE_TOKEN 都是 env 现场
+// 覆盖配置文件（internal/data/source.go、internal/scheduler/scheduler.go），
+// 且本 config 包自身不读环境变量，env 读取只能落在消费点。
+// English: explicit flag > env QUANT_PYDATA_TOKEN > config rules.data.pydata_token;
+// an empty result sends no header at all, i.e. today's anonymous behaviour verbatim.
+func resolvePyDataToken(explicit string) string {
+	if v := strings.TrimSpace(explicit); v != "" {
+		return v
+	}
+	if v := strings.TrimSpace(os.Getenv(data.PyDataTokenEnv)); v != "" {
+		return v
+	}
+	return pyDataTokenFromConfig(store.DefaultConfigPath())
+}
+
+// pyDataTokenFromConfig 从 config.json 的 rules.data.pydata_token 读口令。
+// 文件缺失/无该键/解析失败一律返回空串（匿名）——研究装载绝不因配置读取失败而中断。
+// （pyDataTokenFromConfig reads rules.data.pydata_token, defaulting to anonymous on any error.）
+func pyDataTokenFromConfig(path string) string {
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return ""
+	}
+	var wrapper struct {
+		Rules struct {
+			Data struct {
+				PyDataToken string `json:"pydata_token"` // 与 internal/config.DataConfig 同键
+			} `json:"data"`
+		} `json:"rules"`
+	}
+	if json.Unmarshal(raw, &wrapper) != nil {
+		return ""
+	}
+	return strings.TrimSpace(wrapper.Rules.Data.PyDataToken)
 }

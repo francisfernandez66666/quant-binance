@@ -47,8 +47,14 @@ exception guard; broker chosen by config (xt/mock); reports pushed via outbox th
 安全加固（本文件）相关环境变量与运维须知（中文）：
   - QUANT_GATEWAY_TOKEN       网关鉴权 token。优先从此环境变量读取，未设置才回退 config 明文。
   - QUANT_GATEWAY_REPORT_TOKEN 推送首尔 /api/qmt/report 的 token，可选；缺省同 QUANT_GATEWAY_TOKEN。
+                              §N2（2026-09-26）：该值**只允许等于 token 或不配**。首尔侧按唯一口令
+                              （rules.qmt.token）常量时间比对归因账号，配成第二个值会导致全部回报 401
+                              进 outbox 死信，故网关启动时直接拒启（exit 2）并打印中文说明。
   - ALLOWED_IPS               逗号分隔的允许来源 IP（如决策机出口 IP）。非空时，/order、/cancel、
                               /state 等敏感端点会校验来源 IP，不在白名单返回 403。
+                              §N3（2026-09-26）：/health 只对回环与本白名单放行——远程决策机靠 /health
+                              驱动熔断，白名单漏配 = 探测全 403 = 引擎误熔。监听非回环而 ALLOWED_IPS 为空
+                              时启动打印中文 WARNING 指路。
   - QUANT_GATEWAY_TLS_CERT / QUANT_GATEWAY_TLS_KEY  两者均设置则启动 HTTPS，否则启动 HTTP。
   - QUANT_GATEWAY_BIND        显式指定对外监听地址（如 0.0.0.0:8789）。未设置且配置为 0.0.0.0 时，
                               自动收敛为 127.0.0.1 仅本机可访问。/health 仅允许本机回环访问。
@@ -94,7 +100,7 @@ DEFAULT_CONFIG = {
     "account": "MOCK0001",
     "db": "data.db",
     "user_id": "",             # 回报归属账号 ID（首尔侧 /api/qmt/report 归因用，建议显式配置）
-    "report_url": "",          # 首尔服务器地址（如 http://43.108.86.140:8080），留空不推送
+    "report_url": "",          # 回报推送地址（形如 http://<引擎主机>:8080，地址不入仓，§N7），留空不推送
     "report_token": "",        # 推送 /api/qmt/report 的 token（默认同 token）
     "reconcile_sec": 60,       # 周期全量对账间隔（0=关闭）
     "seed": [],                # mock 预置持仓：[{"ts_code","name","qty","cost_price"}]
@@ -185,6 +191,84 @@ def load_config(path):
     elif not cfg.get("report_token"):
         cfg["report_token"] = cfg.get("token", "")
     return cfg
+
+
+# §N2（2026-09-26 全量审计，docs/AUDIT_FULL_UAT_20260926.md §三 N2）回报口令双源收口。
+#
+# 缺陷原文：Go 侧 /api/qmt/report 的账号归因只比对 rules.qmt.token
+#   （internal/server/qmt.go:145-156，subtle.ConstantTimeCompare 常量时间），而网关这边
+#   cfg["report_token"] 可被 QUANT_GATEWAY_REPORT_TOKEN 独立设置（本文件 load_config），
+#   handler.py 又拿它去推送（ReportHandler.report_token → post_report 的 Authorization 头）。
+#   于是运维只要按本文件顶部环境变量文档"照说明"配了一个与 token 不等值的回报口令，
+#   首尔侧就认不出这个 token → 全部回报 401 → 进 outbox 死信，且整条链路**静默**
+#   （网关日志只有 401、引擎侧完全不知道回报丢了）。审计实核：全仓 Go 无 report_token 字段。
+#
+# 为何这样修：owner 裁决「冻结面照修」，接口契约的权威源是 Go 侧唯一的 rules.qmt.token，
+#   网关不得自带第二份口令。这里在**启动装配处 fail-fast**：report_token 非空且与 token 不等
+#   → 打明确中文错误并 sys.exit(2)，绝不带着"必然 401 的配置"裸奔。
+#   等值（显式配成同一个串）与缺省（回退 token）两种形态行为逐字节不变——
+#   本次修复不删 report_token 配置项（保持向后兼容），只禁止它配成"另一个值"。
+#   错误文本刻意不回显口令内容（日志会落盘/进采集，口令值绝不能出现在里面）。
+def report_token_conflicts(cfg):
+    """校验回报口令与鉴权口令是否同源，返回中文错误说明列表（空列表 = 通过，可启动）。
+
+    :param cfg: load_config 合并后的配置字典。
+    :return: list[str]，每项一条可直接打印的错误说明。
+    English: returns human-readable Chinese errors when cfg["report_token"] differs from
+    cfg["token"] — the Seoul side attributes /api/qmt/report by the single rules.qmt.token,
+    so a different report token means every report gets 401 and silently dies in the outbox.
+    """
+    token = str(cfg.get("token") or "")
+    report_token = str(cfg.get("report_token") or "")
+    if not report_token:
+        # 未配置回报口令：handler 推送不带 Authorization，等价于"网关本就未接首尔"的场景，
+        # 不属于本缺陷（本缺陷专指"配了第二个口令"），放行。
+        return []
+    if report_token == token:
+        return []
+    return [
+        "回报口令（report_token / 环境变量 QUANT_GATEWAY_REPORT_TOKEN）与网关鉴权口令"
+        "（token / QUANT_GATEWAY_TOKEN）不一致。",
+        "首尔侧 /api/qmt/report 只按**唯一**口令 rules.qmt.token 常量时间比对来归因账号，"
+        "网关侧不存在第二个合法口令：这样配下去每一条回报都会被判 401，"
+        "回报堆进 outbox 直到死信，整条成交/委托回报链路静默失联（历史上正是这个形态）。",
+        "修法（二选一）：① 删掉 QUANT_GATEWAY_REPORT_TOKEN 与配置里的 report_token，"
+        "让 load_config 自动回退成 token；② 把它配成与 token 完全相同的字符串。",
+    ]
+
+
+# §N3（2026-09-26 全量审计 §三 N3）/health 白名单静默误熔。
+#
+# 缺陷原文：/health 只放行本机回环或 ALLOWED_IPS 白名单（本文件 _ip_allowed，
+#   约 :1457-1462），而远程决策机引擎正是拿 /health 驱动熔断状态机
+#   （internal/trading/controller.go HealthCheck → QMTClient.Health）。
+#   部署时忘配 ALLOWED_IPS = 引擎每次探测都吃 403 = 计为探测失败 = 连续失联后**误熔**，
+#   而网关日志里只有一句"rejected ... non-allowed IP"，没人把它和"配置漏项"联系起来。
+#
+# 为何这样修：这是纯配置缺失、不是代码错误，拒启会把"本机自用（回环）"的正常部署也打死，
+#   所以按 owner「照修」口径做**启动期显式告警**：listen 绑到非回环地址、白名单却为空时，
+#   打一条把因果说清楚、并指路如何配置的中文 WARNING。
+#   等白名单配齐/纯回环部署时零新增日志，判定逻辑（_ip_allowed）一字未改。
+def health_whitelist_warnings(listen, allowed_ips):
+    """返回 /health 白名单缺失的中文告警列表（空列表 = 无需告警）。
+
+    :param listen: 实际监听串，形如 "0.0.0.0:8789" / "127.0.0.1:8789"。
+    :param allowed_ips: 已解析的来源 IP 白名单列表。
+    """
+    if allowed_ips:
+        return []  # 白名单已配置：远程决策机可放行，无需告警
+    host = str(listen or "").partition(":")[0].strip()
+    if host in ("", "127.0.0.1", "::1", "localhost"):
+        return []  # 纯回环监听：/health 天然对本机开放，远程引擎本就不该直连
+    return [
+        "[gateway] 未设置 ALLOWED_IPS，而 /health 只对回环与白名单放行（现监听 %s）："
+        "远程决策机/引擎的 /health 探测将全部收到 403。"
+        "引擎把 403 计为探测失败，连续失联会触发**误熔**（暂停下单），"
+        "看起来像「网关死了」，实际是白名单漏配。" % host,
+        "[gateway] 如确有远程引擎探测：请把引擎出口 IP 加入环境变量 ALLOWED_IPS"
+        "（逗号分隔，如 ALLOWED_IPS=1.2.3.4），重启网关后即恢复；"
+        "仅本机自用可忽略本告警。",
+    ]
 
 
 def _code_head(code):
@@ -1595,6 +1679,18 @@ def main(argv=None):
     if args.listen:
         cfg["listen"] = args.listen
 
+    # §N2（2026-09-26 全量审计）回报口令双源 fail-fast 闸：装配后立即校验，绝不带着
+    # "必然 401" 的配置起服务（错误说明见 report_token_conflicts 的 §N2 注释）。
+    # 这里不打印口令内容本身，只打印处置办法；退出码 2 与 watchdog 的其它失败区分。
+    _rt_errors = report_token_conflicts(cfg)
+    if _rt_errors:
+        print("[gateway] 启动被拒（回报口令双源，N2）：", file=sys.stderr)
+        for _line in _rt_errors:
+            print("[gateway]   - " + _line, file=sys.stderr)
+        log.error("[gateway] 启动被拒：report_token 与 token 不一致，"
+                  "首尔侧按唯一口令归因账号，双口令必然全量 401（详见 stderr 说明）")
+        sys.exit(2)
+
     # —— 绑定地址收敛（防误暴露到 0.0.0.0）——
     # 仅当显式指定 --listen 或 QUANT_GATEWAY_BIND 时才允许对外绑定；
     # 否则若配置监听 0.0.0.0，自动收敛到 127.0.0.1 仅本机可访问。
@@ -1617,6 +1713,12 @@ def main(argv=None):
         log.info("[gateway] IP 白名单已启用，允许来源：%s", ", ".join(allowed_ips))
     else:
         log.warning("[gateway] 未设置 ALLOWED_IPS，敏感端点仅依赖 token 防护（建议配置决策机出口 IP）")
+
+    # §N3（2026-09-26 全量审计）：白名单为空 + 监听非回环 = 远程引擎的 /health 探测必吃 403，
+    # 而 403 在引擎侧被计为探测失败、连续失败即误熔。这里把因果与处置办法在启动时说清楚
+    # （判定逻辑 _ip_allowed 未改，仅新增告警；纯回环部署与已配白名单部署零新日志）。
+    for _line in health_whitelist_warnings(cfg["listen"], allowed_ips):
+        log.warning("%s", _line)
 
     gw = Gateway(cfg)
     gw.allowed_ips = allowed_ips  # 注入白名单，供 _Handler 校验

@@ -10,6 +10,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -88,7 +89,13 @@ func (c *QMTClient) do(ctx context.Context, method, path string, body any, out a
 		return err
 	}
 	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("gateway %s %s: HTTP %d: %s", method, path, resp.StatusCode, truncate(string(data), 200))
+		// §N3（2026-09-26 全量审计）：非 200 的错误改为带状态码的 gatewayHTTPError 载体，
+		// Error() 文本与旧实现**逐字节相同**（调用方/日志/告警文案零变化），
+		// 目的只是让 Health 链路能把「网关 403（白名单漏配）」和「网络失败/网关真死」分开说清楚。
+		return &gatewayHTTPError{
+			status: resp.StatusCode,
+			msg:    fmt.Sprintf("gateway %s %s: HTTP %d: %s", method, path, resp.StatusCode, truncate(string(data), 200)),
+		}
 	}
 	if out != nil {
 		if err := json.Unmarshal(data, out); err != nil {
@@ -97,6 +104,26 @@ func (c *QMTClient) do(ctx context.Context, method, path string, body any, out a
 	}
 	return nil
 }
+
+// gatewayHTTPError 网关返回非 200 时的错误载体（§N3）。
+// 缺陷原文：网关 /health 只对回环与 ALLOWED_IPS 白名单放行（qmt_gateway/gateway.py 的
+// _ip_allowed），远程决策机忘配白名单时每次探测都吃 403；旧实现把 403 与"连不上/超时"
+// 混成同一句 "gateway GET /health: HTTP 403: ..."，运维看到的是"网关探测失败→熔断"，
+// 真实原因（本机出口 IP 不在网关白名单）被埋没，排查方向整个错掉。
+// 为何这样修：只加"状态码字段 + 分类读法"，不改任何判定语义——err 依旧非空，
+// controller.HealthCheck 仍按"探测失败"开窗计时熔断（宁可误熔不可漏熔）。
+// English: carries the HTTP status so the health path can name the 403 root cause
+// while keeping the failure semantics (non-nil error) exactly as before.
+type gatewayHTTPError struct {
+	status int    // HTTP 状态码
+	msg    string // 与旧实现逐字节一致的错误文本
+}
+
+// Error 返回与旧 fmt.Errorf 完全相同的文本（零文案漂移）。
+func (e *gatewayHTTPError) Error() string { return e.msg }
+
+// Status 返回网关响应的 HTTP 状态码。
+func (e *gatewayHTTPError) Status() int { return e.status }
 
 // truncate 截断超长文本（日志/错误展示用）。
 // （truncate clips long text for logs/errors.）
@@ -205,6 +232,10 @@ func (c *QMTClient) stateOnce() (*GatewayState, error) {
 // 丢包就计入熔断窗口/触发告警）。语义见 healthOnce 注释。
 // English: probes gateway health with a single automatic re-probe on error to absorb
 // transient cross-border jitter.
+// §N3（2026-09-26 全量审计）：返回的 error 文本对 403 追加了「疑似 ALLOWED_IPS 未包含
+// 本机出口 IP」的说明（见 describeHealthError）。**判定语义零变化**——403 仍是 err != nil、
+// 仍被 controller.HealthCheck 计为探测失败并驱动熔断开窗，只是告警文案不再把"白名单漏配"
+// 伪装成"网关失联"。
 func (c *QMTClient) Health() (bool, error) {
 	ok, err := c.healthOnce()
 	if err != nil {
@@ -225,9 +256,31 @@ func (c *QMTClient) healthOnce() (bool, error) {
 		TS              string `json:"ts"`
 	}
 	if err := c.do(ctx, http.MethodGet, "/health", nil, &out); err != nil {
-		return false, err
+		return false, describeHealthError(err)
 	}
 	return out.OK && out.BrokerConnected, nil
+}
+
+// describeHealthError 给 /health 探测失败的原因加一层人话（§N3，2026-09-26 全量审计）。
+//
+// 缺陷原文：网关 /health 只对回环与 ALLOWED_IPS 白名单放行，远程决策机忘配白名单时
+// 每条探测都返回 403；旧错误文本只说 "gateway GET /health: HTTP 403: health endpoint
+// is localhost-only"，而引擎的熔断状态机（controller.HealthCheck）把它与"网关真死/网络断"
+// 同口径计为探测失败并告警，运维看到"网关探测失败→熔断"就往死链方向查，配置漏项被埋掉。
+//
+// 为何这样修：**只补可读性、不动判定**——返回值仍是非 nil error（wrapped 原文，errors.As
+// 仍可取到 gatewayHTTPError 与状态码），Health 的 (false, err) 语义、重探一次的行为、
+// 熔断开窗/计时全部逐字节不变；403 与网络失败在告警文本里从此可区分。
+// English: annotates a 403 with the likely ALLOWED_IPS misconfiguration while preserving
+// the original error (wrapping, not replacing) so breaker semantics stay identical.
+func describeHealthError(err error) error {
+	var he *gatewayHTTPError
+	if errors.As(err, &he) && he.status == http.StatusForbidden {
+		return fmt.Errorf("%w（网关 403：疑似 ALLOWED_IPS 未包含本机出口 IP。"+
+			"网关 /health 只对回环与白名单放行，此状态会被计为探测失败并可能触发误熔；"+
+			"请在网关侧 ALLOWED_IPS 逗号清单里加入本决策机出口 IP，或改由本机回环探测）", err)
+	}
+	return err
 }
 
 // GatewayBrokerStatus 网关双路径状态（§QMT-DUAL）：active 通道 + xt/queued 各自在线态。

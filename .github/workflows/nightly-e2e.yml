@@ -5,6 +5,19 @@
 # 初始化 admin/tester 账号、装配 QMT 配置、seed 情绪日线，再全量跑 spec。
 # English: nightly full-stack e2e — builds mock+engine+frontend, seeds accounts/config/sentiment,
 # then runs the Playwright suite that previously only existed as a manual drill.
+#
+# §N1（2026-09-26 全量审计批，docs/AUDIT_FULL_UAT_20260926.md）CI 单源化改造：
+#   缺陷原文：本 job 曾内联复制「build 二进制→起 mock→起引擎→seed→起 vite→跑 playwright」
+#     全套步骤，与 scripts/uat_bootstrap.sh 已实际分叉——① 裸 go build 无 buildCommit 注入，
+#     nightly 栈的 A7 版本面恒测 unknown 指纹、与线上口径脱节；② 无 quote_source golden 注入
+#     （§3.1-1 盘内形态在 nightly 里从不被触发）；③ seed 面（配额/持仓/auth.json admin id 读取）
+#     一处改动两处不同步。
+#   修法：整栈改为调用 ./scripts/uat_bootstrap.sh run（单一事实源，脚本头注 §FIX-5 写明
+#     提取它的初衷就是 CI 与本地共用同一套口径）。本 job 只保留「工具链准备 → 显式装前端
+#     依赖与 Playwright 内核 → 脚本驱动全栈 → 失败上传脚本落盘日志（.uat-data/*.log）→
+#     if: always() 收尾 stop」。账号/token/端口/数据目录等 env 与脚本默认值逐一核对全同
+#     （admin/tester、uat-secret、18080/5173/18789、$ROOT/.uat-data），冗余项全部删除，
+#     仅保留静态锁要求的 E2E_MOCK_URL（值即脚本默认端口拼法）。
 name: nightly-e2e
 
 on:
@@ -14,26 +27,22 @@ on:
   workflow_dispatch:
 
 jobs:
-  # 唯一 job：拉起"qmt-mock 柜台 + quant 引擎 + vite 前端"三件套后跑 Playwright 全量 spec。
+  # 唯一 job：交由 scripts/uat_bootstrap.sh 拉起"qmt-mock 柜台 + quant 引擎 + vite 前端"
+  # 三件套并跑 Playwright 全量 spec（§N1 单源化，口径详见文件头注释）。
   # 40 分钟超时兜底：Playwright 卡死/等待期重试风暴时不至于烧满 runner 计费时长。
   e2e:
     runs-on: ubuntu-latest
     timeout-minutes: 40
-    # 全栈环境变量：数据目录隔离（独立于默认路径，避免污染 runner 缓存）、
-    # e2e 专用 admin/tester 双账号、QMT token 与 mock 网关对齐。
+    # §N1：E2E_USER/E2E_PASS/E2E_USER2/E2E_PASS2/QMT_TOKEN/QUANT_DATA_DIR/BACKEND 与
+    # uat_bootstrap.sh 内默认值逐一等值，原样保留只会造成"两处定义一处生效"的新漂移面，
+    # 故全部删除、以脚本为单一事实源；run 模式下脚本自行向 playwright 导出全套 E2E_*。
     env:
-      QUANT_DATA_DIR: ${{ github.workspace }}/.uat-data
-      BACKEND: http://127.0.0.1:18080
-      E2E_USER: admin
-      E2E_PASS: Nightly!2026
-      E2E_USER2: tester
-      E2E_PASS2: Tester!2026
-      QMT_TOKEN: uat-secret
       # §UAT-PORTS（抄母仓 cf3be1f）：显式声明 mock 地址 ⇒ spec 里的「连不上 mock 就 skip」在本 job
       # 升级为判红。CI 本来就要求"零 skip"（FIX-8 黄牌），让外部部署才需要的软跳过在这里失效。
+      # 该键同时供人工步进 runner 手工跑 spec 时使用；自动化路径由脚本 run 模式导出（同值同口径）。
       E2E_MOCK_URL: http://127.0.0.1:18789
     steps:
-      # 检出代码（Playwright spec 与后端二进制同仓构建）
+      # 检出代码（Playwright spec 与后端二进制同仓构建；uat_bootstrap.sh 亦以检出目录为仓库根）
       - uses: actions/checkout@v4
 
       # Go 工具链按 go.mod 声明的版本安装，避免与本地开发环境漂移
@@ -50,192 +59,47 @@ jobs:
           cache: npm
           cache-dependency-path: web/package-lock.json
 
-      # Python 3.11 仅用于后续 seed 情绪日线（sqlite3 标准库直插 DB）
+      # Python 3.11 供 uat_bootstrap.sh 的 seed 段使用（golden 解析 + sqlite 直插情绪日线/报告，
+      # auth.json 的 admin id 读取亦在脚本内完成）
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
-      # 编译 quant 引擎与 qmt-mock 假柜台二进制；数据目录随容器预建
-      # §CN-MASTER（2026-09-23）：与 scripts/uat_bootstrap.sh 步 1c 同口径写最小 config.json——
-      # CN 总开关出厂缺省 false 且 boot 冻结，全新数据目录不显式开启则五条 A股腿整栈跳过，
-      # 存量用例（情绪/信号/撮合实时生效等）全以「A股链在跑」为前提必红；关态语义由 Go/vitest 锁承担。
-      - name: Build binaries
-        run: |
-          mkdir -p "$RUNNER_TEMP/bin" "$QUANT_DATA_DIR"
-          printf '{"rules":{"cn":{"enabled":true}}}\n' > "$QUANT_DATA_DIR/config.json"
-          go build -o "$RUNNER_TEMP/bin/quant" ./cmd/quant
-          go build -o "$RUNNER_TEMP/bin/qmt-mock" ./cmd/qmt-mock
-
-      # 先起 mock 柜台（:18789）：预置茅台持仓行情 + 1.5s 回报延迟模拟真实柜台节奏；
-      # 轮询 /health 最多 30s，起不来后续步骤会自然失败。
-      - name: Start qmt-mock
-        run: |
-          "$RUNNER_TEMP/bin/qmt-mock" -listen :18789 -token "$QMT_TOKEN" \
-            -server http://127.0.0.1:18080 -delay 1.5s \
-            -seed "600519.SH,贵州茅台,200,1500.00" \
-            > mock.log 2>&1 &
-          for i in $(seq 1 30); do
-            curl -fsS http://127.0.0.1:18789/health >/dev/null 2>&1 && break
-            sleep 1
-          done
-
-      # 起 quant 引擎（:18080）并等 /setup 就绪（200 已初始化 / 405 未初始化均算服务可达）；
-      # 失败时 cat 日志留证，便于在 CI 界面直接看启动期报错。
-      - name: Start engine
-        run: |
-          QUANT_ADDR=:18080 "$RUNNER_TEMP/bin/quant" > engine.log 2>&1 &
-          echo $! > engine.pid
-          for i in $(seq 1 60); do
-            curl -s -o /dev/null -w '%{http_code}' "$BACKEND/setup" | grep -qE '200|405' && break
-            sleep 1
-          done
-          cat engine.log
-
-      - name: Seed accounts + QMT config
-        run: |
-          TOKEN=$(curl -fsS -X POST "$BACKEND/setup" -H 'Content-Type: application/json' \
-            -d "{\"username\":\"$E2E_USER\",\"password\":\"$E2E_PASS\"}" | jq -r .token)
-          echo "ADMIN_TOKEN=$TOKEN" >> "$GITHUB_ENV"
-          curl -fsS -X POST "$BACKEND/api/admin/users" -H "Authorization: Bearer $TOKEN" \
-            -H 'Content-Type: application/json' \
-            -d "{\"username\":\"$E2E_USER2\",\"password\":\"$E2E_PASS2\",\"role\":\"user\"}"
-          # §T-3（20260917 缺陷修复批）：§MT 租户级频控默认 600 次/分钟与全套 Playwright 突发
-          # 互踩（实测第 600 请求准时 429，失败集合随顺序漂移，CI 靠 retries 掩盖迟早漂绿）。
-          # 仅 nightly 的 UAT 栈上调配额；生产默认 600 不动。
-          curl -fsS -X PUT "$BACKEND/api/tenants/t_default" -H "Authorization: Bearer $TOKEN" \
-            -H 'Content-Type: application/json' \
-            -d '{"quota":{"api_rate_per_min":100000}}'
-          # QMT 网关装配：手动模式 + mock 地址（休市时段部分参数重启后才装配生效，下一步统一重启）
-          curl -fsS -X POST "$BACKEND/api/config/qmt" -H "Authorization: Bearer $TOKEN" \
-            -H 'Content-Type: application/json' -d '{
-              "enabled": true, "mode": "manual",
-              "gateway_url": "http://127.0.0.1:18789", "token": "uat-secret",
-              "price_type": "limit", "max_positions": 5, "fixed_amount": 20000,
-              "initial_capital": 500000, "daily_max_buys": 3,
-              "daily_budget_amount": 100000, "max_order_amount": 50000,
-              "miss_heartbeat_sec": 120,
-              "sell_unified_mode": "shadow"
-            }'
-
-      - name: Seed market_risk_daily（情绪回看用例依赖）
-        # 休市时段引擎不会自行落情绪行情 → 用 sqlite 直插今昨两天记录：
-        # 昨日"偏冷/yellow"、今日"中性/green"，供 e2e 的情绪回看/风险档用例断言。
-        run: |
-          python - <<'PY'
-          import os, sqlite3
-          db = sqlite3.connect(os.path.join(os.environ["QUANT_DATA_DIR"], "trading.db"))
-          from datetime import date, timedelta
-          d0 = date.today().strftime("%Y%m%d")
-          d1 = (date.today() - timedelta(days=1)).strftime("%Y%m%d")
-          for d, emo, tier in ((d1, "偏冷", "yellow"), (d0, "中性", "green")):
-              db.execute(
-                  "INSERT OR REPLACE INTO market_risk_daily(trade_date,emotion,market_state,risk_tier,reasons,up_ratio,break_rate,max_pos_pct,limit_up_count,ladder_height) "
-                  "VALUES (?,?,?,?,?,?,?,?,?,?)",
-                  (d, emo, "震荡", tier, "nightly seed", 0.55, 0.12, 0.6, 30, 4))
-          db.commit()
-          print("seeded rows:", db.execute("SELECT COUNT(*) FROM market_risk_daily").fetchone()[0])
-          # §D-1（GAP_VERIFY_20260917_PM）夜研报告 seed：paper_research_reports 一条最小报告
-          # （D-1 e2e 用例断言"弹窗打开+日期条渲染"，正文形状与 researchd 产出一致）。
-          # §FIX-20260918（UAT_FULLCHAIN_VERIFY P1-CI1）：auth 已迁 auth.json（internal/auth/auth.go:232），
-          # trading.db 不再有 users 表——旧 SQL "SELECT id FROM users" 在本机复刻时实测
-          # sqlite3.OperationalError: no such table: users，夜检 CI 必红。改从 auth.json 取 admin id。
-          # English: users now live in auth.json, not trading.db — read the admin id from there.
-          import json as _json
-          auth = _json.load(open(os.path.join(os.environ["QUANT_DATA_DIR"], "auth.json")))
-          admin_id = next(u["id"] for u in auth["users"] if u.get("role") == "admin")
-          rep = {"generated_at": d0, "trades": [{"strategy_type": "dragon", "side": "buy", "count": 2,
-                 "total_amount": 40000.0, "avg_price": 10.5, "avg_slippage": 0.12, "avg_latency": 2.0}],
-                 "daily": [], "attribution": [], "emotion": {"days": 2, "last_phase": "中性", "phase_days": {}}}
-          # 读端 GET /api/research/paper-reports 走 researchDB=trading.db（server.go:147/455 实证）
-          db.execute("INSERT OR REPLACE INTO paper_research_reports(date,user_id,summary_json,created_at) VALUES (?,?,?,datetime('now'))",
-                     ("2026-09-17", admin_id, _json.dumps(rep)))
-          db.commit()
-          print("seeded reports:", db.execute("SELECT COUNT(*) FROM paper_research_reports").fetchone()[0])
-          PY
-
-      # §FIX-8(20260919) 模拟盘持仓 seed：nightly 此前从不建仓 → uat_full 的手动卖出分支永远 skip，
-      # P0 手/股错位正是在这条"永远绿"的缝里隐形的。开总开关 + 两笔手动买入（qty=股数契约，§FIX-1），
-      # 当日 filled_at 的 T+1 问题由下一步"隔日改写"解决。runner 一次性，跑完无需 reset。
-      - name: Seed paper positions
-        run: |
-          curl -fsS -X POST "$BACKEND/api/paper/config" -H "Authorization: Bearer $ADMIN_TOKEN" \
-            -H 'Content-Type: application/json' -d '{"enabled": true, "auto_sell": false}'
-          for p in '600000.SH|浦发银行|10|500' '000001.SZ|平安银行|12|200'; do
-            IFS='|' read -r code name price qty <<< "$p"
-            curl -fsS -X POST "$BACKEND/api/paper/buy" -H "Authorization: Bearer $ADMIN_TOKEN" \
-              -H 'Content-Type: application/json' \
-              -d "{\"code\":\"$code\",\"name\":\"$name\",\"strategy\":\"手动\",\"price\":$price,\"qty\":$qty}"
-          done
-          curl -fsS "$BACKEND/api/paper/positions" -H "Authorization: Bearer $ADMIN_TOKEN" \
-            | jq -e 'length == 2'
-
-      - name: Restart engine（QMT 配置装配生效）
-        # kill 旧进程后带新数据目录重启：休市时段写入的 QMT 配置/lower 配额随重启装配；
-        # 用带 admin token 的 /api/health 探活，比首启的 /setup 更严格。
-        # §FIX-8：停机窗口内把 paper.json 持仓 filled_at 隔日改写（北京时区 -2 天），
-        # 引擎重启 load() 后即"昨日建仓"——卖出分支不再被 T+1 拦截（只动 CI 临时账本）。
-        run: |
-          kill "$(cat engine.pid)" 2>/dev/null || true
-          sleep 2
-          python - <<'PY'
-          import glob, json, os
-          from datetime import datetime, timedelta, timezone
-          # 账本按账号落盘（$QUANT_DATA_DIR/accounts/<uid>/paper.json），逐文件改写持仓 filled_at
-          files = glob.glob(os.path.join(os.environ["QUANT_DATA_DIR"], "accounts", "*", "paper.json"))
-          old = (datetime.now(timezone(timedelta(hours=8))) - timedelta(days=2)).isoformat()
-          n = 0
-          for path in files:
-              st = json.load(open(path))
-              positions = st.get("positions") or {}
-              for p in positions.values():
-                  p["filled_at"] = old
-                  n += 1
-              if positions:
-                  json.dump(st, open(path, "w"))
-          print("backdated positions:", n, "files:", len(files))
-          PY
-          QUANT_ADDR=:18080 "$RUNNER_TEMP/bin/quant" > engine2.log 2>&1 &
-          echo $! > engine.pid
-          for i in $(seq 1 60); do
-            curl -s -o /dev/null -w '%{http_code}' "$BACKEND/api/health" -H "Authorization: Bearer $ADMIN_TOKEN" | grep -q 200 && break
-            sleep 1
-          done
-
       - name: Install web deps + Playwright browser
         working-directory: web
-        # npm ci 严格按 lockfile 安装；--with-deps 顺带装 chromium 系统依赖（Ubuntu 缺库会白屏）
+        # §N1 保留显式安装：uat_bootstrap.sh 仅在 node_modules 缺失时才 npm ci（本地友好），
+        # CI 上显式装更快也更清晰；Playwright chromium 内核及系统依赖脚本不负责装，必须在此装好，
+        # 否则 run 模式的 `npx playwright test` 会当场判红。
         run: |
           npm ci
           npx playwright install --with-deps chromium
 
-      - name: Start frontend (vite dev)
-        # 用 vite dev 而非 build+preview：与 UAT 实录口径一致且省构建时间；
-        # VITE_BACKEND_PORT 指向 :18080 引擎；--strictPort 保证探活端口即真实服务端口。
-        run: |
-          cd web
-          VITE_BACKEND_PORT=18080 npx vite --port 5173 --strictPort > ../vite.log 2>&1 &
-          echo $! > ../vite.pid
-          for i in $(seq 1 60); do
-            curl -fsS http://127.0.0.1:5173 >/dev/null 2>&1 && break
-            sleep 1
-          done
-
-      # 全量跑 web/e2e Playwright spec（配置内自带 retries/trace，失败可上传回放）
-      # §FIX-8：skip 视为黄牌——本 job 已有 paper 持仓 seed，卖出分支再 skip 即 seed 覆盖退化信号，
-      # 在 CI 界面显式告警而不是无声放过（历史教训：手/股 P0 就藏在"永远 skip"的分支里）。
-      - name: Playwright 全量 e2e
-        working-directory: web
+      # §N1 核心步：全栈启动/seed/跑测一体化交给单一事实源脚本。
+      # 脚本内部完成（口径与本地 UAT 逐字相同）：
+      #   ① go build 注入 -X main.buildCommit（§F6，A7 版本面从此测真实指纹）；
+      #   ② quote_source golden 注入 + 盘内快照落盘（§3.1-1）；
+      #   ③ config.json rules.cn.enabled=true（§CN-MASTER）；
+      #   ④ 起 mock(:18789)/引擎(:18080)、seed 账号+租户配额上调+QMT 装配+情绪日线+模拟盘持仓
+      #      （含 auth.json 取 admin id、paper.json filled_at 隔日改写绕 T+1）；
+      #   ⑤ 起 vite dev(:5173, --strictPort，runner 一次性环境无端口冲突残留)；
+      #   ⑥ 导出 E2E_BASE_URL/E2E_API/E2E_MOCK_URL/E2E_QUOTE_SOURCE 等跑 Playwright 全量 spec。
+      # run.log 落在工作区根而非 .uat-data/：脚本启动即 rm -rf 数据目录，tee 早开的句柄会
+      # 写到被删除的 inode 上、产物上传取不到（真机口径差异点，故刻意放外面）。
+      # §FIX-8 skip 黄牌保留：存在 skipped 用例即显式告警，不无声放过。
+      - name: Run full-stack UAT (scripts/uat_bootstrap.sh run)
         run: |
           set +e
-          npx playwright test 2>&1 | tee pw.log
+          ./scripts/uat_bootstrap.sh run 2>&1 | tee run.log
           status=${PIPESTATUS[0]}
-          if grep -qE '[0-9]+ skipped' pw.log; then
+          if grep -qE '[0-9]+ skipped' run.log; then
             echo "::warning title=FIX-8-skip-yellow-card::存在 skipped 用例——seed 覆盖可能退化，请核对（历史假绿源：卖出分支常年 skip）"
           fi
           exit $status
 
-      # 仅失败时上传：Playwright 报告/trace + 三件套全量日志，供夜间失败次日取证回放
+      # 仅失败时上传：Playwright 报告/trace + 脚本落盘的栈日志（.uat-data/{engine,engine2,mock,vite}.log，
+      # §N1：日志路径随启动方式一并收敛到脚本数据目录，不再散在工作区根）+ run 全输出 + quote_source.txt。
+      # 供夜间失败次日取证回放。
       - name: Upload report artifacts（失败时取证）
         if: failure()
         uses: actions/upload-artifact@v4
@@ -244,8 +108,17 @@ jobs:
           path: |
             web/playwright-report/
             web/test-results/
-            mock.log
-            engine.log
-            engine2.log
-            vite.log
+            run.log
+            .uat-data/engine.log
+            .uat-data/engine2.log
+            .uat-data/mock.log
+            .uat-data/vite.log
+            .uat-data/quote_source.txt
           if-no-files-found: ignore
+
+      # 收尾停栈（§N1）：uat_bootstrap.sh stop 按 pidfile + 本项目数据目录绝对路径精确兜底 kill
+      # （§PICKILL-SCOPE/§VITE-ORPHAN），绝不伤及同机其它进程；always() 保证失败取证后也收口。
+      # stop 自身无判红语义（无记录即静默成功），|| true 兜住极端场景。
+      - name: Stop UAT stack
+        if: always()
+        run: ./scripts/uat_bootstrap.sh stop || true

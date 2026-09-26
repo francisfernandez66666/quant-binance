@@ -432,9 +432,25 @@ func (s *Server) handleExecuteAction(w http.ResponseWriter, r *http.Request) {
 	}
 	if q != nil {
 		// §P1-7 限价偏离检查：委托价偏离现价超 ±15% 且未显式确认 → 400 拒绝（防手滑输错价）。
+		// §AUDITFIX926-D1（2026-09-26 owner 批准补第二条腿）：错误体加机读 code 与结构化数值。
+		// 缺陷原文：此分支只回人话 message，前端 catch 后原样弹 toast，用户在「确认无误也要
+		// 重新输一遍价」的死路上——confirm_deviation 字段后端一直在收、前端全仓零引用。
+		// 修法：message 逐字节不动（旧客户端按文案展示的契约不变），旁挂 code=price_deviation
+		// 与 live_price/deviation_pct 数值——前端 request() 已透传 err.code（§FIX-9d 惯例），
+		// 持仓页据此弹「确认偏离」对话框并带 confirm_deviation 原样重发。重发走 api 自动生成的
+		// 新 client_id：偏离拒单发生在本函数幂等键构造**之前**、键从未被消耗，新键不会误报
+		// duplicate，也不会与首单共享去重命名空间（首单根本没触柜台）。
+		// English: attach machine-readable code + live price so the UI can offer an explicit
+		// confirm-and-resubmit leg instead of a dead-end toast.
 		if dev := (req.Price - q.Price) / q.Price; (dev > 0.15 || dev < -0.15) && !req.ConfirmDeviation {
-			writeError(w, 400, fmt.Sprintf("委托价 %.2f 偏离现价 %.2f 超 ±15%%（%.1f%%），请核对价格后确认提交",
-				req.Price, q.Price, dev*100))
+			msg := fmt.Sprintf("委托价 %.2f 偏离现价 %.2f 超 ±15%%（%.1f%%），请核对价格后确认提交",
+				req.Price, q.Price, dev*100)
+			writeJSON(w, 400, map[string]any{
+				"error":         msg,
+				"code":          "price_deviation",
+				"live_price":    q.Price,
+				"deviation_pct": dev * 100,
+			})
 			return
 		}
 	}

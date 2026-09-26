@@ -27,6 +27,9 @@
 #     + 2026-09-24 §CN-FREEZE 后续本地接线批（§OPSLOAD 首尔链运维装载步 + §QMT-FROZEN 链路冻结三态
 #       改口（含浏览器端用例），见 §43/§75）+ §ADJ-BASIS-2/-2P 复权口径可见性收口（母仓 20e0449
 #       已落地后按单向顺序搬齐：落盘盖章/载入判 stale/实盘 fail-close 闸/接口两腿/前端红标/两条 p1 告警，见 76）
+#   + 2026-09-26 §AUDITFIX926 全链路 UAT 审计修复批（N1 CI 单源/N7 IP 出仓/N8 mock env 生成/
+#       N2 回报口令双源 fail-fast/N3 网关 403 人话/N4 pydata 可选口令/D3 卡片降档/N5 按钮收权/
+#       N10 端点权限矩阵 golden/D1 价格偏离二次确认双腿，见 79）
 # ...盘链路渲染行为锁，见 75）
 # ...
 # §全链路 UAT 修复批（2026-09-18 §UAT_FULLCHAIN_VERIFY）专项（见 11/11）：
@@ -2405,6 +2408,127 @@ PY
 grep -q 'PyURL:           "http://127.0.0.1:8788"' internal/config/config.go \
 	|| { echo "--- FAIL: config 缺省 PyURL 不是 8788（对齐 pydata.service 的等值断言）"; exit 1; }
 echo "ok - §AUDITFIX925 专项守卫通过（行为锁 2 组 + 静态/负向锁 9 道）"
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 79 §AUDITFIX926：全链路 UAT 审计修复批专项守卫（2026-09-26）
+# 覆盖十条修复各自的「接线还在」证据：
+#   N1 CI e2e 单源化（workflow 只调 uat_bootstrap，内联起栈判红）
+#   N7 服务器 IP 出仓（ops.env 模板+忽略+全仓零真实地址；1.2.3.4 类占位不算）
+#   N8 首尔部署生成 /etc/qmt-mock.env（600 权限、双 token、失败仅 warn 不判红）
+#   N2 网关回报口令双源 fail-fast（report_token_conflicts + exit(2)）
+#   N3 网关 403 人话（gatewayHTTPError 载体 + describeHealthError 包装，判定语义零变化）
+#   N4 pydata 可选口令（server 侧 compare_digest + Go 侧 X-Pydata-Token 头 + 三级来源链）
+#   D3/N5 币安状态卡降档 + 夜间报告按钮收权（正锁+adminMiddleware 负锁）
+#   N10 端点→权限矩阵 golden（route_perms.json 在册 + TestRoutePermsGolden 绿）
+#   D1 价格偏离二次确认双腿（后端 code=price_deviation ↔ 前端按码分流 confirm_deviation 重发）
+# 本段全部命令先经试跑全绿后挂入（新验收命令先实跑再入库）。
+# ══════════════════════════════════════════════════════════════════════════════
+echo "==> 79 §AUDITFIX926 审计修复批锁（N1-N10/D1/D3/N5 十项）..."
+
+# ── N1：CI e2e 单源化（脚本调用在位 + 端口单源键在位 + 内联构建负锁）────────────
+grep -q 'scripts/uat_bootstrap.sh run' .github/workflows/nightly-e2e.yml \
+	|| { echo "--- FAIL: nightly e2e 不再走 uat_bootstrap 单源（§N1 双轨漂移复活：CI 与本地两套步骤必然再次分叉）"; exit 1; }
+grep -q 'E2E_MOCK_URL: http://127.0.0.1:18789' .github/workflows/nightly-e2e.yml \
+	|| { echo "--- FAIL: workflow 丢了 E2E_MOCK_URL（§UAT-PORTS 的「连不上 mock 判红」依赖该键下发）"; exit 1; }
+python3 - <<'PY' || { echo "--- FAIL: §N1 workflow 内联构建负锁未通过"; exit 1; }
+import sys
+t = open(".github/workflows/nightly-e2e.yml", encoding="utf-8").read()
+body = "\n".join(l for l in t.splitlines() if not l.strip().startswith("#"))
+hits = [l for l in body.splitlines() if "go build" in l]
+if hits:
+    print("workflow 里重新出现了内联 go build：\n" + "\n".join(hits)); sys.exit(1)
+print("ok - §N1 CI 构建/起栈/seed 全套收敛到 uat_bootstrap（workflow 零内联 go build）")
+PY
+# ── N7：敏感地址出仓（模板/忽略卫生/三消费脚本接线 + 全仓真实 IP 负锁）──────────
+[ -f scripts/ops.env.example ] || { echo "--- FAIL: scripts/ops.env.example 模板丢失（§N7 真实值出仓方案失去入口）"; exit 1; }
+grep -q 'OPS_SSH_HOST=' scripts/ops.env.example \
+	|| { echo "--- FAIL: ops.env.example 缺 OPS_SSH_HOST 键（模板与消费脚本口径分叉）"; exit 1; }
+git check-ignore -q scripts/ops.env \
+	|| { echo "--- FAIL: scripts/ops.env 不再被忽略（真实服务器地址有进仓库的风险）"; exit 1; }
+if git grep -qn "43\.108" ; then
+	echo "--- FAIL: 服务器真实地址又出现在 tracked 文件里（§N7：仓库内只准有占位符）"; git grep -n "43\.108" | head -5; exit 1; fi
+grep -q 'OPS_SSH_HOST:?' scripts/verify_nightly.sh \
+	|| { echo "--- FAIL: verify_nightly 不再经 OPS_SSH_HOST 取地址（缺失即提示模板的 :? 硬闸丢失）"; exit 1; }
+grep -q 'OPS_SSH_HOST' scripts/deploy_seoul.sh \
+	|| { echo "--- FAIL: deploy_seoul 丢了 OPS_SSH_HOST 回落腿（ops.env 将成死配置）"; exit 1; }
+grep -q 'ops.env' scripts/sync_delta_to_cloud.sh \
+	|| { echo "--- FAIL: sync_delta 不再 source ops.env（三消费脚本接线缺一）"; exit 1; }
+# ── N8：首尔部署自动生成 /etc/qmt-mock.env（文件+双 token+600 权限三件齐）───────
+grep -q '/etc/qmt-mock.env' scripts/deploy_seoul.sh \
+	|| { echo "--- FAIL: deploy_seoul 不再落 /etc/qmt-mock.env（service 的 EnvironmentFile 指向不存在文件＝空 token 半死态）"; exit 1; }
+grep -q 'QMT_MOCK_REPORT_TOKEN' scripts/deploy_seoul.sh \
+	|| { echo "--- FAIL: mock env 生成缺回报口令腿（只生成推送口令，回报链仍空转）"; exit 1; }
+grep -q 'umask 077' scripts/deploy_seoul.sh \
+	|| { echo "--- FAIL: mock env 生成不再 umask 077（token 文件世界可读）"; exit 1; }
+# ── N2：网关回报口令双源 fail-fast（函数在位 + 行为锁真跑）─────────────────────
+grep -q 'def report_token_conflicts' qmt_gateway/gateway.py \
+	|| { echo "--- FAIL: gateway 的口令双源校验函数被删（配置不等值将回到「运行期全量 401 静默死信」）"; exit 1; }
+grep -q 'sys.exit(2)' qmt_gateway/gateway.py \
+	|| { echo "--- FAIL: 口令冲突不再拒启（exit(2) 丢失＝fail-fast 退化）"; exit 1; }
+# ── N3：403 人话两腿（网关告警函数 + Go 错误载体，判定语义不变由行为锁兜）──────
+grep -q 'def health_whitelist_warnings' qmt_gateway/gateway.py \
+	|| { echo "--- FAIL: 网关白名单误熔预警函数丢失（/health 403 又将伪装成网关死亡）"; exit 1; }
+grep -q 'gatewayHTTPError' internal/trading/qmt_client.go \
+	|| { echo "--- FAIL: Go 网关非 200 错误不再带状态码载体（describeHealthError 无从分流 403）"; exit 1; }
+grep -q '疑似 ALLOWED_IPS' internal/trading/qmt_client.go \
+	|| { echo "--- FAIL: 健康探测 403 的人话说明丢失"; exit 1; }
+# ── N4：pydata 可选口令全链（server 闸 + Go 客户端头 + 三级来源 + 调度透传）─────
+grep -q 'compare_digest' cmd/pydata/server.py \
+	|| { echo "--- FAIL: pydata 口令校验不再常量时间比对"; exit 1; }
+grep -q 'error: unauthorized' cmd/pydata/server.py \
+	|| { echo "--- FAIL: pydata 拒权响应体不再是 Go 唯一认得的 error: 前缀形态（JSON 会被当 CSV 假成功）"; exit 1; }
+grep -q 'X-Pydata-Token' internal/data/baostock.go \
+	|| { echo "--- FAIL: Go 客户端不再发 X-Pydata-Token 头（配了口令后 baostock 链必 401）"; exit 1; }
+grep -q 'PyDataToken string' internal/config/config.go \
+	|| { echo "--- FAIL: config 丢了 pydata_token 键（三级来源链的配置文件腿断）"; exit 1; }
+grep -q 'resolvePyDataToken' cmd/dataload/main.go \
+	|| { echo "--- FAIL: dataload 丢了口令三级来源解析（显式>env>config）"; exit 1; }
+grep -q -- '--pytoken' internal/scheduler/worker.go \
+	|| { echo "--- FAIL: 调度器不再把 config 口令透传给 dataload 子进程（夜间链与手跑口径分叉）"; exit 1; }
+# ── D3：币安状态卡降档（正锁=auth 档注册行原形；负锁=不得回挂 adminMiddleware）──
+grep -q 's.mux.HandleFunc("GET /api/binance/state", s.authMiddleware(s.handleBinanceState))' internal/server/server.go \
+	|| { echo "--- FAIL: /api/binance/state 注册不再是登录可读档（§AUDITFIX926-D3 裁决被改动须重新评审）"; exit 1; }
+grep -q '"GET /api/binance/state": "auth"' internal/server/route_perms.json \
+	|| { echo "--- FAIL: 权限矩阵 golden 里 binance/state 档位不是 auth（golden 与路由实态脱节）"; exit 1; }
+# ── D1：偏离确认双腿等值（后端机读码 ↔ 前端分流码同一字符串；弹窗在位）─────────
+grep -q '价格偏离确认' web/src/pages/Positions.jsx \
+	|| { echo "--- FAIL: Positions 偏离二次确认弹窗丢失（D1 前端腿被摘，拒单又回到死路 toast）"; exit 1; }
+grep -q 'price_deviation' internal/server/qmt.go \
+	|| { echo "--- FAIL: qmt.go 拒单体不再带 code=price_deviation 机读码"; exit 1; }
+grep -q "'price_deviation'" web/src/pages/Positions.jsx \
+	|| { echo "--- FAIL: 前端不再按 price_deviation 机读码分流（双腿字符串失配）"; exit 1; }
+grep -q 'confirm_deviation' web/src/pages/Positions.jsx \
+	|| { echo "--- FAIL: 前端重发不再带 confirm_deviation（后端字段再次成为孤儿）"; exit 1; }
+python3 - <<'PY' || { echo "--- FAIL: §N5/D3/D1 python 接线锁未通过"; exit 1; }
+import sys
+# N5：夜间报告按钮行上方 3 行内必须有 {isAdmin && ( 包裹（按钮裸挂=成员可见不可用的谎报形态复活）
+src = open("web/src/pages/Paper.jsx", encoding="utf-8").read().splitlines()
+idx = [i for i, l in enumerate(src) if "openNightlyReports" in l and "Button" in l]
+if len(idx) != 1:
+    print(f"夜间报告按钮定位异常（应恰 1 处，实际 {len(idx)}）"); sys.exit(1)
+if "{isAdmin && (" not in "\n".join(src[idx[0] - 3:idx[0] + 1]):
+    print("夜间报告按钮不再包在 isAdmin 条件块内（N5 谎报形态复活）"); sys.exit(1)
+# D3 负锁：binance/state 的注册行（全仓唯一）不得含 adminMiddleware——降档裁决不许被顺手改回
+lines = [l for l in open("internal/server/server.go", encoding="utf-8").read().splitlines()
+         if "HandleFunc" in l and "GET /api/binance/state" in l]
+if len(lines) != 1:
+    print(f"binance/state 注册行应恰 1 条，实际 {len(lines)}（一行注册不变式被破坏）"); sys.exit(1)
+if "adminMiddleware" in lines[0]:
+    print("binance/state 又挂回 adminMiddleware（D3 降档裁决被回改）"); sys.exit(1)
+print("ok - §N5 按钮 isAdmin 包裹在位 + §D3 adminMiddleware 负锁通过")
+PY
+# ── 行为锁：五组真跑（pytest 双文件 / Go 三包定向 / vitest D1 组件用例）─────────
+if ! python3 -m pytest qmt_gateway/tests/test_report_token_guard.py qmt_gateway/tests/test_pydata_token_n4.py -q >/dev/null 2>&1; then
+	echo "--- FAIL: §N2/N3/N4 python 行为锁未通过（口令双源拒启/白名单预警/pydata 闸）"; exit 1; fi
+if ! go test ./internal/trading -run 'TestQMTHealth' -count=1 >/dev/null 2>&1; then
+	echo "--- FAIL: §N3 Go 健康探测分流用例红（403 人话/判定语义不变）"; exit 1; fi
+if ! go test ./internal/data -run 'TestBaostock' -count=1 >/dev/null 2>&1; then
+	echo "--- FAIL: §N4 baostock 口令头用例红（空 token 逐字节兼容/配置即发头）"; exit 1; fi
+if ! go test ./internal/server -run 'TestRoutePermsGolden|TestExecuteDeviationGate|TestWritePerms' -count=1 >/dev/null 2>&1; then
+	echo "--- FAIL: §N10 权限矩阵 golden / §D1 偏离闸行为 / 写端点普查红"; exit 1; fi
+if ! ( cd web && npx vitest run src/__tests__/d1_price_deviation_confirm.test.jsx >/dev/null 2>&1 ); then
+	echo "--- FAIL: §D1 偏离二次确认组件用例红（弹窗分流/confirm_deviation 重发/普通错误不误弹）"; exit 1; fi
+echo "ok - §AUDITFIX926 专项守卫通过（行为锁 5 组 + 静态/正负锁 30 道）"
 
 echo ""
 echo "==> 全部通过"

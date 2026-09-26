@@ -686,10 +686,17 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("GET /api/config/binance", s.adminMiddleware(s.handleGetBinanceConfig))
 	s.mux.HandleFunc("POST /api/config/binance", s.adminMiddleware(s.handleSetBinanceConfig))
 
-	// §BINANCE-P2 币安实盘运维端点（PLAN §6.4）：读面 state/orders/exchange_info 只查币安两市场
+	// §BINANCE-P2 币安实盘运维端点（PLAN §6.4）：读面 orders/exchange_info 只查币安两市场
 	// （CN 快照与撤单仍归 /api/qmt/*）；写面 cancel/halt/disclaimer 全过 adminMiddleware——
 	// halt 只扇出币安控制器（A 股紧急停止互不牵连），disclaimer 是资金安全闩的人工复位口。
-	s.mux.HandleFunc("GET /api/binance/state", s.adminMiddleware(s.handleBinanceState))
+	// §AUDITFIX926-D3（2026-09-26 owner 裁决「卡片降级」）：GET state 由 admin 降为登录可读。
+	// 缺陷原文：Quant 页 BinanceStatusCard 全员挂载，但端点挂 adminMiddleware，普通成员 403
+	// 被组件 catch 吞掉后渲染「未接入」占位——把权限问题谎报成功能没上线。载荷侧实审无密钥
+	// 材料（enabled/mode/halted/控制器快照/feed 统计，凭证字段本就掩码），且 binanceLive 按
+	// 请求者账号归因（成员看到的是自己通道的空态），降级不扩大暴露面。写面维持 admin 不动。
+	// English: §AUDITFIX926-D3 — GET /api/binance/state downgraded to any authenticated user
+	// after payload audit (no secret material, per-user attribution); write side stays admin.
+	s.mux.HandleFunc("GET /api/binance/state", s.authMiddleware(s.handleBinanceState))
 	// §BINANCE-P5 新市场（US/CRYPTO）历史 K 线只读面（研究库 daily 表）：CN 仍走 /api/kline，两链分轨。
 	s.mux.HandleFunc("GET /api/binance/kline", s.authMiddleware(s.handleBinanceKline))
 	// §市场分家-1 详情抽屉头部现价的非 CN 轨（CN→400 分轨，与 kline 同姿势；只读、登录态）。

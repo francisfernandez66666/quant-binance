@@ -785,8 +785,14 @@ export default function Paper() {
           <Button disabled={!enabled && !isAdmin} onClick={openSettingsModal}>⚙ 设置</Button>
           {/* 自检诊断入口：拉取引擎快照一致性结果并弹窗展示 */}
           <Button theme="default" loading={selfCheckLoading} onClick={runSelfCheck}>🔍 自检</Button>
-          {/* §D-1 夜间信号质量报告入口（researchd 每晚落库，admin-only 端点） */}
-          <Button theme="default" loading={nReportsLoading} onClick={openNightlyReports}>📊 夜间报告</Button>
+          {/* §D-1 夜间信号质量报告入口（researchd 每晚落库，admin-only 端点）。
+              §AUDITFIX926-N5（2026-09-26）：按钮按角色隐藏——此前对成员无条件渲染，点一下
+              才吃到 403 toast，权限问题伪装成功能故障（上方旧注释写「403 时静默」与实现矛盾，
+              一并纠偏）。入口可见性与端点鉴权同级，成员不再有点了才知道没权限的路径。
+              English: hide the admin-only nightly-report entry from non-admin roles. */}
+          {isAdmin && (
+            <Button theme="default" loading={nReportsLoading} onClick={openNightlyReports}>📊 夜间报告</Button>
+          )}
           {/* 全局清盘入口：未启用时禁用 */}
           <Button theme="danger" disabled={!enabled} onClick={() => setShowResetModal(true)}>清盘</Button>
         </div>

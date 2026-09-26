@@ -744,6 +744,17 @@ type DataConfig struct {
 	// English: risk-factor board primary-source switch — nil/true = hithink primary + EastMoney
 	// fallback; explicit false = emergency rollback to the old EastMoney-direct path.
 	RiskSourceHithink *bool `json:"risk_source_hithink,omitempty"`
+	// PyDataToken pydata sidecar（cmd/pydata/server.py，baostock 主数据源）的**可选**共享口令，
+	// 对应 sidecar 的 --token 与请求头 X-Pydata-Token（§N4，2026-09-26 全量审计）。
+	// 缺陷原文：sidecar 全文零鉴权，防线只有"绑 127.0.0.1"，同机任意进程可匿名取全市场研究数据。
+	// 为何这样修（默认零行为变化）：空串 = 不发头 = 现网匿名访问形态逐字节不变；
+	//   非空 = Go 客户端每个请求带 X-Pydata-Token 头，sidecar 不匹配即 401。
+	// 来源链（口径与仓内既有 env 惯例一致：env 现场覆盖配置文件，见 TUSHARE_TOKEN/QUANT_DATA_DIR；
+	//   本包自身不读环境变量，故 env 读取落在消费点 cmd/dataload 的 resolvePyDataToken）：
+	//   显式 --pytoken > 环境变量 QUANT_PYDATA_TOKEN > 本字段。
+	// English: optional shared secret for the local pydata sidecar; empty keeps today's
+	// anonymous behaviour. Resolution order: --pytoken flag > env QUANT_PYDATA_TOKEN > this field.
+	PyDataToken string `json:"pydata_token,omitempty"`
 }
 
 // RiskHithinkPrimary 返回风险盘口是否以同花顺为主源（nil 视为默认 true）。

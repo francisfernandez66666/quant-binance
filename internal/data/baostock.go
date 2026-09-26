@@ -22,17 +22,32 @@ import (
 // （BaostockClient is the Go client for the local baostock sidecar.）
 type BaostockClient struct {
 	base   string // 形如 http://127.0.0.1:8788
+	token  string // §N4 可选口令（X-Pydata-Token 头值）；空串 = 不发头 = 匿名请求，与旧版逐字节兼容
 	client *http.Client
 }
 
+// PyDataTokenHeader sidecar（cmd/pydata/server.py）的口令头名，两侧必须同字面量。
+// §N4（2026-09-26 全量审计）：pydata 此前零鉴权（防线只有绑 127.0.0.1），
+// 现支持可选共享口令；本客户端在非空 token 时给每个请求带上该头。
+// English: the optional shared-secret header understood by the pydata sidecar.
+const PyDataTokenHeader = "X-Pydata-Token"
+
+// PyDataTokenEnv 口令的环境变量名（调用方来源链：显式旗标 > 本 env > config rules.data.pydata_token）。
+// 与仓内既有 env 惯例同型（TUSHARE_TOKEN、QUANT_DATA_DIR 都是现场 env 覆盖配置文件）。
+// （PyDataTokenEnv is the env var carrying the optional pydata shared secret.）
+const PyDataTokenEnv = "QUANT_PYDATA_TOKEN"
+
 // NewBaostockClient 创建 sidecar 客户端。
-// （NewBaostockClient builds the sidecar client.）
-func NewBaostockClient(base string) *BaostockClient {
+// token 传空串 = 不带鉴权头（现网匿名访问形态，行为逐字节不变）；
+// 非空 = 每个请求都带 X-Pydata-Token 头，与 sidecar 的 --token 配成同一个值。
+// （NewBaostockClient builds the sidecar client; an empty token keeps today's anonymous requests.）
+func NewBaostockClient(base, token string) *BaostockClient {
 	if base == "" {
 		base = "http://127.0.0.1:8788" // §AUDITFIX925-D6c：sidecar 缺省端口与 pydata.service 对齐（旧 8787 撞同机翻译助手）
 	}
 	return &BaostockClient{
 		base:   strings.TrimRight(base, "/"),
+		token:  strings.TrimSpace(token),
 		client: &http.Client{Timeout: 60 * time.Second},
 	}
 }
@@ -55,7 +70,15 @@ func (c *BaostockClient) call(method string, params map[string]string, strCols m
 
 	// 向 sidecar 发 GET 取回 CSV 文本：连接失败与读体失败分开包装，
 	// 便于区分「Baostock 进程没起来」和「响应中途断开」两类故障。
-	resp, err := c.client.Get(u.String())
+	// §N4：配置了口令才带头——空 token 一个头都不发，与旧版请求逐字节相同（兼容锁）。
+	req, err := http.NewRequest(http.MethodGet, u.String(), nil)
+	if err != nil {
+		return nil, err
+	}
+	if c.token != "" {
+		req.Header.Set(PyDataTokenHeader, c.token)
+	}
+	resp, err := c.client.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("baostock %s: %v", method, err)
 	}
@@ -66,6 +89,8 @@ func (c *BaostockClient) call(method string, params map[string]string, strCols m
 	}
 	text := string(body)
 	// baostock 以文本行返回结果：error: 前缀表示调用失败。
+	// §N4 说明：sidecar 口令不匹配时回的是 **401 + "error: unauthorized" 纯文本**（不是 JSON），
+	// 正是因为本协议只认这个前缀——见 cmd/pydata/server.py 的 token_error_body 注释。
 	if strings.HasPrefix(text, "error:") {
 		return nil, fmt.Errorf("baostock %s: %s", method, strings.TrimSpace(text))
 	}
