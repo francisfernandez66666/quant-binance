@@ -13,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	"quant-trading-v2/internal/data"
 	"quant-trading-v2/internal/store"
 )
 
@@ -26,8 +27,8 @@ func openDayBarsDB(t *testing.T) *store.DB {
 	}
 	t.Cleanup(func() { _ = db.Close() })
 
-	// 日期轴与生产同构（连续交易日）：兜底链的「丢当日行」「昨收锚」判据都依赖倒数第二行，
-	// 日期散成不连续区间会让守卫误判成通过。
+	// 日期轴与生产同构（日历连续、锚在最近一个交易日往回，见 dayBarsTestDates）：兜底链的
+	// 「丢当日行」「昨收锚」判据都依赖倒数第二行，日期散成不连续区间会让守卫误判成通过。
 	dates := dayBarsTestDates()
 	rows := make([]map[string]any, 0, len(dates))
 	for _, d := range dates {
@@ -47,11 +48,26 @@ func openDayBarsDB(t *testing.T) *store.DB {
 	return db
 }
 
-// dayBarsTestDates 最近 5 个日历日（升序，均早于今天，避免把周末当成今日 bar）。
+// dayBarsTestDates 锚定最近交易日往回的 5 个日历日（升序，恒 ≤ 生产窗口上沿 end）。
+// §GATEFIX927-2（2026-09-27 周日实红复盘，审计 §D2）：旧夹具用 time.Now().AddDate(0,0,-i)
+// 纯日历日生成，周日跑会夹进一根周六 bar——生产 Lookup 的窗口上沿 end=TradingDayDate(now)
+// （周末回退上周五，§GAP3.1 节假日同口径回退）+ HfqBars 闭区间 trade_date<=end 把它正确
+// clamp 掉，期望 5 实得 4：红的是夹具与交易日历不对齐，生产逻辑本身安全。修法只动夹具：
+// 从 end 往回取 5 天，播种日期恒落在闭区间内（其中周末日期只是库里多出的历史行，查询侧
+// 不做日历过滤、无副作用），任何日子跑期望都稳定为 5；end 与生产共用同一单源谓词，
+// 节假日也不再脆弱。
+// （English: anchor the seeded dates to the production end-of-window predicate
+// TradingDayDate(now) and walk back 5 calendar days — the closed interval on trade_date
+// then always contains every seeded row, removing the Sunday-only flake.）
 func dayBarsTestDates() []string {
+	end := data.TradingDayDate(time.Now())
+	t0, err := time.Parse("20060102", end)
+	if err != nil {
+		panic("dayBarsTestDates: TradingDayDate 返回了非 YYYYMMDD: " + end)
+	}
 	out := make([]string, 0, 5)
-	for i := 5; i >= 1; i-- {
-		out = append(out, time.Now().AddDate(0, 0, -i).Format("20060102"))
+	for i := 4; i >= 0; i-- {
+		out = append(out, t0.AddDate(0, 0, -int(i)).Format("20060102"))
 	}
 	return out
 }

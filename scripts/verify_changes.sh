@@ -30,6 +30,8 @@
 #   + 2026-09-26 §AUDITFIX926 全链路 UAT 审计修复批（N1 CI 单源/N7 IP 出仓/N8 mock env 生成/
 #       N2 回报口令双源 fail-fast/N3 网关 403 人话/N4 pydata 可选口令/D3 卡片降档/N5 按钮收权/
 #       N10 端点权限矩阵 golden/D1 价格偏离二次确认双腿，见 79）
+#   + 2026-09-27 §GATEFIX927 门禁假绿根治（审计 P0 #1：23 处 -run 门禁迁 go_run_gate 单源出口
+#       + 第 80 段反证锁；同日审计复核勘误见 docs/FIX_PLAN_20260927.md，见 80）
 # ...盘链路渲染行为锁，见 75）
 # ...
 # §全链路 UAT 修复批（2026-09-18 §UAT_FULLCHAIN_VERIFY）专项（见 11/11）：
@@ -156,6 +158,27 @@
 # 说明：本机通常没有 pytest，脚本内 py_tests() 会自动退回标准库 unittest（CI 仍走 pytest）。
 set -euo pipefail
 cd "$(dirname "$0")/.."
+
+# go_run_gate <包相对路径> <正则> <门禁标签>
+# §GATEFIX927-1（审计报告 AUDIT_FULL_BYTELEVEL_UAT_20260927 P0 #1 根治）：带 -run 过滤的
+# go 测试门禁统一出口。旧形态（跑完 grep 输出里的 'ok' 字样）可被空跑骗过——测试被改名/
+# 删除时仍打印 `ok … [no tests to run]` 且退出 0，字符串命中照旧、门禁恒绿（2026-09-27
+# 复核已复现该形态）。判绿三条件缺一不可：
+#   ① 退出码为 0（成败第一真源；set -euo pipefail 下用 `|| rc=$?` 收码，不写裸判定）；
+#   ② 输出不含 `[no tests to run]`（空跑即红，堵「改名即恒绿」）；
+#   ③ `-v` 的 `^=== RUN` 计数 ≥1（真实回归被跑到才有绿，测试数非零断言焊死）。
+# grep 计数管道一律带 `|| true`：无命中时退出 1，set -euo 下会把赋值变成脚本静默中止
+# （本脚本 §1218 行既有教训，此处照章执行）。
+go_run_gate() {
+	local pkg="$1" re="$2" label="$3" out rc=0 runs
+	out=$(go test -count=1 -v -run "$re" "./$pkg/" 2>&1) || rc=$?
+	runs=$(printf '%s\n' "$out" | grep -c '^=== RUN' || true)
+	if [ "$rc" -ne 0 ] || printf '%s\n' "$out" | grep -q '\[no tests to run\]' || [ "${runs:-0}" -eq 0 ]; then
+		printf '%s\n' "$out" | tail -20
+		echo "--- FAIL: ${label}（rc=${rc} runs=${runs}，§GATEFIX927 go_run_gate）"
+		exit 1
+	fi
+}
 
 # py_tests <目标文件或目录> [-k 过滤表达式]
 #
@@ -1507,13 +1530,13 @@ echo "==> 61 §MR 市场实际改造批：数据面/交易面拆分 + 7×24 维�
 # 无市场过滤会跨市场误伤。本批：data_plane 拆平面、MR-2 独立 60s ticker、MR-3 规则化 NYSE
 # 节假日/半日 + 市场时区日界 + 清扫带 market 键。
 # 行为锁①：§MR-1 数据面四链（无凭证合法 / 子开关全关拒 / BrokerEnabled=true 且 TradingActive=false / enabled 仍强制凭证）
-go test -count=1 ./internal/config/ -run 'TestBinanceDataPlane' 2>&1 | grep -q '^ok' || { echo "--- FAIL: §MR-1 data_plane 行为回归未过"; exit 1; }
-go test -count=1 ./internal/server/ -run 'TestBinanceConfigDataPlane' 2>&1 | grep -q '^ok' || { echo "--- FAIL: §MR-1 data_plane HTTP 端点回归未过"; exit 1; }
+go_run_gate internal/config 'TestBinanceDataPlane' '§MR-1 data_plane 行为回归未过'
+go_run_gate internal/server 'TestBinanceConfigDataPlane' '§MR-1 data_plane HTTP 端点回归未过'
 # 行为锁②：§MR-3 NYSE 规则日历（10 节假日+位移+受难日；半日 13:00/独立日前 16:00；EXTENDED 半日 17:00 收）
-go test -count=1 ./internal/data/ -run 'TestUSMarketCalendar|TestUSSessionActiveHalfDay' 2>&1 | grep -q '^ok' || { echo "--- FAIL: §MR-3 US 日历/半日行为回归未过"; exit 1; }
+go_run_gate internal/data 'TestUSMarketCalendar|TestUSSessionActiveHalfDay' '§MR-3 US 日历/半日行为回归未过'
 # 行为锁③：§MR-3 跨日清扫按市场隔离 + trading 侧原 C1b 回归不破
-go test -count=1 ./internal/store/ -run 'TestSweepStaleBuyOrders' 2>&1 | grep -q '^ok' || { echo "--- FAIL: §MR-3 SweepStaleBuyOrders 市场隔离回归未过"; exit 1; }
-go test -count=1 ./internal/trading/ -run 'TestSweepOrdersStaleBuyUnconditional' 2>&1 | grep -q '^ok' || { echo "--- FAIL: §C1b 清扫接线回归未过"; exit 1; }
+go_run_gate internal/store 'TestSweepStaleBuyOrders' '§MR-3 SweepStaleBuyOrders 市场隔离回归未过'
+go_run_gate internal/trading 'TestSweepOrdersStaleBuyUnconditional' '§C1b 清扫接线回归未过'
 # ---- 静态锁：MR-1 配置契约三处 + 语义判定 ----
 grep -q 'json:"data_plane"' internal/config/binance.go || { echo "--- FAIL: §MR-1 config 段 data_plane 字段丢失"; exit 1; }
 grep -q '"data_plane"' internal/server/binance_config.go || { echo "--- FAIL: §MR-1 GET 视图不再下发 data_plane"; exit 1; }
@@ -1537,7 +1560,7 @@ grep -A8 'func (d \*DB) SweepStaleBuyOrders' internal/store/real_positions.go | 
 # Easter 月基修正必须在位（匿名格里高利历月序 0=三月，缺 +3 则受难日整体错位一年）
 grep -q '/31+3' internal/data/market_session.go || { echo "--- FAIL: §MR-3 easterSunday 月基 +3 修正丢失（受难日错位）"; exit 1; }
 # 行为锁④：§MR-EDGAR-ENC EDGAR Atom 声明 ISO-8859-1 必须可解（现网 US 事件腿曾因 CharsetReader nil 恒失败）
-go test -count=1 ./internal/data/ -run 'TestEdgarISO8859CharsetDecode' 2>&1 | grep -q '^ok' || { echo "--- FAIL: §MR-EDGAR-ENC Latin-1 解码回归未过"; exit 1; }
+go_run_gate internal/data 'TestEdgarISO8859CharsetDecode' '§MR-EDGAR-ENC Latin-1 解码回归未过'
 grep -q 'dec.CharsetReader = latin1ToUTF8Reader' internal/data/edgar.go || { echo "--- FAIL: §MR-EDGAR-ENC CharsetReader 注入丢失（xml.Unmarshal 裸奔=US 事件腿全灭复活）"; exit 1; }
 echo "ok - §MR 市场实际改造批专项守卫通过（行为回归 5 组 + 静态锁 17 道〔含 MR-1 执行器误用负锁〕）"
 
@@ -1546,23 +1569,23 @@ echo "==> 62 §MR-4/战法批/CN-MASTER：做空+合约四链派发、纸面柜�
 # 加 EDGAR CIK→ticker 映射兜底、派发摘要进状态端点/设置页，并以 rules.cn.enabled（缺省关）
 # 把 A股装配腿做成总开关。行为锁按包分组跑本批测试族；静态锁钉死"门在位且没把币安链关进门里"。
 # ---- 行为锁①：§CN-MASTER 配置默认关 + /api/status 双向旗标 ----
-go test -count=1 ./internal/config/ -run 'TestCNMaster' 2>&1 | grep -q '^ok' || { echo "--- FAIL: §CN-MASTER 配置出厂默认关回归未过"; exit 1; }
-go test -count=1 ./internal/server/ -run 'TestStatusCNMaster' 2>&1 | grep -q '^ok' || { echo "--- FAIL: §CN-MASTER 状态旗标回归未过"; exit 1; }
+go_run_gate internal/config 'TestCNMaster' '§CN-MASTER 配置出厂默认关回归未过'
+go_run_gate internal/server 'TestStatusCNMaster' '§CN-MASTER 状态旗标回归未过'
 # ---- 行为锁②：§MR-4B/§战法批-1 配置域（合约 URL/派发校验/纸面卫生/打分键全有或全无）----
-go test -count=1 ./internal/config/ -run 'TestFutures|TestValidateMR4BMatrix|TestValidateDispatch|TestValidatePaperHygiene|TestValidateLLMKeys|TestPaperActive|TestDispatchEffective' 2>&1 | grep -q '^ok' || { echo "--- FAIL: §MR-4/战法批 配置域回归未过"; exit 1; }
+go_run_gate internal/config 'TestFutures|TestValidateMR4BMatrix|TestValidateDispatch|TestValidatePaperHygiene|TestValidateLLMKeys|TestPaperActive|TestDispatchEffective' '§MR-4/战法批 配置域回归未过'
 # ---- 行为锁③：§战法批-4 派发核四链（多/空×现货/合约+止盈止损+关闸零发+幂等键）----
-go test -count=1 ./internal/engine/ -run 'TestDispatch|TestAsyncDispatcher' 2>&1 | grep -q '^ok' || { echo "--- FAIL: §战法批-4 派发链回归未过"; exit 1; }
+go_run_gate internal/engine 'TestDispatch|TestAsyncDispatcher' '§战法批-4 派发链回归未过'
 # ---- 行为锁④：§战法批-2 无密钥纸面柜台四方向 + §MR-4B 资金费/合约回报 ----
-go test -count=1 ./internal/trading/ -run 'TestPaper' 2>&1 | grep -q '^ok' || { echo "--- FAIL: §战法批-2 纸面柜台回归未过"; exit 1; }
-go test -count=1 ./internal/trading/ -run 'TestReporterFutures|TestReporterFunding|TestFuturesForkNegativeLocks|TestBinanceSideMR4|TestReporterMR4' 2>&1 | grep -q '^ok' || { echo "--- FAIL: §MR-4B 合约回报/方向映射回归未过"; exit 1; }
+go_run_gate internal/trading 'TestPaper' '§战法批-2 纸面柜台回归未过'
+go_run_gate internal/trading 'TestReporterFutures|TestReporterFunding|TestFuturesForkNegativeLocks|TestBinanceSideMR4|TestReporterMR4' '§MR-4B 合约回报/方向映射回归未过'
 # ---- 行为锁⑤：§MR-4A 风控做空闸 + 账本短向 + §战法批-3 事件打分/空头腿 + EDGAR 映射 ----
-go test -count=1 ./internal/risk/ -run 'TestGateMR4' 2>&1 | grep -q '^ok' || { echo "--- FAIL: §MR-4A/4B 风控闸回归未过"; exit 1; }
-go test -count=1 ./internal/store/ -run 'TestMR4|TestMR4BFunding' 2>&1 | grep -q '^ok' || { echo "--- FAIL: §MR-4 账本/资金费回归未过"; exit 1; }
-go test -count=1 ./internal/data/ -run 'TestScoreXEvent|TestParseSentimentJSON|TestXEventScorer|TestXEventLLMClient' 2>&1 | grep -q '^ok' || { echo "--- FAIL: §战法批-3 事件打分器回归未过"; exit 1; }
-go test -count=1 ./internal/data/ -run 'TestEdgarTicker|TestEdgarPaddedCIKKey' 2>&1 | grep -q '^ok' || { echo "--- FAIL: §MR-EDGAR-TKR CIK→ticker 映射回归未过"; exit 1; }
-go test -count=1 ./internal/strategies/xasset/ -run 'Bear' 2>&1 | grep -q '^ok' || { echo "--- FAIL: §战法批-3 xasset 空头腿回归未过"; exit 1; }
+go_run_gate internal/risk 'TestGateMR4' '§MR-4A/4B 风控闸回归未过'
+go_run_gate internal/store 'TestMR4|TestMR4BFunding' '§MR-4 账本/资金费回归未过'
+go_run_gate internal/data 'TestScoreXEvent|TestParseSentimentJSON|TestXEventScorer|TestXEventLLMClient' '§战法批-3 事件打分器回归未过'
+go_run_gate internal/data 'TestEdgarTicker|TestEdgarPaddedCIKKey' '§MR-EDGAR-TKR CIK→ticker 映射回归未过'
+go_run_gate internal/strategies/xasset 'Bear' '§战法批-3 xasset 空头腿回归未过'
 # ---- 行为锁⑥：§战法批-5 状态端点 dispatch 节（缺省省略/形状/按账号）----
-go test -count=1 ./internal/server/ -run 'TestBinanceStateDispatch' 2>&1 | grep -q '^ok' || { echo "--- FAIL: §战法批-5 dispatch 节回归未过"; exit 1; }
+go_run_gate internal/server 'TestBinanceStateDispatch' '§战法批-5 dispatch 节回归未过'
 # ---- 静态锁：§CN-MASTER 装配门五处包裹 + 币安节拍不在门内（红线）----
 grep -q 'cnEnabled := cfgMgr.Rules.CN.Enabled' cmd/quant/main.go || { echo "--- FAIL: §CN-MASTER boot 快照丢失"; exit 1; }
 grep -q 'srv.SetCNMaster(cnEnabled)' cmd/quant/main.go || { echo "--- FAIL: §CN-MASTER 旗标未注入 server"; exit 1; }
@@ -1586,10 +1609,10 @@ echo "==> 63 §市场分家-1：顶部市场切换全局生效 + /api/binance/qu
 # 附带实锤修复：币安真实帧的 "e"（事件名字符串）被 Go json 大小写不敏感回退灌进
 # struct 的 int64 E 字段 → miniTicker/ticker 每帧解析失败（订阅成功、永远 0 命中）。
 # ---- 行为锁①：§市场分家-1 现价源三态（feed 命中/REST 兜底+TTL/诚实失败）+ market 闸 ----
-go test -count=1 ./internal/engine/ -run 'TestQuoteSource|TestEngineQuote' 2>&1 | grep -q '^ok' || { echo "--- FAIL: §市场分家-1 现价源回归未过"; exit 1; }
-go test -count=1 ./internal/server/ -run 'TestQuoteEndpoint' 2>&1 | grep -q '^ok' || { echo "--- FAIL: §市场分家-1 /api/binance/quote 端点回归未过"; exit 1; }
+go_run_gate internal/engine 'TestQuoteSource|TestEngineQuote' '§市场分家-1 现价源回归未过'
+go_run_gate internal/server 'TestQuoteEndpoint' '§市场分家-1 /api/binance/quote 端点回归未过'
 # 行为锁②：币安现货帧解析回归（真 "e" 字段帧必须可解——回归即整链 0 命中复辟）
-go test -count=1 ./internal/data/ -run 'TestParseSpot' 2>&1 | grep -q '^ok' || { echo "--- FAIL: §市场分家-1 现货帧解析回归未过"; exit 1; }
+go_run_gate internal/data 'TestParseSpot' '§市场分家-1 现货帧解析回归未过'
 # 行为锁③：前端全局过滤 8 例（面板代码识别/四页 tab 门/自选添加入口拒收/抽屉现价腿双向互斥）
 ( cd web && npx vitest run src/__tests__/mkt_split_p1.test.jsx >/dev/null 2>&1 ) || { echo "--- FAIL: §市场分家-1 前端市场过滤 vitest 未通过"; exit 1; }
 # ---- 静态锁：后端接线三点 + 碰撞吸收字段 ----
@@ -1618,7 +1641,7 @@ echo "==> 64 §DISCIPLINE 延持态终态失明止血 + 重评估非对称守卫
 # 价格继续跌破更深一档线也视而不见 = 终态失明（该走的仓位永远不走，资金级漏卖）。
 # 修法：延持态每轮重评估，出卡需「本轮仍破线且不轻于原始锁定线」（reevalAllowsSettle）；
 # 反向情形（止损延持后反弹进止盈区）一律不收卡，避免把失明换成「按反弹后的止盈价挂止损标签卖」。
-go test -count=1 ./internal/trading/ -run 'TestDiscipline' 2>&1 | grep -q '^ok' || { echo "--- FAIL: §P0-C 纪律引擎回归未过（含对称行为锁 3 例）"; exit 1; }
+go_run_gate internal/trading 'TestDiscipline' '§P0-C 纪律引擎回归未过（含对称行为锁 3 例）'
 grep -q 'func reevalAllowsSettle(' internal/trading/discipline.go || { echo "--- FAIL: §P0-C 重评估准入判据丢失"; exit 1; }
 grep -q 'if extendHold && !reevalAllowsSettle(st.Line, line)' internal/trading/discipline.go || { echo "--- FAIL: §P0-C 准入判据未被调用（定义了个寂寞）"; exit 1; }
 grep -q 'func isLossLine(' internal/trading/discipline.go || { echo "--- FAIL: §P0-C 损失族判定丢失（止盈延持跌进损失线无法识别）"; exit 1; }
@@ -1710,7 +1733,7 @@ echo "==> 67 §NOTIFYADMIN 全局推送探测端点抬档 + 频控（抄母仓 �
 # 但档位仍挂在普通登录态下 ⇒ 任何登录成员一次 POST 就能向 owner 的全部推送通道发实弹，
 # 用噪声淹没真告警（告警通道本身成为攻击面）。修法：抬 adminMiddleware + 全进程 60s 最小间隔
 # （探测打的是 server 级单例通道，按账号限流挡不住多管理员合流）+ 全路径 opslog 审计。
-go test -count=1 ./internal/server/ -run 'TestNotifyTestAdminOnlyAndRateLimited' 2>&1 | grep -q '^ok' || { echo "--- FAIL: §N-2 notify-test 行为锁未过（成员 403/首击 200/二击 429）"; exit 1; }
+go_run_gate internal/server 'TestNotifyTestAdminOnlyAndRateLimited' '§N-2 notify-test 行为锁未过（成员 403/首击 200/二击 429）'
 grep -q '"POST /api/notify-test", s.adminMiddleware' internal/server/server.go || { echo "--- FAIL: §N-2 notify-test 抬档丢失（成员可轰炸 owner 推送通道）"; exit 1; }
 if grep -q '"POST /api/notify-test", s.authMiddleware' internal/server/server.go; then
   echo "--- FAIL: §N-2 notify-test 又回退 authMiddleware"; exit 1; fi
@@ -2529,6 +2552,27 @@ if ! go test ./internal/server -run 'TestRoutePermsGolden|TestExecuteDeviationGa
 if ! ( cd web && npx vitest run src/__tests__/d1_price_deviation_confirm.test.jsx >/dev/null 2>&1 ); then
 	echo "--- FAIL: §D1 偏离二次确认组件用例红（弹窗分流/confirm_deviation 重发/普通错误不误弹）"; exit 1; fi
 echo "ok - §AUDITFIX926 专项守卫通过（行为锁 5 组 + 静态/正负锁 30 道）"
+
+echo "==> 80 §GATEFIX927 门禁假绿根治（go_run_gate 单源出口 + 反证锁，2026-09-27）..."
+# 审计 P0 #1 根治的验收段。旧形态「-run 过滤后 grep 输出里的 ok 字样」23 处已全部迁移到
+# go_run_gate（空跑/改名/删除测试都会判红，见帮助函数注释三条件）。
+# 负锁：列首起手的旧形态行必须为 0。三层过滤全部作用于「^go test」锚定的行流——本锁语句行
+# 自身以 legacy= 起手、永远进不了第一层输出，天然免疫自指（§89 自指锁教训的另一种解法：
+# 不洗模式串，而是把匹配面收窄到列首）。已知边界：若有人把旧形态写在缩进/if 内会漏过本锁，
+# 由下方反证锁第一腿兜语义——helper 单源出口对不存在测试名必须判红，红不了才是真塌方。
+legacy=$(grep '^go test' scripts/verify_changes.sh | grep -- '-run' | grep -F "grep -q '^ok'" | wc -l | tr -d ' ' || true)
+if [ "${legacy:-0}" -ne 0 ]; then
+	echo "--- FAIL: §GATEFIX927 旧假绿门禁形态复活（列首命中 $legacy 行）"; exit 1; fi
+# 正锁：迁移后的调用必须仍走单源出口且不少于 23 处（防半截迁移/整段被顺手删空）。
+calls=$(grep -c '^go_run_gate ' scripts/verify_changes.sh || true)
+if [ "${calls:-0}" -lt 23 ]; then
+	echo "--- FAIL: §GATEFIX927 go_run_gate 调用数 $calls < 23（-run 门禁未全量走单源出口）"; exit 1; fi
+# 反证锁第一腿（对锁自身的反证）：不存在的测试名必须判红。子壳里跑，exit 1 不外溢主流程。
+if ( go_run_gate internal/config 'TestZzzGATEFIX927counterfalsum' '§反证用-必须红' >/dev/null 2>&1 ); then
+	echo "--- FAIL: §GATEFIX927 反证锁塌方：go_run_gate 对不存在测试名判了绿（根治失效）"; exit 1; fi
+# 反证锁第二腿：真实测试名必须判绿，防 helper 恒红误伤全部 23 道锁。缩进书写，不进 ^ 计数。
+	go_run_gate internal/config 'TestCNMaster' '§GATEFIX927 helper 正例（TestCNMaster 必须绿）'
+echo "ok - §GATEFIX927 门禁假绿根治通过（旧形态 0 行 + 单源调用 $calls 处 + 反证双腿合拢）"
 
 echo ""
 echo "==> 全部通过"
