@@ -13,6 +13,8 @@
 #   LLM_API_URL       LLM API 地址（可选，默认 https://api.siliconflow.cn/v1/chat/completions）
 #   LLM_MODEL         LLM 模型名（可选，默认 THUDM/GLM-Z1-9B-0414）
 #   HITHINK_FINANCE_API_KEY  同花顺数据密钥（可选，§ENH-0：交易日历/行情主源，强烈建议提供）
+#   SETUP_TOKEN       初始化令牌（§UATFIX929-M2：无需传入——远端缺值时自动生成一次并打印留档，
+#                     已有值跨整文件覆盖保旧不轮换；server 侧守卫见 server.go:1289）
 #   OPS_WATCHDOG      1=装载看门狗每分钟 cron（默认 0=不装，脚本仍上传待用）
 #   OPS_BACKUP        1=装载每日备份 cron（默认 0；快照落 $QUANT_DATA_DIR/backups）
 #   HEALTHCHECK_URL / ALERT_WEBHOOK  看门狗心跳与告警出口（任一给出才有意义，空=只写本机日志）
@@ -175,6 +177,27 @@ EOF
 else
     echo "      LLM/hithink key 均未提供，保留服务器现有 /etc/quant.env（云端后台配置）"
 fi
+
+# ── §UATFIX929-M2 初始化令牌（SETUP_TOKEN）接线 ──
+# 缺陷原文：server.go:1289 守卫是「环境变量非空才比对」，部署面从不写这个变量＝守卫空转；
+#   公网首机未初始化期间 POST /setup 先到先得当管理员（频控 5/min 只防刷、不防抢跑）。
+# 为何先捞回再补写：上方 [4/8] 的 tee 是**整文件覆盖**，若只是无脑追加，下次部署会
+#   「覆盖抹掉→再生成」——运维记下的令牌每轮失效（轮换取钥虽非安全洞，属运维混乱，禁止）。
+# 口径：存在保旧值（与 §N8 qmt-mock.env 幂等一致）；缺失才生成一次、打印一次。
+SETUP_OLD=$($SSH "sudo grep -m1 '^SETUP_TOKEN=' /etc/quant.env 2>/dev/null || true" || true)
+if [ -n "$SETUP_OLD" ]; then
+    if [ -n "$ENV_CONTENT" ]; then
+        # 整文件覆盖刚把它抹掉，原样放回（不打印、不再生成）
+        $SSH "echo ${SETUP_OLD} | sudo tee -a /etc/quant.env >/dev/null"
+    fi
+    echo "      SETUP_TOKEN 已存在，保持旧值（§UATFIX929：生成后永不轮换）"
+else
+    SETUP_NEW=$(openssl rand -hex 16)
+    $SSH "echo SETUP_TOKEN=${SETUP_NEW} | sudo tee -a /etc/quant.env >/dev/null"
+    echo "      §UATFIX929 初始化令牌已生成（仅此次打印，请留档）：SETUP_TOKEN=${SETUP_NEW}"
+    echo "      首个管理员注册时携带 setup_token=${SETUP_NEW}；端点关闭后此令牌仅备用"
+fi
+$SSH "sudo chmod 600 /etc/quant.env"
 
 # ── 5. 域名占位符替换 + 安装 Caddy ──
 echo "[5/8] 前端构建上传 + 配置 Caddy ($SERVER_DOMAIN)..."

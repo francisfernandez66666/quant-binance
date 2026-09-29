@@ -43,6 +43,14 @@ api()  { curl --noproxy '*' -fsS "$@"; }
 # ── stop：结束后台进程 ──────────────────────────────────────────────────────
 if [[ "$MODE" == "stop" ]]; then
   [[ -d "$PIDDIR" ]] || { log "无自举记录（$PIDDIR 不存在），无需停止"; exit 0; }
+  # §UATFIX929-M5：stop 的端口以**起栈时的落盘记录**为准（up 阶段写 ports.env）。旧实现只吃
+  # 环境变量——up 用 UAT_FRONT_PORT=6173 起栈、stop 裸调时 FRONT_PORT 回落默认 5173，
+  # 下方 §VITE-ORPHAN 补杀模式的端口段永远对不上真实孤儿（09-29 审计 6173/5174 两次残留
+  # 需手工按 pid 杀，即此因；argv 形态实测仍是 .bin/vite，非 realpath 漂移）。
+  if [[ -f "$PIDDIR/ports.env" ]]; then
+    # shellcheck disable=SC1091  # 本脚本 up 阶段自写自读的端口记录，非外部配置
+    . "$PIDDIR/ports.env"
+  fi
   for name in engine mock vite; do
     pf="$PIDDIR/$name.pid"
     if [[ -f "$pf" ]]; then
@@ -66,11 +74,41 @@ if [[ "$MODE" == "stop" ]]; then
   pkill -f -- "$ROOT/web/node_modules/\.bin/vite --port ${FRONT_PORT}( |$)" 2>/dev/null || true
   pkill -f -- "$PIDDIR/quant" 2>/dev/null || true
   pkill -f -- "$PIDDIR/qmt-mock" 2>/dev/null || true
-  exit 0
+  # §UATFIX929-M5 端口归零自证：补杀后三端口必须无监听——仍被**本仓库 argv** 的残留按 pid 复杀
+  # （只圈 $ROOT，跨检出进程绝不碰，§PICKILL-SCOPE 铁律）；归零不了就判红，不再"口头停止成功"。
+  stop_rc=0
+  for p in "$BACKEND_PORT" "$FRONT_PORT" "$MOCK_PORT"; do
+    cleared=0
+    for i in 1 2 3; do
+      left="$(lsof -tiTCP:"$p" -sTCP:LISTEN 2>/dev/null || true)"
+      if [[ -z "$left" ]]; then cleared=1; break; fi
+      for pid in $left; do
+        if ps -o command= -p "$pid" 2>/dev/null | grep -qF -- "$ROOT"; then
+          kill "$pid" 2>/dev/null || true
+        fi
+      done
+      sleep 1
+    done
+    if [[ "$cleared" -ne 1 ]]; then
+      echo "[uat-boot:ERR] 端口 $p 停止后仍被监听（残留 pid: $(lsof -tiTCP:"$p" -sTCP:LISTEN 2>/dev/null | tr '\n' ' ')；非本仓库进程不代杀）" >&2
+      stop_rc=1
+    fi
+  done
+  rm -f "$PIDDIR/ports.env"
+  if [[ "$stop_rc" -ne 0 ]]; then
+    echo "--- FAIL: §UATFIX929-M5 端口归零自证未过（stop 不得宣称成功而留孤儿）" >&2
+  fi
+  exit "$stop_rc"
 fi
 
 # ── env：只打印环境变量 ─────────────────────────────────────────────────────
 if [[ "$MODE" == "env" ]]; then
+  # §UATFIX929-M5 同口径：env 打印也优先吃起栈落盘记录——否则 up 用非默认端口、env 裸调
+  # 会打印默认端口的导出语句，照抄即假连（与 stop 同族的"记录≠环境"漂移）。
+  if [[ -f "$PIDDIR/ports.env" ]]; then
+    # shellcheck disable=SC1091  # up 阶段自写自读的端口记录
+    . "$PIDDIR/ports.env"
+  fi
   # §3.1-1：E2E_QUOTE_SOURCE = 本次自举注入 mock 的行情源名（up 阶段落盘的文件）；
   # 消费方（web/e2e/uat_full.spec.mjs）据此判定「盘内形态是否已注入」，注入在场时
   # /api/status.quote_source 必须非空且命中 golden 枚举——空=旧盘外形态，只跑宽松断言。
@@ -104,6 +142,13 @@ command -v "$PY" >/dev/null || die "缺 ${PY}（seed 脚本依赖）"
 log "数据目录：$DATA_DIR"
 rm -rf "$DATA_DIR"
 mkdir -p "$DATA_DIR" "$PIDDIR"
+# §UATFIX929-M5：本次起栈实际采用的端口落盘——stop 阶段以该记录为准做补杀与端口归零自证
+# （环境变量只在无记录的裸 stop 时充当回退值）。写在 rm -rf 之后、任何拉起之前，崩溃也不留旧值。
+cat > "$PIDDIR/ports.env" <<EOF
+BACKEND_PORT=$BACKEND_PORT
+FRONT_PORT=$FRONT_PORT
+MOCK_PORT=$MOCK_PORT
+EOF
 
 log "构建 quant 引擎与 qmt-mock 假柜台..."
 # §F6（2026-09-22）：与生产部署同款式注入 git 指纹（deploy_seoul.sh 步[1/8]

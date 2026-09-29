@@ -32,6 +32,9 @@
 #       N10 端点权限矩阵 golden/D1 价格偏离二次确认双腿，见 79）
 #   + 2026-09-27 §GATEFIX927 门禁假绿根治（审计 P0 #1：23 处 -run 门禁迁 go_run_gate 单源出口
 #       + 第 80 段反证锁；同日审计复核勘误见 docs/FIX_PLAN_20260927.md，见 80）
+#   + 2026-09-29 §UATFIX929 全量审计施工批（M1 捕获式假绿 3 处迁单源+共现锁反证 / M2 SETUP_TOKEN
+#       接线锁 / M3 state 披露键双源锁 / M4-lite mock 保真锁 / M5 ports.env 落盘锁 / M6 死壳零复活锁，
+#       方案 docs/FIX_PLAN_UAT929.md，见 81）
 # ...盘链路渲染行为锁，见 75）
 # ...
 # §全链路 UAT 修复批（2026-09-18 §UAT_FULLCHAIN_VERIFY）专项（见 11/11）：
@@ -1766,9 +1769,12 @@ if [ "$(go test -count=1 ./internal/metrics/ -run 'TestPushRule|TestResolved|Tes
   echo "--- FAIL: §高-3 出站行为锁跑到 8 例以下（-run 过滤器打空=恒绿，先确认用例名）"; exit 1; fi
 # -race 锁：先落变量再判定（直接 `go test | grep -q` 时 grep 提前退场会让上游吃 SIGPIPE，
 # 在 set -o pipefail 下变成恒失败——本段实跑就是这样假红过一次）。
-race_out=$(go test -race -count=1 ./internal/metrics/ 2>&1 || true)
-printf '%s\n' "$race_out" | grep -q '^ok' \
-  || { echo "--- FAIL: §高-3 §ALERTDRIVE 并发/竞态锁未过（-race）"; exit 1; }
+# §UATFIX929：同 g_race 腿口径堵「测试整删→ok [no test files]」假绿洞（退出码+no test files 双判红）。
+rc_ro=0
+race_out=$(go test -race -count=1 ./internal/metrics/ 2>&1) || rc_ro=$?
+if [ "$rc_ro" -ne 0 ] || printf '%s\n' "$race_out" | grep -q '\[no test files\]'; then
+	printf '%s\n' "$race_out" | tail -10
+	echo "--- FAIL: §高-3 §ALERTDRIVE 并发/竞态锁未过（rc=${rc_ro}，-race；测试被整删时输出 ok [no test files] 同样判红）"; exit 1; fi
 grep -q 'func DefaultAlertRouting()' internal/metrics/alert_routing.go \
   || { echo "--- FAIL: 默认路由表丢失（规则无出口=评估了但没人知道）"; exit 1; }
 grep -q 'metrics.SetAlertSink(' cmd/quant/main.go \
@@ -1810,9 +1816,7 @@ echo "==> 69 §DEADGAUGE 死规则通用守卫：每条规则量规都要有赋�
 #         三方对账三类差异条数之和、scoring_loop 用 llm.Client.KeysInCooldown）；
 #       ② 通用守卫：从规则表反解全部 Metric 名，逐条要求非测试代码里存在 SetGauge("<名>") 赋值点；
 #       ③ 负锁锁住三个已知假绿形态。
-g_trading=$(go test -count=1 ./internal/trading/ -run 'TestSettleDayFeedsDiffGauge|TestSettleDaySkipBranchesWriteZero' 2>&1 || true)
-printf '%s\n' "$g_trading" | grep -q '^ok' \
-  || { echo "--- FAIL: §DEADGAUGE 交割差异量规行为锁未过"; exit 1; }
+go_run_gate internal/trading 'TestSettleDayFeedsDiffGauge|TestSettleDaySkipBranchesWriteZero' '§DEADGAUGE 交割差异量规行为锁（§UATFIX929 捕获式形态迁移）'
 if [ "$(go test -count=1 ./internal/metrics/ -run 'TestOrderFailRate|TestRunAlertEvaluationRefreshesDerivedGauge' -v 2>&1 | grep -c '^--- PASS')" -lt 5 ]; then
   echo "--- FAIL: §DEADGAUGE 下单失败率窗口换算行为锁<5 例"; exit 1; fi
 if [ "$(go test -count=1 ./internal/llm/ -run 'TestKeysInCooldown' -v 2>&1 | grep -c '^--- PASS')" -lt 2 ]; then
@@ -1871,12 +1875,15 @@ echo "==> 70 §CFGSMASH 战法参数保存：稀疏 merge + 版本冲突 409 +  
 # 另：GetStrategyConfig 返回内部指针、Set 系无锁写，与打分/热更新并发（-race 可复现）。
 # 修法：逐字段 JSON 递归稀疏 merge（没传=保留旧值，要清 0 请明写 0）+ updated_at 乐观锁 409
 # + 全部 getter 改快照拷贝、setter 加锁 + 前端三态加载（缺失渲空并保存前必填校验）。
-g_cfg=$(go test -count=1 ./internal/config/ -run 'TestMergeStrategyConfig|TestSetStrategyConfig|TestStrategyConfigSaveWhileScoringRace' 2>&1 || true)
-printf '%s\n' "$g_cfg" | grep -q '^ok' || { echo "--- FAIL: §N-4 稀疏 merge/乐观锁/并发行为锁未过"; exit 1; }
-g_race=$(go test -race -count=1 ./internal/config/ 2>&1 || true)
-printf '%s\n' "$g_race" | grep -q '^ok' || { echo "--- FAIL: §CFGSMASH-concurrency -race 未过（getter 又回退成别名活体）"; exit 1; }
-g_srv=$(go test -count=1 ./internal/server/ -run 'TestSetStrategyConfig' 2>&1 || true)
-printf '%s\n' "$g_srv" | grep -q '^ok' || { echo "--- FAIL: §N-4 端点级行为锁未过（部分键保存/409/坏结构 400）"; exit 1; }
+go_run_gate internal/config 'TestMergeStrategyConfig|TestSetStrategyConfig|TestStrategyConfigSaveWhileScoringRace' '§N-4 稀疏 merge/乐观锁/并发行为锁（§UATFIX929 捕获式形态迁移）'
+# §UATFIX929：-race 包级锁无 -run，但同样堵「测试整删→ok [no test files]」假绿洞：
+# 退出码判红 + no test files 判红（旧写法只 grep '^ok'，整包测试被删时照样喂出绿字）。
+rc_g=0
+g_race=$(go test -race -count=1 ./internal/config/ 2>&1) || rc_g=$?
+if [ "$rc_g" -ne 0 ] || printf '%s\n' "$g_race" | grep -q '\[no test files\]'; then
+	printf '%s\n' "$g_race" | tail -10
+	echo "--- FAIL: §CFGSMASH-concurrency -race 未过（rc=${rc_g}；getter 又回退成别名活体，或测试被整删输出 ok [no test files] 同样判红）"; exit 1; fi
+go_run_gate internal/server 'TestSetStrategyConfig' '§N-4 端点级行为锁（部分键保存/409/坏结构 400，§UATFIX929 捕获式形态迁移）'
 ( cd web && npx vitest run src/__tests__/n4_cfg_smash.test.jsx >/dev/null 2>&1 ) \
   || { echo "--- FAIL: §N-4 前端三态加载/409 冲突锁未过（E1/E3/E4 之一失效）"; exit 1; }
 grep -q 'func (m \*Manager) MergeStrategyConfig(patch map\[string\]json.RawMessage' internal/config/config.go \
@@ -2563,16 +2570,77 @@ echo "==> 80 §GATEFIX927 门禁假绿根治（go_run_gate 单源出口 + 反证
 legacy=$(grep '^go test' scripts/verify_changes.sh | grep -- '-run' | grep -F "grep -q '^ok'" | wc -l | tr -d ' ' || true)
 if [ "${legacy:-0}" -ne 0 ]; then
 	echo "--- FAIL: §GATEFIX927 旧假绿门禁形态复活（列首命中 $legacy 行）"; exit 1; fi
-# 正锁：迁移后的调用必须仍走单源出口且不少于 23 处（防半截迁移/整段被顺手删空）。
+# 正锁：迁移后的调用必须仍走单源出口且不少于 26 处（防半截迁移/整段被顺手删空）。
+# §UATFIX929（2026-09-29）：本批把 §GATEFIX927 圈定口径漏掉的 3 处「捕获式」旧形态
+# （`g_xxx=$(go test -run …)` + 次行 `grep -q '^ok'`，列首锚定扫描天然数不到它们）也迁到
+# 单源出口，23→26；另有两处无 -run 的 -race 包级锁就地加 [no test files] 判红腿。
+# §UATFIX929 追加：段 81 又新增 2 处行为锁调用（M3 state 披露键 / M4 mock 保真），26→28——
+# 本下限同时钉住段 81 两条 go_run_gate 腿不被整删（删一条即 27 < 28 判红）。
 calls=$(grep -c '^go_run_gate ' scripts/verify_changes.sh || true)
-if [ "${calls:-0}" -lt 23 ]; then
-	echo "--- FAIL: §GATEFIX927 go_run_gate 调用数 $calls < 23（-run 门禁未全量走单源出口）"; exit 1; fi
+if [ "${calls:-0}" -lt 28 ]; then
+	echo "--- FAIL: §GATEFIX927 go_run_gate 调用数 ${calls} < 28（-run 门禁未全量走单源出口）"; exit 1; fi
 # 反证锁第一腿（对锁自身的反证）：不存在的测试名必须判红。子壳里跑，exit 1 不外溢主流程。
 if ( go_run_gate internal/config 'TestZzzGATEFIX927counterfalsum' '§反证用-必须红' >/dev/null 2>&1 ); then
 	echo "--- FAIL: §GATEFIX927 反证锁塌方：go_run_gate 对不存在测试名判了绿（根治失效）"; exit 1; fi
 # 反证锁第二腿：真实测试名必须判绿，防 helper 恒红误伤全部 23 道锁。缩进书写，不进 ^ 计数。
 	go_run_gate internal/config 'TestCNMaster' '§GATEFIX927 helper 正例（TestCNMaster 必须绿）'
 echo "ok - §GATEFIX927 门禁假绿根治通过（旧形态 0 行 + 单源调用 $calls 处 + 反证双腿合拢）"
+
+echo "==> 81 §UATFIX929 全量审计施工批守卫（M1 共现锁+反证 / M2 M5 M6 静态锁 / M3 M4 行为锁，2026-09-29）..."
+# ── M1 共现锁（§GATEFIX927 防回潮锁的补盲腿）──────────────────────────────
+# 背景：段 80 负锁锚定「列首 go test 起手」，多行捕获形态 `xx=$(go test -run …)` +
+# 邻行 `grep -q '^ok'` 天然逃逸（本批迁移的 3 处正是漏网之鱼，见 :2571 注）。
+# 本锁按「相邻两行状态机」共现计数：列首赋值式捕获 -run 过滤的 go test 后，紧接一行
+# 出现 grep -q '^ok'（任意引号形态）记一次。预演读数：现脚本=0；植入旧形态必=1；
+# 无 -run 的捕获（整包测试）不计数——口径只钉 -run 假绿，不误伤合法整包写法。
+co=$(awk '/^[A-Za-z_][A-Za-z0-9_]*=\$\(go test/{cap=($0 ~ /-run/); next} /grep -q .\^ok/{if(cap)n++; cap=0} {cap=0} END{print n+0}' scripts/verify_changes.sh || true)
+if [ "${co:-0}" -ne 0 ]; then
+	echo "--- FAIL: §UATFIX929-M1 捕获式假绿形态共现 ${co} 处（必须 0，带 -run 的判定只准走 go_run_gate 单源出口）"; exit 1; fi
+# M1 反证锁：把旧形态原样植入临时文件，检测器必须报 1——反证不红说明共现锁是空枪自嗨。
+# 植入行以缩进+引号起手：段 80 与本锁的规则 1 都锚定列首字母，自指天然不命中（§89 教训变体）。
+cf=$(mktemp)
+printf '%s\n' \
+	'g_fake=$(go test -run TestNoSuchUATFIX929Probe ./internal/config/ 2>&1)' \
+	'if ! printf "%s\n" "$g_fake" | grep -q "^ok"; then :; fi' > "$cf"
+cf_hits=$(awk '/^[A-Za-z_][A-Za-z0-9_]*=\$\(go test/{cap=($0 ~ /-run/); next} /grep -q .\^ok/{if(cap)n++; cap=0} {cap=0} END{print n+0}' "$cf" || true)
+rm -f "$cf"
+if [ "${cf_hits:-0}" -ne 1 ]; then
+	echo "--- FAIL: §UATFIX929-M1 反证塌方：植入旧形态检测=${cf_hits}（应恰 1，awk 状态机失效）"; exit 1; fi
+# ── M2 部署面 SETUP_TOKEN 接线静态锁（三道：总量 / 生成腿 / 保旧腿）─────────
+# 背景：审计 P1-B——代码守卫在位但部署脚本零接线，公网首机上线前 /setup 先到先得。
+# 本批生成腿落地（缺值随机生成一次），保旧腿防每次部署整轮换令牌（[4/8] tee 是整文件覆写）。
+st=$(grep -c 'SETUP_TOKEN' scripts/deploy_seoul.sh || true)
+if [ "${st:-0}" -lt 4 ]; then
+	echo "--- FAIL: §UATFIX929-M2 部署脚本 SETUP_TOKEN 接线数 ${st:-0} < 4（生成腿被删或退回零接线）"; exit 1; fi
+if ! grep -q 'openssl rand -hex 16' scripts/deploy_seoul.sh; then
+	echo "--- FAIL: §UATFIX929-M2 随机令牌生成腿缺失（公网抢跑窗口重新打开）"; exit 1; fi
+if ! grep -q 'SETUP_OLD' scripts/deploy_seoul.sh; then
+	echo "--- FAIL: §UATFIX929-M2 保旧令牌分支缺失（再部署即整轮换，端点关闭前旧令牌作废）"; exit 1; fi
+# ── M3 行为锁：state 面披露签署键后端单源 + 前端卡片渲染双腿 ────────────────
+# 背景：审计 P2-C——卡片读 state 不存在的键，state 正常时恒显「未签署」（坏得越对）。
+# 后端锁 TestUATFIX929StateDisclaimer 两用例（signed 值等 config 面逐字节 / 未签也必发键）；
+# 前端 vitest 锁渲染优先级（state 有值不回落 config）。
+go_run_gate internal/server 'TestUATFIX929StateDisclaimer' '§UATFIX929-C state 面披露签署键行为锁'
+if ! ( cd web && npx vitest run src/__tests__/uatfix929_card_disclaimer.test.jsx >/dev/null 2>&1 ); then
+	echo "--- FAIL: §UATFIX929-C 币安状态卡披露签署组件用例红（state 优先渲染/空值显未签署）"; exit 1; fi
+# ── M4-lite 行为锁：模拟柜台保真五修 + 撤单终态码值 ─────────────────────────
+# 背景：审计 P2-E 保真差中「马上能改」的五条（cancel 409 / broker_mode / feed_age_sec /
+# 结算日期数字校验 / Bearer 常量时间比对），TestUATFIX929 五用例逐条钉 mock==网关口径。
+go_run_gate cmd/qmt-mock 'TestUATFIX929|TestMockCancelTerminalCodes' '§UATFIX929-M4 mock 保真五用例+撤单码值行为锁'
+# ── M5 静态锁：起栈端口落盘 ports.env（裸 stop 端口漂移根因）────────────────
+# 背景：stop/env 旧版从环境变量回退读端口（默认 5173），up 用 6173 起栈时 6173 孤儿杀不到
+# （09-29 两次实锤）。本批 up 落盘、stop/env 回灌，冒烟实测裸 stop 三端口归零。
+pe=$(grep -c 'ports.env' scripts/uat_bootstrap.sh || true)
+if [ "${pe:-0}" -lt 6 ]; then
+	echo "--- FAIL: §UATFIX929-M5 bootstrap ports.env 落盘接线数 ${pe:-0} < 6（裸 stop 端口漂移根因复活）"; exit 1; fi
+# ── M6 防复活锁：死循环壳 RunScoringLoop 全仓零调用/零声明 ──────────────────
+# 背景：main.go 调度统一走 RunScoringLoopOnce（外层 5s tick 驱动），自带 ticker 的导出壳是
+# 死入口；复活即同轮双 scoreCycle（重复分发/重复下单风险面）。模式串含左括号，天然排除
+# RunScoringLoopOnce( 的匹配；本锁语句行只存在于本 .sh，不在 internal/cmd 扫描面内。
+rsl=$(grep -rn 'RunScoringLoop(' internal cmd --include='*.go' | wc -l | tr -d ' ' || true)
+if [ "${rsl:-0}" -ne 0 ]; then
+	echo "--- FAIL: §UATFIX929-G 死循环壳复活：RunScoringLoop 调用/声明计 ${rsl}（必须 0，调度只走 RunScoringLoopOnce）"; exit 1; fi
+echo "ok - §UATFIX929 施工批守卫通过（M1 共现 0+反证 1 / M2 三道 / M3 双源 / M4 六用例 / M5 落盘 / M6 零复活）"
 
 echo ""
 echo "==> 全部通过"

@@ -1612,7 +1612,9 @@ func (e *Engine) autoPlace(sig combat_agent.Signal, live map[string]*data.StockI
 	}
 }
 
-// StartBuyDispatcher §A+B 启动异步下单 worker 池（事件驱动热路径）。在 RunScoringLoop 启动时调用一次。
+// StartBuyDispatcher §A+B 启动异步下单 worker 池（事件驱动热路径）。在 RunScoringLoopOnce 启动时调用一次。
+// §UATFIX929-G 勘误：旧注释写"RunScoringLoop 启动时"——该死导出已删，真实调用点是 RunScoringLoopOnce
+// 首行的幂等 StartBuyDispatcher(4)。
 // §M11（2026-09-22 修复批）：启动时先恢复上次停机落盘的排队买单（SignalID 去重后重新入队），
 // 修复旧行为——buyCh 是 64 槽纯内存队列，停机时已排队未消费的买单随重启蒸发、当日无人重放。
 // English: A+B — starts the async order worker pool; §M11 restores the shutdown-drained queue first.

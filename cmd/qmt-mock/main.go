@@ -22,6 +22,7 @@ package main
 
 import (
 	"bytes"
+	"crypto/subtle"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -492,11 +493,21 @@ func buildHandler(b *book, token string, delay time.Duration, push func(map[stri
 			})
 		}
 		b.mu.Unlock()
+		// §UATFIX929-E④：broker_mode 与 /health 同源（真网关 _do_state gateway.py:1470 亦发）——
+		// Go 侧 GatewayState.BrokerMode 本就解析该键（qmt_client.go:291），旧 mock 缺键导致
+		// 观察面在 UAT 栈恒空。取锁内快照，与 activeBroker 切换互斥一致。
+		b.mu.Lock()
+		ab := b.activeBroker
+		b.mu.Unlock()
+		if ab == "" {
+			ab = "xt"
+		}
 		writeJSON(w, map[string]interface{}{
-			"connected": true,
-			"account":   b.account,
-			"positions": b.snapshotPositions(),
-			"orders":    orders,
+			"connected":   true,
+			"account":     b.account,
+			"positions":   b.snapshotPositions(),
+			"orders":      orders,
+			"broker_mode": ab,
 		})
 	})
 
@@ -548,7 +559,10 @@ func buildHandler(b *book, token string, delay time.Duration, push func(map[stri
 				"tickTime":  nowMs,
 			}
 		}
-		out := map[string]interface{}{"ok": true, "ticks": ticks, "feed_connected": true}
+		// §UATFIX929-E⑤：feed_age_sec 对齐真网关 _do_quotes（gateway.py:973/993 恒发）——
+		// mock tick 即时合成、无真实 feed 通道，固定 0 表示「零秒前刚更新」；Go 侧
+		// qmt_feed 不解析该键（纯观察字段），加键零行为变化，只为消除保真差。
+		out := map[string]interface{}{"ok": true, "ticks": ticks, "feed_connected": true, "feed_age_sec": 0}
 		// §3.1-1：注入 quote_source 时顶层回显同名观察字段（实网关无此字段、Go 侧 QMTTick 亦不解析，
 		// 故仅在显式注入时出现——E2E 用它把「mock 侧注入的行情源名」与 golden 枚举对齐做硬断言）。
 		if b.quoteSource != "" {
@@ -724,7 +738,11 @@ func buildHandler(b *book, token string, delay time.Duration, push func(map[stri
 	// 此前 mock 404，Go 侧 SettleDay 的 e2e 只能靠 stub；现在全链路结算对账可在 mock 下回归。
 	mux.HandleFunc("/settlement", func(w http.ResponseWriter, r *http.Request) {
 		day := r.URL.Query().Get("date")
-		if len(day) != 10 || day[4] != '-' || day[7] != '-' {
+		// §UATFIX929-E⑥：日期校验补数字段判定，逐字对齐真网关 _do_settlement（gateway.py:1493
+		// 多一条 isdigit）——旧写法 `abcdefghij` 在 mock 过、实网关 400，保真差会让 mock 下
+		// 永远测不出「日期串脏数据」这类调用方缺陷。
+		if len(day) != 10 || day[4] != '-' || day[7] != '-' ||
+			!isASCIIDigits(day[:4]) || !isASCIIDigits(day[5:7]) || !isASCIIDigits(day[8:]) {
 			http.Error(w, `{"ok":false,"err":"date required, format YYYY-MM-DD"}`, http.StatusBadRequest)
 			return
 		}
@@ -763,7 +781,11 @@ func buildHandler(b *book, token string, delay time.Duration, push func(map[stri
 		o := b.orders[req.OrderID]
 		if o == nil {
 			b.mu.Unlock()
-			http.Error(w, `{"ok":false,"err":"unknown order_id"}`, http.StatusNotFound)
+			// §UATFIX929-E③：未知单一律 409，逐字对齐真网关 _do_cancel（gateway.py:1437-1452
+			// 只分「空引用 400 / 撤失败一律 409」两档，无 404 档）——旧 mock 自创 404 档，
+			// 让 mock 下的撤单错误分支与实盘形态不一致。Go 侧 Cancel 不分码（do() 非 200 皆报错），
+			// 改码零行为变化，纯保真。空 order_id 真网关回 400，mock 侧查无此单同归 409 失败档。
+			http.Error(w, `{"ok":false,"err":"unknown order_id"}`, http.StatusConflict)
 			return
 		}
 		if o.Status != "已报" {
@@ -789,7 +811,15 @@ func buildHandler(b *book, token string, delay time.Duration, push func(map[stri
 			return
 		}
 		auth := r.Header.Get("Authorization")
-		if !strings.HasPrefix(auth, "Bearer ") || strings.TrimPrefix(auth, "Bearer ") != token {
+		// §UATFIX929-E⑦：口令比对改常量时间（subtle.ConstantTimeCompare），对齐真网关
+		// _auth_ok（gateway.py:1565-1566 hmac.compare_digest 同义）——旧 `!=` 短路比较在本机
+		// 仅测试面暴露时序、无真实威胁，但两面口径应一致到「比对不泄露前缀」这一层，
+		// 且防未来有人把 mock 形态反向抄进生产路径。判定结果与旧写法逐位等价（含长度不等即拒）。
+		got := ""
+		if strings.HasPrefix(auth, "Bearer ") {
+			got = strings.TrimPrefix(auth, "Bearer ")
+		}
+		if !strings.HasPrefix(auth, "Bearer ") || subtle.ConstantTimeCompare([]byte(got), []byte(token)) != 1 {
 			http.Error(w, `{"ok":false,"err":"unauthorized"}`, http.StatusUnauthorized)
 			return
 		}
@@ -822,6 +852,22 @@ func postReport(base, token string, payload map[string]interface{}) error {
 		return fmt.Errorf("report HTTP %d: %s", resp.StatusCode, truncate(string(b), 200))
 	}
 	return nil
+}
+
+// isASCIIDigits 判定字符串非空且全为 ASCII 数字（§UATFIX929-E⑥：对齐真网关 settlement
+// 日期校验的 isdigit 腿；空段判 false，与 Python str.isdigit 对空串回 False 同口径）。
+// English: true iff s is non-empty and all ASCII digits (mirrors Python .isdigit on the
+// settlement date segments; empty → false, same as Python).
+func isASCIIDigits(s string) bool {
+	if s == "" {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		if s[i] < '0' || s[i] > '9' {
+			return false
+		}
+	}
+	return true
 }
 
 // writeJSON 以 JSON 编码写入 HTTP 响应，并设置 application/json 内容类型。

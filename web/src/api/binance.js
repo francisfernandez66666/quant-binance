@@ -9,14 +9,24 @@
 //                                 stock,spot,risk_gate,paper_separate}
 //   POST /api/config/binance   → 指针字段局部合并（stock/spot/risk_gate 整档案替换）
 // 在建端点（PLAN §7 表，形状先行按 §6.2 契约消费，全部 fail-soft：404/未上线由调用处兜底）：
-//   GET  /api/binance/state    → {connected,halted,mode,testnet,ws_subscriptions,
-//                                 rate_limit_remaining,disclaimer_signed_at,...}
+//   GET  /api/binance/state    → 实发形状（internal/server/binance_api.go 装配，§UATFIX929-C 勘正）：
+//                                 {enabled,mode,testnet,halted,disclaimer_signed_at,
+//                                 controllers{US|CRYPTO:{snapshot,executor[,disclaimer_unsigned]}},
+//                                 reporters,feeds[,dispatch][,fng][,events]}
+//                                 ——dispatch/fng/events 为可选节（键名逐字取后端 out[...] 实发名，
+//                                 §UATFIX929-C 复审核正：旧写 xevents 是 Go 侧源字段名，JSON 里没有该键）：
+//                                 装配闭包未注入即整节省略（零配置零行为）。
 //   GET  /api/binance/orders   → 数组 [{...}]（非 {orders:[]}；market 可选过滤，CN 行不回流）
 //   POST /api/binance/cancel   → body {market, order_id}（无路径参数）
 //   POST /api/binance/halt     / GET /api/binance/exchange_info（刷新规则缓存）
 // §AUDITFIX925-D2（2026-09-25 审计批）：本注释旧版写的是 "POST /api/binance/cancel/{id}" 与
 // "POST /api/binance/exchange_info"——两处均与后端实注册路由不符（server.go:698-699），
 // 照抄者必撞 404/405。现已按后端真实契约逐一对齐，并以 vitest 契约用例（binance_contract.test.js）钉死。
+// §UATFIX929-C（2026-09-29 全量 UAT 审计）：本注释旧版按 §6.2 承诺 state 顶层发
+// "connected,ws_subscriptions,rate_limit_remaining,disclaimer_signed_at"——前两者实发无、
+// disclaimer_signed_at 实发无是缺陷 C 的成因（状态卡 :126 照注释读键，state 正常时恒显「未签署」）。
+// 处置：后端 state 顶层与 config 面同源补发该键（行为锁 uatfix929_state_disclaimer_test.go），
+// 注释本行按实发契约重写；ws_subscriptions/rate_limit_remaining 仍以实发为准不再承诺。
 // English: header contract notes realigned to server routes (cancel takes body not path id; exchange_info is GET).
 // English: single fetch module for all Binance endpoints; when backend paths shift, fix them here only.
 import { request } from './index.js'

@@ -4,9 +4,10 @@ package main
 // 真实网关在 xtquant 回调里同时推 order 状态事件（已报/已成/已撤）与 trade 成交事件，
 // 旧 mock 只有 trade——本地联调永远测不到委托状态机（引擎侧委托行卡"已报"）。
 // 本测试驱动 buildHandler 验证四件事：受理推"已报"、成交先"已成"后 trade、
-// 撤单推"已撤"且撤单竞态下不产生幻影成交、终态撤单按实柜台契约回 409/未知单 404。
+// 撤单推"已撤"且撤单竞态下不产生幻影成交、终态与未知单撤单按实柜台契约一律 409
+// （§UATFIX929-E③ 勘正：旧注释与用例钉的「未知单 404」是 mock 自创档，真网关无 404 档）。
 // English: unit tests for the §U-4 order lifecycle events of the mock gateway
-// (submit/fill/cancel pushes, cancel-race guard, 409/404 contract).
+// (submit/fill/cancel pushes, cancel-race guard, 409-on-any-cancel-failure contract).
 
 import (
 	"encoding/json"
@@ -167,8 +168,10 @@ func TestMockCancelTerminalCodes(t *testing.T) {
 	if code, _ := post(t, h, "/cancel", `{"order_id":"`+oid+`"}`); code != http.StatusConflict {
 		t.Fatalf("已成单撤单应 409, got %d", code)
 	}
-	if code, _ := post(t, h, "/cancel", `{"order_id":"NOPE"}`); code != http.StatusNotFound {
-		t.Fatalf("未知单撤单应 404, got %d", code)
+	if code, _ := post(t, h, "/cancel", `{"order_id":"NOPE"}`); code != http.StatusConflict {
+		// §UATFIX929-E③：未知单一律 409（真网关 _do_cancel 只有 400/409/200 三档、无 404 档）；
+		// 旧断言钉的是 mock 自创形态，随实现同批改口径。
+		t.Fatalf("未知单撤单应 409（对齐真网关）, got %d", code)
 	}
 }
 

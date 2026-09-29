@@ -196,12 +196,46 @@ jobs:
           legacy=$(grep '^go test' "$v" | grep -- '-run' | grep -cF "grep -q '^ok'" || true)
           if [ "${legacy:-0}" -ne 0 ]; then echo "verify_changes.sh 旧假绿门禁形态复活（列首命中 $legacy 行）"; exit 1; fi
           # 锁② 单源出口在位且吃满全部 -run 门禁（helper 三判据：exit code / no-tests-to-run / RUN 计数）
+          # §UATFIX929（2026-09-29）：3 处捕获式旧形态（g_xxx=$(go test -run …) + 次行 grep '^ok'）迁单源出口，23→26；
+          # 段 81 新增 M3/M4 两条行为锁调用，26→28（与本机段 80 下限同口径）。
           grep -q '^go_run_gate() {' "$v" || { echo "go_run_gate 单源出口被删除（§GATEFIX927）"; exit 1; }
           calls=$(grep -c '^go_run_gate ' "$v" || true)
-          if [ "${calls:-0}" -lt 23 ]; then echo "go_run_gate 调用数 $calls < 23，-run 门禁未全量走单源出口"; exit 1; fi
+          if [ "${calls:-0}" -lt 28 ]; then echo "go_run_gate 调用数 ${calls} < 28，-run 门禁未全量走单源出口"; exit 1; fi
           # 锁③ 第 80 段（含反证双腿）在位
           grep -q '==> 80 §GATEFIX927' "$v" || { echo "verify_changes.sh 缺第 80 段根治锁"; exit 1; }
           echo "ok - §GATEFIX927 静态锁 3 道全过（旧形态 0 行 / 单源调用 $calls 处 / 段 80 在位）"
+
+      # §UATFIX929（2026-09-29）全量审计施工批的 CI 侧锁：与 verify_changes.sh 第 81 段同口径的
+      # 静态子集（M3/M4 行为锁需真跑 go test/vitest，本机段已覆盖，CI 只钉防复活形态与接线量）。
+      - name: §UATFIX929 审计施工批静态锁
+        run: |
+          v=scripts/verify_changes.sh
+          # 锁①（M1）捕获式假绿共现锁：列首 `xx=$(go test -run …)` 与邻行 grep -q '^ok' 状态机共现必须为 0
+          awk_prog='/^[A-Za-z_][A-Za-z0-9_]*=\$\(go test/{cap=($0 ~ /-run/); next} /grep -q .\^ok/{if(cap)n++; cap=0} {cap=0} END{print n+0}'
+          co=$(awk "$awk_prog" "$v" || true)
+          if [ "${co:-0}" -ne 0 ]; then echo "捕获式假绿形态共现 ${co} 处（§UATFIX929-M1，只准走 go_run_gate）"; exit 1; fi
+          # 锁①反证：植入旧形态到临时文件，检测器必须报 1（不报说明共现锁是空枪）
+          cf=$(mktemp)
+          printf '%s\n' \
+            'g_fake=$(go test -run TestNoSuchUATFIX929Probe ./internal/config/ 2>&1)' \
+            'if ! printf "%s\n" "$g_fake" | grep -q "^ok"; then :; fi' > "$cf"
+          cf_hits=$(awk "$awk_prog" "$cf" || true)
+          rm -f "$cf"
+          if [ "${cf_hits:-0}" -ne 1 ]; then echo "反证塌方：植入旧形态检测=${cf_hits}（应恰 1）"; exit 1; fi
+          # 锁②（M2）部署面 SETUP_TOKEN 接线三道：总量下限 + 随机生成腿 + 保旧分支
+          st=$(grep -c 'SETUP_TOKEN' scripts/deploy_seoul.sh || true)
+          if [ "${st:-0}" -lt 4 ]; then echo "deploy_seoul.sh SETUP_TOKEN 接线数 ${st:-0} < 4（§UATFIX929-M2 被回退）"; exit 1; fi
+          grep -q 'openssl rand -hex 16' scripts/deploy_seoul.sh || { echo "SETUP_TOKEN 生成腿缺失（§UATFIX929-M2）"; exit 1; }
+          grep -q 'SETUP_OLD' scripts/deploy_seoul.sh || { echo "SETUP_TOKEN 保旧分支缺失（§UATFIX929-M2）"; exit 1; }
+          # 锁③（M5）bootstrap 端口落盘接线在位
+          pe=$(grep -c 'ports.env' scripts/uat_bootstrap.sh || true)
+          if [ "${pe:-0}" -lt 6 ]; then echo "uat_bootstrap.sh ports.env 接线数 ${pe:-0} < 6（§UATFIX929-M5 裸 stop 漂移根因复活）"; exit 1; fi
+          # 锁④（M6）死循环壳零复活：RunScoringLoop 带左括号的调用/声明在 Go 面必须为 0 行
+          rsl=$(grep -rn 'RunScoringLoop(' internal cmd --include='*.go' | wc -l | tr -d ' ' || true)
+          if [ "${rsl:-0}" -ne 0 ]; then echo "RunScoringLoop 死壳复活（调用/声明 ${rsl} 行，§UATFIX929-G）"; exit 1; fi
+          # 锁⑤ 第 81 段在位
+          grep -q '==> 81 §UATFIX929' "$v" || { echo "verify_changes.sh 缺第 81 段施工批锁"; exit 1; }
+          echo "ok - §UATFIX929 静态锁 5 道全过（M1 共现 0+反证 1 / M2 三道 / M5 / M6 / 段 81 在位）"
 
       # §20260922 修复批（FIX_PLAN_20260922）静态锁：P0/P1/P2 十八项的 CI 侧子集，
       # 与 scripts/verify_changes.sh §28~§37 同口径——行为回归随重构漂移，这里只钉

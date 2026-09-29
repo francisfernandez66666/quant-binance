@@ -135,6 +135,12 @@ func (s *Server) handleBinanceState(w http.ResponseWriter, r *http.Request) {
 		"controllers": map[string]any{},
 		"reporters":   map[string]any{},
 	}
+	// §UATFIX929-C（2026-09-29 全量 UAT 审计）：状态卡「披露签署」行读顶层键
+	// disclaimer_signed_at（BinanceStatusCard.jsx:126），此前该键只存在于 config 面
+	// （binanceConfigView），state 成功时反而恒显「未签署」（坏得越对的反直觉形态）。
+	// 此处与 config 面同源补发顶层键（同一 cfg 快照、同一字段，两面逐字节一致由
+	// uatfix929_state_disclaimer_test.go 锁死）；空串=未签署，语义照旧。
+	out["disclaimer_signed_at"] = cfg.DisclaimerSignedAt
 	for m, snap := range snaps {
 		if m == "CN" {
 			continue // CN 快照走 /api/qmt/state，本端点只讲币安两市场

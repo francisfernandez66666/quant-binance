@@ -28,30 +28,10 @@ import (
 	"quant-trading-v2/internal/trading"
 )
 
-// RunScoringLoop 启动近实时打分循环，直到 ctx 取消。
-// 需先 SetFetcher 提供 5s 快照（新浪→同花顺→东财）。
-func (e *Engine) RunScoringLoop(ctx context.Context) {
-	e.mu.RLock()
-	f := e.fetcher
-	e.mu.RUnlock()
-	if f == nil {
-		log.Printf("[engine] 近实时打分循环未启动: 未设置 Fetcher")
-		return
-	}
-	log.Printf("[engine] 近实时 8a/8b 打分循环启动: 5s 节奏")
-	ticker := time.NewTicker(5 * time.Second) // 固定 5s 心跳：与快照源刷新节奏对齐
-	defer ticker.Stop()
-	for { // select 主循环：ctx 取消即退出，取不到 tick 就继续等，绝不 busy-loop
-		select {
-		case <-ctx.Done():
-			log.Printf("[engine] 近实时打分循环停止")
-			return
-		case <-ticker.C: // 每 5s 执行一轮完整打分（单轮 panic 已在 scoreCycle 内 recover）
-			e.scoreCycle(ctx)
-		}
-	}
-}
-
+// §UATFIX929-G（2026-09-29 施工批）：原导出 RunScoringLoop（自带 5s ticker 的循环壳）全仓零调用
+// ——main.go 调度器与注册表统一走 RunScoringLoopOnce（5s 节奏由外层 tick 驱动，见 cmd/quant/main.go
+// 打分循环段），循环壳属死入口（audit 929 P3-G），已删除。ticker 语义若复活须先证明与外层调度
+// 不双跑，否则会出现同轮二次 scoreCycle 的重复分发。
 // RunScoringLoopOnce 执行一轮近实时打分（供多账号注册表统一 5s 调度调用）。
 // English: runs one near-realtime scoring cycle (called by the multi-account registry's shared
 // 5s scheduler).
