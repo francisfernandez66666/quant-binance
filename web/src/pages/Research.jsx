@@ -12,6 +12,7 @@ import ParetoChart from '../components/ParetoChart'
 import BacktestConfigPanel from '../components/BacktestConfigPanel'
 import * as api from '../api/index.js'
 import { showToast, confirmDialog } from '../ui.jsx'
+import { logger } from '../utils/logger.js'
 
 
 // §ADJ-BASIS-2（2026-09-23）当前复权口径基线版本，与 Go 侧 internal/research/windowed.go 的
@@ -197,7 +198,7 @@ export default function Research() {
       // §A6（20260918 审计批）：拉取失败不再整体静默——因子名回退显示原始 id，
       // 同时留 console 痕迹，避免"元数据接口挂了但页面看不出异常"的隐性降级。
       // English: §A6 — surface the fetch failure instead of silently degrading.
-      if (typeof console !== 'undefined') console.warn('[research] 因子元数据拉取失败，因子名回退原始 id:', e && e.message)
+      logger.warn('[research]', '因子元数据拉取失败，因子名回退原始 id:', e && e.message)
     }
   }
   function factorName(id) {
@@ -333,7 +334,7 @@ export default function Research() {
       const p = await api.fetchResearchProgress()
       // 常量 p：局部定义
       if (p) setProgress(p)
-    } catch (e) { console.error('Research 进度加载失败', e) }
+    } catch (e) { logger.error('[research]', 'Research 进度加载失败', e) }
   }
   // 按当前状态筛选拉取研究候选列表；研究库未接入时进入 noDB 空状态
   async function loadData() {
@@ -349,7 +350,7 @@ export default function Research() {
       if (e && e.message && e.message.indexOf('研究库未接入') >= 0) {
         setNoDB(true)
         setCandidates([])
-      } else { console.error('Research 加载失败', e) }
+      } else { logger.error('[research]', 'Research 加载失败', e) }
     } finally { setLoading(false) }
   }
   async function loadAll() {
@@ -475,7 +476,7 @@ export default function Research() {
       const res = await api.fetchResearchLibrary()
       // 常量 res：局部定义
       if (res && Array.isArray(res.library)) setLibrary(res.library)
-    } catch (e) { console.error('战法库加载失败', e) }
+    } catch (e) { logger.error('[research]', '战法库加载失败', e) }
     finally { setLoadingLibrary(false) }
   }
   async function toggleLibrary(s) {
@@ -519,7 +520,7 @@ export default function Research() {
       const res = await api.fetchBacktestToggle()
       // 常量 res：局部定义
       if (res && typeof res.enabled === 'boolean') setBacktestEnabled(res.enabled)
-    } catch (e) { console.error('加载回测开关失败', e) }
+    } catch (e) { logger.error('[research]', '加载回测开关失败', e) }
   }
   async function saveBacktestToggle(val) {
   // 保存全量回测全局开关状态
@@ -582,7 +583,7 @@ export default function Research() {
       const res = await api.fetchOptimizations()
       // 常量 res：局部定义
       setOptTasks(res.optimizations || [])
-    } catch (e) { console.warn('寻优结果加载失败', e) }
+    } catch (e) { logger.warn('[research]', '寻优结果加载失败', e) }
     finally { setLoadingOpts(false) }
   }
   // 发起全库战法参数寻优，提交目标函数后进入研究队列（盘后窗口执行）
@@ -1014,7 +1015,7 @@ export default function Research() {
         if (j.progress) setBacktestProgress((p) => ({ ...p, [c.id]: j.progress }))
         pollBacktest(c)
       }
-    } catch (e) { console.error('恢复运行中回测任务失败', e) }
+    } catch (e) { logger.error('[research]', '恢复运行中回测任务失败', e) }
   }
   // 拉取全部回测任务并去重（按 kind:candidate_id），用于回测任务中心表格展示
   async function loadBacktests() {
@@ -1033,7 +1034,7 @@ export default function Research() {
           return true
         }))
       }
-    } catch (e) { console.error('加载回测任务失败', e) }
+    } catch (e) { logger.error('[research]', '加载回测任务失败', e) }
     finally { setBtLoading(false) }
   }
   function syncJobIntoList(j) {

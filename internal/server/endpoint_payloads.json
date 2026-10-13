@@ -1,0 +1,1529 @@
+{
+  "DELETE /api/admin/users/{id}": {
+    "method": "DELETE",
+    "path": "/api/admin/users/{id}",
+    "handler": "s.adminMiddleware(s.handleDeleteUser)",
+    "request_struct": "",
+    "request_fields": null,
+    "response_fields": null
+  },
+  "DELETE /api/alerts": {
+    "method": "DELETE",
+    "path": "/api/alerts",
+    "handler": "s.adminMiddleware(s.handleClearAlerts)",
+    "request_struct": "",
+    "request_fields": null,
+    "response_fields": null
+  },
+  "DELETE /api/alerts/{id}": {
+    "method": "DELETE",
+    "path": "/api/alerts/{id}",
+    "handler": "s.adminMiddleware(s.handleDeleteAlert)",
+    "request_struct": "",
+    "request_fields": null,
+    "response_fields": null
+  },
+  "DELETE /api/consult/history": {
+    "method": "DELETE",
+    "path": "/api/consult/history",
+    "handler": "s.authMiddleware(s.handleClearConsultHistory)",
+    "request_struct": "",
+    "request_fields": null,
+    "response_fields": null
+  },
+  "DELETE /api/positions/{id}": {
+    "method": "DELETE",
+    "path": "/api/positions/{id}",
+    "handler": "s.adminMiddleware(s.handleDeletePosition)",
+    "request_struct": "",
+    "request_fields": null,
+    "response_fields": null
+  },
+  "DELETE /api/watchlist": {
+    "method": "DELETE",
+    "path": "/api/watchlist",
+    "handler": "s.authMiddleware(s.handleFixRemoveWatchlist)",
+    "request_struct": "",
+    "request_fields": null,
+    "response_fields": null
+  },
+  "GET /api/admin/users": {
+    "method": "GET",
+    "path": "/api/admin/users",
+    "handler": "s.adminMiddleware(s.handleListUsers)",
+    "request_struct": "",
+    "request_fields": null,
+    "response_fields": null
+  },
+  "GET /api/admin/users/{id}/config/d1": {
+    "method": "GET",
+    "path": "/api/admin/users/{id}/config/d1",
+    "handler": "s.adminMiddleware(s.handleAdminGetD1Config)",
+    "request_struct": "",
+    "request_fields": null,
+    "response_fields": null
+  },
+  "GET /api/admin/users/{id}/config/llm": {
+    "method": "GET",
+    "path": "/api/admin/users/{id}/config/llm",
+    "handler": "s.adminMiddleware(s.handleAdminGetLLMConfig)",
+    "request_struct": "",
+    "request_fields": null,
+    "response_fields": null
+  },
+  "GET /api/admin/users/{id}/config/longshort": {
+    "method": "GET",
+    "path": "/api/admin/users/{id}/config/longshort",
+    "handler": "s.adminMiddleware(s.handleAdminGetLongShortConfig)",
+    "request_struct": "",
+    "request_fields": null,
+    "response_fields": null
+  },
+  "GET /api/admin/users/{id}/config/qmt": {
+    "method": "GET",
+    "path": "/api/admin/users/{id}/config/qmt",
+    "handler": "s.adminMiddleware(s.handleAdminGetQMTConfig)",
+    "request_struct": "",
+    "request_fields": null,
+    "response_fields": null
+  },
+  "GET /api/admin/users/{id}/config/strategy": {
+    "method": "GET",
+    "path": "/api/admin/users/{id}/config/strategy",
+    "handler": "s.adminMiddleware(s.handleAdminGetStrategyConfig)",
+    "request_struct": "",
+    "request_fields": null,
+    "response_fields": null
+  },
+  "GET /api/alerts": {
+    "method": "GET",
+    "path": "/api/alerts",
+    "handler": "s.authMiddleware(s.handleFixAlerts)",
+    "request_struct": "",
+    "request_fields": null,
+    "response_fields": null
+  },
+  "GET /api/app/version": {
+    "method": "GET",
+    "path": "/api/app/version",
+    "handler": "s.handleAppVersion",
+    "request_struct": "",
+    "request_fields": null,
+    "response_fields": null
+  },
+  "GET /api/auth/me": {
+    "method": "GET",
+    "path": "/api/auth/me",
+    "handler": "s.authMiddleware(s.handleAuthMe)",
+    "request_struct": "",
+    "request_fields": null,
+    "response_fields": null
+  },
+  "GET /api/binance/exchange_info": {
+    "method": "GET",
+    "path": "/api/binance/exchange_info",
+    "handler": "s.adminMiddleware(s.handleBinanceExchangeInfo)",
+    "request_struct": "",
+    "request_fields": null,
+    "response_fields": null
+  },
+  "GET /api/binance/kline": {
+    "method": "GET",
+    "path": "/api/binance/kline",
+    "handler": "s.authMiddleware(s.handleBinanceKline)",
+    "request_struct": "",
+    "request_fields": null,
+    "response_fields": null
+  },
+  "GET /api/binance/orders": {
+    "method": "GET",
+    "path": "/api/binance/orders",
+    "handler": "s.adminMiddleware(s.handleBinanceOrders)",
+    "request_struct": "",
+    "request_fields": null,
+    "response_fields": null
+  },
+  "GET /api/binance/quote": {
+    "method": "GET",
+    "path": "/api/binance/quote",
+    "handler": "s.authMiddleware(s.handleBinanceQuote)",
+    "request_struct": "",
+    "request_fields": null,
+    "response_fields": null
+  },
+  "GET /api/binance/state": {
+    "method": "GET",
+    "path": "/api/binance/state",
+    "handler": "s.authMiddleware(s.handleBinanceState)",
+    "request_struct": "",
+    "request_fields": null,
+    "response_fields": null
+  },
+  "GET /api/config/binance": {
+    "method": "GET",
+    "path": "/api/config/binance",
+    "handler": "s.adminMiddleware(s.handleGetBinanceConfig)",
+    "request_struct": "",
+    "request_fields": null,
+    "response_fields": null
+  },
+  "GET /api/config/d1": {
+    "method": "GET",
+    "path": "/api/config/d1",
+    "handler": "s.adminMiddleware(s.handleGetD1Config)",
+    "request_struct": "",
+    "request_fields": null,
+    "response_fields": null
+  },
+  "GET /api/config/history": {
+    "method": "GET",
+    "path": "/api/config/history",
+    "handler": "s.adminMiddleware(s.handleConfigHistory)",
+    "request_struct": "",
+    "request_fields": null,
+    "response_fields": null
+  },
+  "GET /api/config/llm": {
+    "method": "GET",
+    "path": "/api/config/llm",
+    "handler": "s.adminMiddleware(s.handleGetLLMConfig)",
+    "request_struct": "",
+    "request_fields": null,
+    "response_fields": null
+  },
+  "GET /api/config/qmt": {
+    "method": "GET",
+    "path": "/api/config/qmt",
+    "handler": "s.adminMiddleware(s.handleGetQMTConfig)",
+    "request_struct": "",
+    "request_fields": null,
+    "response_fields": null
+  },
+  "GET /api/config/strategy": {
+    "method": "GET",
+    "path": "/api/config/strategy",
+    "handler": "s.adminMiddleware(s.handleGetStrategyConfig)",
+    "request_struct": "",
+    "request_fields": null,
+    "response_fields": null
+  },
+  "GET /api/consult/history": {
+    "method": "GET",
+    "path": "/api/consult/history",
+    "handler": "s.authMiddleware(s.handleConsultHistory)",
+    "request_struct": "",
+    "request_fields": null,
+    "response_fields": null
+  },
+  "GET /api/consult/pro-mode": {
+    "method": "GET",
+    "path": "/api/consult/pro-mode",
+    "handler": "s.authMiddleware(s.handleGetConsultProMode)",
+    "request_struct": "",
+    "request_fields": null,
+    "response_fields": null
+  },
+  "GET /api/dashboard": {
+    "method": "GET",
+    "path": "/api/dashboard",
+    "handler": "s.authMiddleware(s.handleDashboard)",
+    "request_struct": "",
+    "request_fields": null,
+    "response_fields": null
+  },
+  "GET /api/data_source_health": {
+    "method": "GET",
+    "path": "/api/data_source_health",
+    "handler": "s.authMiddleware(s.handleDataSourceHealth)",
+    "request_struct": "",
+    "request_fields": null,
+    "response_fields": null
+  },
+  "GET /api/depth/{code}": {
+    "method": "GET",
+    "path": "/api/depth/{code}",
+    "handler": "s.authMiddleware(s.handleFixDepth)",
+    "request_struct": "",
+    "request_fields": null,
+    "response_fields": null
+  },
+  "GET /api/engine/init-status": {
+    "method": "GET",
+    "path": "/api/engine/init-status",
+    "handler": "s.authMiddleware(s.handleEngineInitStatus)",
+    "request_struct": "",
+    "request_fields": null,
+    "response_fields": null
+  },
+  "GET /api/engine_health": {
+    "method": "GET",
+    "path": "/api/engine_health",
+    "handler": "s.authMiddleware(s.handleFixEngineHealth)",
+    "request_struct": "",
+    "request_fields": null,
+    "response_fields": null
+  },
+  "GET /api/evaluations": {
+    "method": "GET",
+    "path": "/api/evaluations",
+    "handler": "s.authMiddleware(s.handleFixEvaluations)",
+    "request_struct": "",
+    "request_fields": null,
+    "response_fields": null
+  },
+  "GET /api/events": {
+    "method": "GET",
+    "path": "/api/events",
+    "handler": "s.handleFixSSE",
+    "request_struct": "",
+    "request_fields": null,
+    "response_fields": null
+  },
+  "GET /api/health": {
+    "method": "GET",
+    "path": "/api/health",
+    "handler": "s.authMiddleware(s.handleHealth)",
+    "request_struct": "",
+    "request_fields": null,
+    "response_fields": null
+  },
+  "GET /api/holdings": {
+    "method": "GET",
+    "path": "/api/holdings",
+    "handler": "s.authMiddleware(s.handleFixGetHoldings)",
+    "request_struct": "",
+    "request_fields": null,
+    "response_fields": null
+  },
+  "GET /api/ipo/calendar": {
+    "method": "GET",
+    "path": "/api/ipo/calendar",
+    "handler": "s.authMiddleware(s.handleFixIPOCalendar)",
+    "request_struct": "",
+    "request_fields": null,
+    "response_fields": null
+  },
+  "GET /api/kline": {
+    "method": "GET",
+    "path": "/api/kline",
+    "handler": "s.authMiddleware(s.handleFixKLine)",
+    "request_struct": "",
+    "request_fields": null,
+    "response_fields": null
+  },
+  "GET /api/llm-debug": {
+    "method": "GET",
+    "path": "/api/llm-debug",
+    "handler": "s.adminMiddleware(s.handleLLMDebug)",
+    "request_struct": "",
+    "request_fields": null,
+    "response_fields": null
+  },
+  "GET /api/long/status": {
+    "method": "GET",
+    "path": "/api/long/status",
+    "handler": "s.authMiddleware(s.handleLongStatus)",
+    "request_struct": "",
+    "request_fields": null,
+    "response_fields": null
+  },
+  "GET /api/market/emotion/history": {
+    "method": "GET",
+    "path": "/api/market/emotion/history",
+    "handler": "s.authMiddleware(s.handleMarketEmotionHistory)",
+    "request_struct": "",
+    "request_fields": null,
+    "response_fields": null
+  },
+  "GET /api/metrics": {
+    "method": "GET",
+    "path": "/api/metrics",
+    "handler": "s.adminMiddleware(http.HandlerFunc(expvar.Handler().ServeHTTP))",
+    "request_struct": "",
+    "request_fields": null,
+    "response_fields": null
+  },
+  "GET /api/metrics/alerts": {
+    "method": "GET",
+    "path": "/api/metrics/alerts",
+    "handler": "s.adminMiddleware(s.handleAlertState)",
+    "request_struct": "",
+    "request_fields": null,
+    "response_fields": null
+  },
+  "GET /api/metrics/prometheus": {
+    "method": "GET",
+    "path": "/api/metrics/prometheus",
+    "handler": "s.adminMiddleware(s.handlePrometheusMetrics)",
+    "request_struct": "",
+    "request_fields": null,
+    "response_fields": null
+  },
+  "GET /api/minute": {
+    "method": "GET",
+    "path": "/api/minute",
+    "handler": "s.authMiddleware(s.handleFixMinute)",
+    "request_struct": "",
+    "request_fields": null,
+    "response_fields": null
+  },
+  "GET /api/news": {
+    "method": "GET",
+    "path": "/api/news",
+    "handler": "s.authMiddleware(s.handleFixNews)",
+    "request_struct": "",
+    "request_fields": null,
+    "response_fields": null
+  },
+  "GET /api/news/showall": {
+    "method": "GET",
+    "path": "/api/news/showall",
+    "handler": "s.authMiddleware(s.handleNewsShowAllStatus)",
+    "request_struct": "",
+    "request_fields": null,
+    "response_fields": null
+  },
+  "GET /api/news_source_health": {
+    "method": "GET",
+    "path": "/api/news_source_health",
+    "handler": "s.authMiddleware(s.handleNewsSourceHealth)",
+    "request_struct": "",
+    "request_fields": null,
+    "response_fields": null
+  },
+  "GET /api/opslog": {
+    "method": "GET",
+    "path": "/api/opslog",
+    "handler": "s.adminMiddleware(s.handleOpslog)",
+    "request_struct": "",
+    "request_fields": null,
+    "response_fields": null
+  },
+  "GET /api/opslog/dates": {
+    "method": "GET",
+    "path": "/api/opslog/dates",
+    "handler": "s.adminMiddleware(s.handleOpslogDates)",
+    "request_struct": "",
+    "request_fields": null,
+    "response_fields": null
+  },
+  "GET /api/paper/config": {
+    "method": "GET",
+    "path": "/api/paper/config",
+    "handler": "s.authMiddleware(s.handleGetPaperConfig)",
+    "request_struct": "",
+    "request_fields": null,
+    "response_fields": null
+  },
+  "GET /api/paper/equity": {
+    "method": "GET",
+    "path": "/api/paper/equity",
+    "handler": "s.authMiddleware(s.handlePaperEquity)",
+    "request_struct": "",
+    "request_fields": null,
+    "response_fields": null
+  },
+  "GET /api/paper/orders": {
+    "method": "GET",
+    "path": "/api/paper/orders",
+    "handler": "s.authMiddleware(s.handlePaperOrders)",
+    "request_struct": "",
+    "request_fields": null,
+    "response_fields": null
+  },
+  "GET /api/paper/positions": {
+    "method": "GET",
+    "path": "/api/paper/positions",
+    "handler": "s.authMiddleware(s.handlePaperPositions)",
+    "request_struct": "",
+    "request_fields": null,
+    "response_fields": null
+  },
+  "GET /api/paper/selfcheck": {
+    "method": "GET",
+    "path": "/api/paper/selfcheck",
+    "handler": "s.authMiddleware(s.handlePaperSelfCheck)",
+    "request_struct": "",
+    "request_fields": null,
+    "response_fields": null
+  },
+  "GET /api/paper/state": {
+    "method": "GET",
+    "path": "/api/paper/state",
+    "handler": "s.authMiddleware(s.handlePaperState)",
+    "request_struct": "",
+    "request_fields": null,
+    "response_fields": null
+  },
+  "GET /api/paper/strategies": {
+    "method": "GET",
+    "path": "/api/paper/strategies",
+    "handler": "s.authMiddleware(s.handleGetPaperStrategies)",
+    "request_struct": "",
+    "request_fields": null,
+    "response_fields": null
+  },
+  "GET /api/paper/trades": {
+    "method": "GET",
+    "path": "/api/paper/trades",
+    "handler": "s.authMiddleware(s.handlePaperTrades)",
+    "request_struct": "",
+    "request_fields": null,
+    "response_fields": null
+  },
+  "GET /api/positions": {
+    "method": "GET",
+    "path": "/api/positions",
+    "handler": "s.authMiddleware(s.handleListPositions)",
+    "request_struct": "",
+    "request_fields": null,
+    "response_fields": null
+  },
+  "GET /api/positions/advice": {
+    "method": "GET",
+    "path": "/api/positions/advice",
+    "handler": "s.adminMiddleware(s.handleRealAdvice)",
+    "request_struct": "",
+    "request_fields": null,
+    "response_fields": null
+  },
+  "GET /api/positions/real": {
+    "method": "GET",
+    "path": "/api/positions/real",
+    "handler": "s.adminMiddleware(s.handleRealPositions)",
+    "request_struct": "",
+    "request_fields": null,
+    "response_fields": null
+  },
+  "GET /api/qmt/broker": {
+    "method": "GET",
+    "path": "/api/qmt/broker",
+    "handler": "s.adminMiddleware(s.handleQMTBroker)",
+    "request_struct": "",
+    "request_fields": null,
+    "response_fields": null
+  },
+  "GET /api/qmt/orders": {
+    "method": "GET",
+    "path": "/api/qmt/orders",
+    "handler": "s.adminMiddleware(s.handleQMTOrders)",
+    "request_struct": "",
+    "request_fields": null,
+    "response_fields": null
+  },
+  "GET /api/qmt/settle/history": {
+    "method": "GET",
+    "path": "/api/qmt/settle/history",
+    "handler": "s.adminMiddleware(s.handleQMTSettleHistory)",
+    "request_struct": "",
+    "request_fields": null,
+    "response_fields": null
+  },
+  "GET /api/qmt/state": {
+    "method": "GET",
+    "path": "/api/qmt/state",
+    "handler": "s.adminMiddleware(s.handleQMTState)",
+    "request_struct": "",
+    "request_fields": null,
+    "response_fields": null
+  },
+  "GET /api/qmt/trades": {
+    "method": "GET",
+    "path": "/api/qmt/trades",
+    "handler": "s.adminMiddleware(s.handleQMTTrades)",
+    "request_struct": "",
+    "request_fields": null,
+    "response_fields": null
+  },
+  "GET /api/research/backtest-config": {
+    "method": "GET",
+    "path": "/api/research/backtest-config",
+    "handler": "s.permMiddleware(auth.PermResearchApprove, s.handleBacktestConfigGet)",
+    "request_struct": "",
+    "request_fields": null,
+    "response_fields": null
+  },
+  "GET /api/research/backtest-toggle": {
+    "method": "GET",
+    "path": "/api/research/backtest-toggle",
+    "handler": "s.authMiddleware(s.handleResearchBacktestToggle)",
+    "request_struct": "",
+    "request_fields": null,
+    "response_fields": null
+  },
+  "GET /api/research/backtest/list": {
+    "method": "GET",
+    "path": "/api/research/backtest/list",
+    "handler": "s.permMiddleware(auth.PermResearchApprove, s.handleBacktestList)",
+    "request_struct": "",
+    "request_fields": null,
+    "response_fields": null
+  },
+  "GET /api/research/backtest/running": {
+    "method": "GET",
+    "path": "/api/research/backtest/running",
+    "handler": "s.permMiddleware(auth.PermResearchApprove, s.handleBacktestRunning)",
+    "request_struct": "",
+    "request_fields": null,
+    "response_fields": null
+  },
+  "GET /api/research/backtest/{id}": {
+    "method": "GET",
+    "path": "/api/research/backtest/{id}",
+    "handler": "s.authMiddleware(s.handleBacktestStatus)",
+    "request_struct": "",
+    "request_fields": null,
+    "response_fields": null
+  },
+  "GET /api/research/candidates": {
+    "method": "GET",
+    "path": "/api/research/candidates",
+    "handler": "s.permMiddleware(auth.PermResearchApprove, s.handleResearchCandidates)",
+    "request_struct": "",
+    "request_fields": null,
+    "response_fields": null
+  },
+  "GET /api/research/emotion-strategy-matrix": {
+    "method": "GET",
+    "path": "/api/research/emotion-strategy-matrix",
+    "handler": "s.authMiddleware(s.handleEmotionStrategyMatrix)",
+    "request_struct": "",
+    "request_fields": null,
+    "response_fields": null
+  },
+  "GET /api/research/event-factor": {
+    "method": "GET",
+    "path": "/api/research/event-factor",
+    "handler": "s.authMiddleware(s.handleResearchEventFactor)",
+    "request_struct": "",
+    "request_fields": null,
+    "response_fields": null
+  },
+  "GET /api/research/factors": {
+    "method": "GET",
+    "path": "/api/research/factors",
+    "handler": "s.authMiddleware(s.handleResearchFactors)",
+    "request_struct": "",
+    "request_fields": null,
+    "response_fields": null
+  },
+  "GET /api/research/library": {
+    "method": "GET",
+    "path": "/api/research/library",
+    "handler": "s.permMiddleware(auth.PermResearchApprove, s.handleResearchLibrary)",
+    "request_struct": "",
+    "request_fields": null,
+    "response_fields": null
+  },
+  "GET /api/research/optimizations": {
+    "method": "GET",
+    "path": "/api/research/optimizations",
+    "handler": "s.permMiddleware(auth.PermResearchApprove, s.handleOptimizationList)",
+    "request_struct": "",
+    "request_fields": null,
+    "response_fields": null
+  },
+  "GET /api/research/paper-reports": {
+    "method": "GET",
+    "path": "/api/research/paper-reports",
+    "handler": "s.adminMiddleware(s.handlePaperResearchReports)",
+    "request_struct": "",
+    "request_fields": null,
+    "response_fields": null
+  },
+  "GET /api/research/progress": {
+    "method": "GET",
+    "path": "/api/research/progress",
+    "handler": "s.permMiddleware(auth.PermResearchApprove, s.handleResearchProgress)",
+    "request_struct": "",
+    "request_fields": null,
+    "response_fields": null
+  },
+  "GET /api/research/strategies/snapshots": {
+    "method": "GET",
+    "path": "/api/research/strategies/snapshots",
+    "handler": "s.authMiddleware(s.handleStrategySnapshots)",
+    "request_struct": "",
+    "request_fields": null,
+    "response_fields": null
+  },
+  "GET /api/research/sweep-pools": {
+    "method": "GET",
+    "path": "/api/research/sweep-pools",
+    "handler": "s.permMiddleware(auth.PermResearchApprove, s.handleSweepPoolList)",
+    "request_struct": "",
+    "request_fields": null,
+    "response_fields": null
+  },
+  "GET /api/research/task/{id}/log": {
+    "method": "GET",
+    "path": "/api/research/task/{id}/log",
+    "handler": "s.authMiddleware(s.handleResearchTaskLog)",
+    "request_struct": "",
+    "request_fields": null,
+    "response_fields": null
+  },
+  "GET /api/risk/gates": {
+    "method": "GET",
+    "path": "/api/risk/gates",
+    "handler": "s.adminMiddleware(s.handleRiskGates)",
+    "request_struct": "",
+    "request_fields": null,
+    "response_fields": null
+  },
+  "GET /api/scheduler/status": {
+    "method": "GET",
+    "path": "/api/scheduler/status",
+    "handler": "s.authMiddleware(s.handleSchedulerStatus)",
+    "request_struct": "",
+    "request_fields": null,
+    "response_fields": null
+  },
+  "GET /api/sector/hot": {
+    "method": "GET",
+    "path": "/api/sector/hot",
+    "handler": "s.authMiddleware(s.handleFixSectorHot)",
+    "request_struct": "",
+    "request_fields": null,
+    "response_fields": null
+  },
+  "GET /api/sector/hot/records": {
+    "method": "GET",
+    "path": "/api/sector/hot/records",
+    "handler": "s.authMiddleware(s.handleSectorHotRecords)",
+    "request_struct": "",
+    "request_fields": null,
+    "response_fields": null
+  },
+  "GET /api/short/status": {
+    "method": "GET",
+    "path": "/api/short/status",
+    "handler": "s.authMiddleware(s.handleShortStatus)",
+    "request_struct": "",
+    "request_fields": null,
+    "response_fields": null
+  },
+  "GET /api/signal-logs": {
+    "method": "GET",
+    "path": "/api/signal-logs",
+    "handler": "s.authMiddleware(s.handleSignalLogs)",
+    "request_struct": "",
+    "request_fields": null,
+    "response_fields": null
+  },
+  "GET /api/signalctl/verdicts": {
+    "method": "GET",
+    "path": "/api/signalctl/verdicts",
+    "handler": "s.authMiddleware(s.handleSignalVerdicts)",
+    "request_struct": "",
+    "request_fields": null,
+    "response_fields": null
+  },
+  "GET /api/signals": {
+    "method": "GET",
+    "path": "/api/signals",
+    "handler": "s.authMiddleware(s.handleFixSignals)",
+    "request_struct": "",
+    "request_fields": null,
+    "response_fields": null
+  },
+  "GET /api/snapshot": {
+    "method": "GET",
+    "path": "/api/snapshot",
+    "handler": "s.authMiddleware(s.handleFixSnapshot)",
+    "request_struct": "",
+    "request_fields": null,
+    "response_fields": null
+  },
+  "GET /api/snapshot/hot": {
+    "method": "GET",
+    "path": "/api/snapshot/hot",
+    "handler": "s.authMiddleware(s.handleFixHotSnapshot)",
+    "request_struct": "",
+    "request_fields": null,
+    "response_fields": null
+  },
+  "GET /api/stage-records": {
+    "method": "GET",
+    "path": "/api/stage-records",
+    "handler": "s.adminMiddleware(s.handleStageRecords)",
+    "request_struct": "",
+    "request_fields": null,
+    "response_fields": null
+  },
+  "GET /api/status": {
+    "method": "GET",
+    "path": "/api/status",
+    "handler": "s.authMiddleware(s.handleFixStatus)",
+    "request_struct": "",
+    "request_fields": null,
+    "response_fields": null
+  },
+  "GET /api/stock/lookup": {
+    "method": "GET",
+    "path": "/api/stock/lookup",
+    "handler": "s.authMiddleware(s.handleFixStockLookup)",
+    "request_struct": "",
+    "request_fields": null,
+    "response_fields": null
+  },
+  "GET /api/tenant/usage": {
+    "method": "GET",
+    "path": "/api/tenant/usage",
+    "handler": "s.adminMiddleware(s.handleTenantUsage)",
+    "request_struct": "",
+    "request_fields": null,
+    "response_fields": null
+  },
+  "GET /api/tenants": {
+    "method": "GET",
+    "path": "/api/tenants",
+    "handler": "s.adminMiddleware(s.handleListTenants)",
+    "request_struct": "",
+    "request_fields": null,
+    "response_fields": null
+  },
+  "GET /api/watchlist": {
+    "method": "GET",
+    "path": "/api/watchlist",
+    "handler": "s.authMiddleware(s.handleFixGetWatchlist)",
+    "request_struct": "",
+    "request_fields": null,
+    "response_fields": null
+  },
+  "GET /setup": {
+    "method": "GET",
+    "path": "/setup",
+    "handler": "s.handleSetupStatus",
+    "request_struct": "",
+    "request_fields": null,
+    "response_fields": null
+  },
+  "POST /api/action": {
+    "method": "POST",
+    "path": "/api/action",
+    "handler": "s.adminMiddleware(s.handleFixAction)",
+    "request_struct": "",
+    "request_fields": null,
+    "response_fields": null
+  },
+  "POST /api/admin/users": {
+    "method": "POST",
+    "path": "/api/admin/users",
+    "handler": "s.adminMiddleware(s.handleCreateUser)",
+    "request_struct": "",
+    "request_fields": null,
+    "response_fields": null
+  },
+  "POST /api/admin/users/cleanup": {
+    "method": "POST",
+    "path": "/api/admin/users/cleanup",
+    "handler": "s.adminMiddleware(s.handleCleanupUsers)",
+    "request_struct": "",
+    "request_fields": null,
+    "response_fields": null
+  },
+  "POST /api/admin/users/{id}/config/d1": {
+    "method": "POST",
+    "path": "/api/admin/users/{id}/config/d1",
+    "handler": "s.adminMiddleware(s.handleAdminSetD1Config)",
+    "request_struct": "",
+    "request_fields": null,
+    "response_fields": null
+  },
+  "POST /api/admin/users/{id}/config/llm": {
+    "method": "POST",
+    "path": "/api/admin/users/{id}/config/llm",
+    "handler": "s.adminMiddleware(s.handleAdminSetLLMConfig)",
+    "request_struct": "",
+    "request_fields": null,
+    "response_fields": null
+  },
+  "POST /api/admin/users/{id}/config/longshort": {
+    "method": "POST",
+    "path": "/api/admin/users/{id}/config/longshort",
+    "handler": "s.adminMiddleware(s.handleAdminSetLongShortConfig)",
+    "request_struct": "",
+    "request_fields": null,
+    "response_fields": null
+  },
+  "POST /api/admin/users/{id}/config/qmt": {
+    "method": "POST",
+    "path": "/api/admin/users/{id}/config/qmt",
+    "handler": "s.adminMiddleware(s.handleAdminSetQMTConfig)",
+    "request_struct": "",
+    "request_fields": null,
+    "response_fields": null
+  },
+  "POST /api/admin/users/{id}/config/strategy": {
+    "method": "POST",
+    "path": "/api/admin/users/{id}/config/strategy",
+    "handler": "s.adminMiddleware(s.handleAdminSetStrategyConfig)",
+    "request_struct": "",
+    "request_fields": null,
+    "response_fields": null
+  },
+  "POST /api/admin/users/{id}/enabled": {
+    "method": "POST",
+    "path": "/api/admin/users/{id}/enabled",
+    "handler": "s.adminMiddleware(s.handleSetUserEnabled)",
+    "request_struct": "",
+    "request_fields": null,
+    "response_fields": null
+  },
+  "POST /api/admin/users/{id}/expiry": {
+    "method": "POST",
+    "path": "/api/admin/users/{id}/expiry",
+    "handler": "s.adminMiddleware(s.handleSetUserExpiry)",
+    "request_struct": "",
+    "request_fields": null,
+    "response_fields": null
+  },
+  "POST /api/admin/users/{id}/password": {
+    "method": "POST",
+    "path": "/api/admin/users/{id}/password",
+    "handler": "s.adminMiddleware(s.handleSetUserPassword)",
+    "request_struct": "",
+    "request_fields": null,
+    "response_fields": null
+  },
+  "POST /api/admin/users/{id}/perms": {
+    "method": "POST",
+    "path": "/api/admin/users/{id}/perms",
+    "handler": "s.adminMiddleware(s.handleSetUserPerms)",
+    "request_struct": "",
+    "request_fields": null,
+    "response_fields": null
+  },
+  "POST /api/admin/users/{id}/role": {
+    "method": "POST",
+    "path": "/api/admin/users/{id}/role",
+    "handler": "s.adminMiddleware(s.handleSetUserRole)",
+    "request_struct": "setUserRoleReq",
+    "request_fields": [
+      {
+        "name": "role",
+        "type": "string",
+        "required": true
+      }
+    ],
+    "response_fields": null
+  },
+  "POST /api/auth/login": {
+    "method": "POST",
+    "path": "/api/auth/login",
+    "handler": "s.handleLogin",
+    "request_struct": "",
+    "request_fields": null,
+    "response_fields": null
+  },
+  "POST /api/auth/logout": {
+    "method": "POST",
+    "path": "/api/auth/logout",
+    "handler": "s.authMiddleware(s.handleLogout)",
+    "request_struct": "",
+    "request_fields": null,
+    "response_fields": null
+  },
+  "POST /api/backtest/optimize": {
+    "method": "POST",
+    "path": "/api/backtest/optimize",
+    "handler": "s.permMiddleware(auth.PermResearchApprove, s.handleOptimizeEnqueue)",
+    "request_struct": "",
+    "request_fields": null,
+    "response_fields": null
+  },
+  "POST /api/binance/cancel": {
+    "method": "POST",
+    "path": "/api/binance/cancel",
+    "handler": "s.adminMiddleware(s.handleBinanceCancel)",
+    "request_struct": "",
+    "request_fields": null,
+    "response_fields": null
+  },
+  "POST /api/binance/disclaimer": {
+    "method": "POST",
+    "path": "/api/binance/disclaimer",
+    "handler": "s.adminMiddleware(s.handleBinanceDisclaimerPost)",
+    "request_struct": "",
+    "request_fields": null,
+    "response_fields": null
+  },
+  "POST /api/binance/halt": {
+    "method": "POST",
+    "path": "/api/binance/halt",
+    "handler": "s.adminMiddleware(s.handleBinanceHalt)",
+    "request_struct": "",
+    "request_fields": null,
+    "response_fields": null
+  },
+  "POST /api/config/binance": {
+    "method": "POST",
+    "path": "/api/config/binance",
+    "handler": "s.adminMiddleware(s.handleSetBinanceConfig)",
+    "request_struct": "",
+    "request_fields": null,
+    "response_fields": null
+  },
+  "POST /api/config/d1": {
+    "method": "POST",
+    "path": "/api/config/d1",
+    "handler": "s.adminMiddleware(s.handleSetD1Config)",
+    "request_struct": "",
+    "request_fields": null,
+    "response_fields": null
+  },
+  "POST /api/config/llm": {
+    "method": "POST",
+    "path": "/api/config/llm",
+    "handler": "s.adminMiddleware(s.handleSetLLMConfig)",
+    "request_struct": "",
+    "request_fields": null,
+    "response_fields": null
+  },
+  "POST /api/config/llm/probe": {
+    "method": "POST",
+    "path": "/api/config/llm/probe",
+    "handler": "s.adminMiddleware(s.handleProbeLLMConfig)",
+    "request_struct": "",
+    "request_fields": null,
+    "response_fields": null
+  },
+  "POST /api/config/llm/rollback": {
+    "method": "POST",
+    "path": "/api/config/llm/rollback",
+    "handler": "s.adminMiddleware(s.handleRollbackLLMConfig)",
+    "request_struct": "",
+    "request_fields": null,
+    "response_fields": null
+  },
+  "POST /api/config/qmt": {
+    "method": "POST",
+    "path": "/api/config/qmt",
+    "handler": "s.adminMiddleware(s.handleSetQMTConfig)",
+    "request_struct": "",
+    "request_fields": null,
+    "response_fields": null
+  },
+  "POST /api/config/rollback": {
+    "method": "POST",
+    "path": "/api/config/rollback",
+    "handler": "s.adminMiddleware(s.handleConfigRollback)",
+    "request_struct": "",
+    "request_fields": null,
+    "response_fields": null
+  },
+  "POST /api/config/strategy": {
+    "method": "POST",
+    "path": "/api/config/strategy",
+    "handler": "s.adminMiddleware(s.handleSetStrategyConfig)",
+    "request_struct": "",
+    "request_fields": null,
+    "response_fields": null
+  },
+  "POST /api/consult": {
+    "method": "POST",
+    "path": "/api/consult",
+    "handler": "s.authMiddleware(s.handleConsult)",
+    "request_struct": "consultReq",
+    "request_fields": [
+      {
+        "name": "message",
+        "type": "string",
+        "required": true
+      }
+    ],
+    "response_fields": null
+  },
+  "POST /api/events/ticket": {
+    "method": "POST",
+    "path": "/api/events/ticket",
+    "handler": "s.authMiddleware(s.handleSSETicket)",
+    "request_struct": "",
+    "request_fields": null,
+    "response_fields": null
+  },
+  "POST /api/holdings": {
+    "method": "POST",
+    "path": "/api/holdings",
+    "handler": "s.adminMiddleware(s.handleFixSetHoldings)",
+    "request_struct": "",
+    "request_fields": null,
+    "response_fields": null
+  },
+  "POST /api/holdings/{code}/add": {
+    "method": "POST",
+    "path": "/api/holdings/{code}/add",
+    "handler": "s.adminMiddleware(s.handleFixAddHoldingLot)",
+    "request_struct": "",
+    "request_fields": null,
+    "response_fields": null
+  },
+  "POST /api/holdings/{code}/close": {
+    "method": "POST",
+    "path": "/api/holdings/{code}/close",
+    "handler": "s.adminMiddleware(s.handleFixCloseHolding)",
+    "request_struct": "",
+    "request_fields": null,
+    "response_fields": null
+  },
+  "POST /api/holdings/{code}/cost": {
+    "method": "POST",
+    "path": "/api/holdings/{code}/cost",
+    "handler": "s.adminMiddleware(s.handleFixSetCost)",
+    "request_struct": "",
+    "request_fields": null,
+    "response_fields": null
+  },
+  "POST /api/holdings/{code}/sell": {
+    "method": "POST",
+    "path": "/api/holdings/{code}/sell",
+    "handler": "s.adminMiddleware(s.handleFixSellHolding)",
+    "request_struct": "",
+    "request_fields": null,
+    "response_fields": null
+  },
+  "POST /api/long/toggle": {
+    "method": "POST",
+    "path": "/api/long/toggle",
+    "handler": "s.adminMiddleware(s.handleLongToggle)",
+    "request_struct": "",
+    "request_fields": null,
+    "response_fields": null
+  },
+  "POST /api/news/reanalyze": {
+    "method": "POST",
+    "path": "/api/news/reanalyze",
+    "handler": "s.adminMiddleware(s.handleNewsReanalyze)",
+    "request_struct": "",
+    "request_fields": null,
+    "response_fields": null
+  },
+  "POST /api/news/showall": {
+    "method": "POST",
+    "path": "/api/news/showall",
+    "handler": "s.adminMiddleware(s.handleNewsShowAllToggle)",
+    "request_struct": "",
+    "request_fields": null,
+    "response_fields": null
+  },
+  "POST /api/news/test-attribution": {
+    "method": "POST",
+    "path": "/api/news/test-attribution",
+    "handler": "s.adminMiddleware(s.handleNewsTestAttribution)",
+    "request_struct": "",
+    "request_fields": null,
+    "response_fields": null
+  },
+  "POST /api/notify-test": {
+    "method": "POST",
+    "path": "/api/notify-test",
+    "handler": "s.adminMiddleware(s.handleFixNotifyTest)",
+    "request_struct": "",
+    "request_fields": null,
+    "response_fields": null
+  },
+  "POST /api/paper/buy": {
+    "method": "POST",
+    "path": "/api/paper/buy",
+    "handler": "s.adminMiddleware(s.handlePaperBuy)",
+    "request_struct": "",
+    "request_fields": null,
+    "response_fields": null
+  },
+  "POST /api/paper/config": {
+    "method": "POST",
+    "path": "/api/paper/config",
+    "handler": "s.adminMiddleware(s.handleSetPaperConfig)",
+    "request_struct": "",
+    "request_fields": null,
+    "response_fields": null
+  },
+  "POST /api/paper/pool/config": {
+    "method": "POST",
+    "path": "/api/paper/pool/config",
+    "handler": "s.adminMiddleware(s.handlePaperPoolConfig)",
+    "request_struct": "",
+    "request_fields": null,
+    "response_fields": null
+  },
+  "POST /api/paper/pool/reset": {
+    "method": "POST",
+    "path": "/api/paper/pool/reset",
+    "handler": "s.adminMiddleware(s.handlePaperPoolReset)",
+    "request_struct": "",
+    "request_fields": null,
+    "response_fields": null
+  },
+  "POST /api/paper/reset": {
+    "method": "POST",
+    "path": "/api/paper/reset",
+    "handler": "s.adminMiddleware(s.handlePaperReset)",
+    "request_struct": "",
+    "request_fields": null,
+    "response_fields": null
+  },
+  "POST /api/paper/sell": {
+    "method": "POST",
+    "path": "/api/paper/sell",
+    "handler": "s.adminMiddleware(s.handlePaperSell)",
+    "request_struct": "",
+    "request_fields": null,
+    "response_fields": null
+  },
+  "POST /api/paper/short_cover": {
+    "method": "POST",
+    "path": "/api/paper/short_cover",
+    "handler": "s.adminMiddleware(s.handlePaperShortCover)",
+    "request_struct": "",
+    "request_fields": null,
+    "response_fields": null
+  },
+  "POST /api/paper/short_open": {
+    "method": "POST",
+    "path": "/api/paper/short_open",
+    "handler": "s.adminMiddleware(s.handlePaperShortOpen)",
+    "request_struct": "",
+    "request_fields": null,
+    "response_fields": null
+  },
+  "POST /api/paper/strategies": {
+    "method": "POST",
+    "path": "/api/paper/strategies",
+    "handler": "s.adminMiddleware(s.handleSetPaperStrategies)",
+    "request_struct": "",
+    "request_fields": null,
+    "response_fields": null
+  },
+  "POST /api/positions": {
+    "method": "POST",
+    "path": "/api/positions",
+    "handler": "s.adminMiddleware(s.handleCreatePosition)",
+    "request_struct": "",
+    "request_fields": null,
+    "response_fields": null
+  },
+  "POST /api/positions/execute": {
+    "method": "POST",
+    "path": "/api/positions/execute",
+    "handler": "s.adminMiddleware(s.handleExecuteAction)",
+    "request_struct": "",
+    "request_fields": null,
+    "response_fields": null
+  },
+  "POST /api/positions/{id}/exit": {
+    "method": "POST",
+    "path": "/api/positions/{id}/exit",
+    "handler": "s.adminMiddleware(s.handleExitPosition)",
+    "request_struct": "",
+    "request_fields": null,
+    "response_fields": null
+  },
+  "POST /api/qmt/broker": {
+    "method": "POST",
+    "path": "/api/qmt/broker",
+    "handler": "s.adminMiddleware(s.handleQMTBrokerSwitch)",
+    "request_struct": "",
+    "request_fields": null,
+    "response_fields": null
+  },
+  "POST /api/qmt/cancel/{order_id}": {
+    "method": "POST",
+    "path": "/api/qmt/cancel/{order_id}",
+    "handler": "s.adminMiddleware(s.handleQMTCancel)",
+    "request_struct": "",
+    "request_fields": null,
+    "response_fields": null
+  },
+  "POST /api/qmt/halt": {
+    "method": "POST",
+    "path": "/api/qmt/halt",
+    "handler": "s.adminMiddleware(s.handleQMTHalt)",
+    "request_struct": "",
+    "request_fields": null,
+    "response_fields": null
+  },
+  "POST /api/qmt/report": {
+    "method": "POST",
+    "path": "/api/qmt/report",
+    "handler": "s.qmtReportMiddleware(s.handleQMTReport)",
+    "request_struct": "",
+    "request_fields": null,
+    "response_fields": null
+  },
+  "POST /api/qmt/settle": {
+    "method": "POST",
+    "path": "/api/qmt/settle",
+    "handler": "s.adminMiddleware(s.handleQMTSettle)",
+    "request_struct": "",
+    "request_fields": null,
+    "response_fields": null
+  },
+  "POST /api/research/backtest-toggle": {
+    "method": "POST",
+    "path": "/api/research/backtest-toggle",
+    "handler": "s.permMiddleware(auth.PermResearchApprove, s.handleResearchBacktestToggle)",
+    "request_struct": "",
+    "request_fields": null,
+    "response_fields": null
+  },
+  "POST /api/research/backtest/{id}/cancel": {
+    "method": "POST",
+    "path": "/api/research/backtest/{id}/cancel",
+    "handler": "s.permMiddleware(auth.PermResearchApprove, s.handleBacktestCancel)",
+    "request_struct": "",
+    "request_fields": null,
+    "response_fields": null
+  },
+  "POST /api/research/backtest/{id}/pause": {
+    "method": "POST",
+    "path": "/api/research/backtest/{id}/pause",
+    "handler": "s.permMiddleware(auth.PermResearchApprove, s.handleBacktestPause)",
+    "request_struct": "",
+    "request_fields": null,
+    "response_fields": null
+  },
+  "POST /api/research/backtest/{id}/resume": {
+    "method": "POST",
+    "path": "/api/research/backtest/{id}/resume",
+    "handler": "s.permMiddleware(auth.PermResearchApprove, s.handleBacktestResume)",
+    "request_struct": "",
+    "request_fields": null,
+    "response_fields": null
+  },
+  "POST /api/research/candidates/{id}/approve": {
+    "method": "POST",
+    "path": "/api/research/candidates/{id}/approve",
+    "handler": "s.permMiddleware(auth.PermResearchApprove, s.handleResearchApprove)",
+    "request_struct": "",
+    "request_fields": null,
+    "response_fields": null
+  },
+  "POST /api/research/candidates/{id}/backtest": {
+    "method": "POST",
+    "path": "/api/research/candidates/{id}/backtest",
+    "handler": "s.permMiddleware(auth.PermResearchApprove, s.handleCandidateBacktest)",
+    "request_struct": "",
+    "request_fields": null,
+    "response_fields": null
+  },
+  "POST /api/research/candidates/{id}/grayscale": {
+    "method": "POST",
+    "path": "/api/research/candidates/{id}/grayscale",
+    "handler": "s.permMiddleware(auth.PermResearchApprove, s.handleResearchGrayscale)",
+    "request_struct": "",
+    "request_fields": null,
+    "response_fields": null
+  },
+  "POST /api/research/candidates/{id}/reject": {
+    "method": "POST",
+    "path": "/api/research/candidates/{id}/reject",
+    "handler": "s.permMiddleware(auth.PermResearchApprove, s.handleResearchReject)",
+    "request_struct": "",
+    "request_fields": null,
+    "response_fields": null
+  },
+  "POST /api/research/library/{id}/backtest": {
+    "method": "POST",
+    "path": "/api/research/library/{id}/backtest",
+    "handler": "s.permMiddleware(auth.PermResearchApprove, s.handleLibraryBacktest)",
+    "request_struct": "",
+    "request_fields": null,
+    "response_fields": null
+  },
+  "POST /api/research/library/{id}/delete": {
+    "method": "POST",
+    "path": "/api/research/library/{id}/delete",
+    "handler": "s.permMiddleware(auth.PermResearchApprove, s.handleResearchLibraryDelete)",
+    "request_struct": "",
+    "request_fields": null,
+    "response_fields": null
+  },
+  "POST /api/research/library/{id}/disable": {
+    "method": "POST",
+    "path": "/api/research/library/{id}/disable",
+    "handler": "s.permMiddleware(auth.PermResearchApprove, s.handleResearchLibraryToggle(\"disable\"))",
+    "request_struct": "",
+    "request_fields": null,
+    "response_fields": null
+  },
+  "POST /api/research/library/{id}/enable": {
+    "method": "POST",
+    "path": "/api/research/library/{id}/enable",
+    "handler": "s.permMiddleware(auth.PermResearchApprove, s.handleResearchLibraryToggle(\"enable\"))",
+    "request_struct": "",
+    "request_fields": null,
+    "response_fields": null
+  },
+  "POST /api/research/library/{id}/rename": {
+    "method": "POST",
+    "path": "/api/research/library/{id}/rename",
+    "handler": "s.permMiddleware(auth.PermResearchApprove, s.handleResearchLibraryRename)",
+    "request_struct": "",
+    "request_fields": null,
+    "response_fields": null
+  },
+  "POST /api/research/optimizations/{id}/approve": {
+    "method": "POST",
+    "path": "/api/research/optimizations/{id}/approve",
+    "handler": "s.permMiddleware(auth.PermResearchApprove, s.handleOptimizationApprove)",
+    "request_struct": "",
+    "request_fields": null,
+    "response_fields": null
+  },
+  "POST /api/research/optimizations/{id}/reject": {
+    "method": "POST",
+    "path": "/api/research/optimizations/{id}/reject",
+    "handler": "s.permMiddleware(auth.PermResearchApprove, s.handleOptimizationReject)",
+    "request_struct": "",
+    "request_fields": null,
+    "response_fields": null
+  },
+  "POST /api/research/strategies/rollback": {
+    "method": "POST",
+    "path": "/api/research/strategies/rollback",
+    "handler": "s.adminMiddleware(s.handleStrategyRollback)",
+    "request_struct": "",
+    "request_fields": null,
+    "response_fields": null
+  },
+  "POST /api/review/positions": {
+    "method": "POST",
+    "path": "/api/review/positions",
+    "handler": "s.authMiddleware(s.handleTriggerPositionReview)",
+    "request_struct": "",
+    "request_fields": null,
+    "response_fields": null
+  },
+  "POST /api/short/toggle": {
+    "method": "POST",
+    "path": "/api/short/toggle",
+    "handler": "s.adminMiddleware(s.handleShortToggle)",
+    "request_struct": "",
+    "request_fields": null,
+    "response_fields": null
+  },
+  "POST /api/tenants": {
+    "method": "POST",
+    "path": "/api/tenants",
+    "handler": "s.adminMiddleware(s.handleCreateTenant)",
+    "request_struct": "",
+    "request_fields": null,
+    "response_fields": null
+  },
+  "POST /api/watchlist": {
+    "method": "POST",
+    "path": "/api/watchlist",
+    "handler": "s.authMiddleware(s.handleFixAddWatchlist)",
+    "request_struct": "",
+    "request_fields": null,
+    "response_fields": null
+  },
+  "POST /auth/login": {
+    "method": "POST",
+    "path": "/auth/login",
+    "handler": "s.handleLogin",
+    "request_struct": "loginReq",
+    "request_fields": [
+      {
+        "name": "username",
+        "type": "string",
+        "required": true
+      },
+      {
+        "name": "password",
+        "type": "string",
+        "required": true
+      }
+    ],
+    "response_fields": null
+  },
+  "POST /auth/register": {
+    "method": "POST",
+    "path": "/auth/register",
+    "handler": "s.handleRegister",
+    "request_struct": "",
+    "request_fields": null,
+    "response_fields": null
+  },
+  "POST /auth/temp": {
+    "method": "POST",
+    "path": "/auth/temp",
+    "handler": "s.handleTemp",
+    "request_struct": "",
+    "request_fields": null,
+    "response_fields": null
+  },
+  "POST /setup": {
+    "method": "POST",
+    "path": "/setup",
+    "handler": "s.handleSetupSubmit",
+    "request_struct": "",
+    "request_fields": null,
+    "response_fields": null
+  },
+  "PUT /api/admin/users/{id}/tenant": {
+    "method": "PUT",
+    "path": "/api/admin/users/{id}/tenant",
+    "handler": "s.adminMiddleware(s.handleMoveUserTenant)",
+    "request_struct": "",
+    "request_fields": null,
+    "response_fields": null
+  },
+  "PUT /api/consult/pro-mode": {
+    "method": "PUT",
+    "path": "/api/consult/pro-mode",
+    "handler": "s.authMiddleware(s.handleSetConsultProMode)",
+    "request_struct": "",
+    "request_fields": null,
+    "response_fields": null
+  },
+  "PUT /api/positions/{id}": {
+    "method": "PUT",
+    "path": "/api/positions/{id}",
+    "handler": "s.adminMiddleware(s.handleUpdatePosition)",
+    "request_struct": "",
+    "request_fields": null,
+    "response_fields": null
+  },
+  "PUT /api/research/backtest-config": {
+    "method": "PUT",
+    "path": "/api/research/backtest-config",
+    "handler": "s.permMiddleware(auth.PermResearchApprove, s.handleBacktestConfigPut)",
+    "request_struct": "",
+    "request_fields": null,
+    "response_fields": null
+  },
+  "PUT /api/research/sweep-pools": {
+    "method": "PUT",
+    "path": "/api/research/sweep-pools",
+    "handler": "s.permMiddleware(auth.PermResearchApprove, s.handleSweepPoolUpsert)",
+    "request_struct": "",
+    "request_fields": null,
+    "response_fields": null
+  },
+  "PUT /api/tenants/{id}": {
+    "method": "PUT",
+    "path": "/api/tenants/{id}",
+    "handler": "s.adminMiddleware(s.handleUpdateTenant)",
+    "request_struct": "updateTenantReq",
+    "request_fields": [
+      {
+        "name": "name",
+        "type": "string",
+        "required": false
+      },
+      {
+        "name": "enabled",
+        "type": "bool",
+        "required": false
+      },
+      {
+        "name": "quota",
+        "type": "object",
+        "required": false
+      }
+    ],
+    "response_fields": null
+  }
+}

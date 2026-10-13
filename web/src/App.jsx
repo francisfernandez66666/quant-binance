@@ -13,11 +13,18 @@ import ToggleSw from './components/ToggleSw'
 import MarketStatusBar from './components/MarketStatusBar'
 import RoleBar from './components/RoleBar'
 import CommandPalette from './components/CommandPalette'
-import StockDetailDrawer from './components/StockDetailDrawer'
+// §FIX1012-M9 首屏优化：StockDetailDrawer 改懒加载 + 按需挂载，把轻量级图表库
+// lightweight-charts（App.jsx → StockDetailDrawer → XProChart 静态链）移出首屏包——
+// 旧实现常驻挂载，即使关闭也把图表库打进首屏 1.52MiB。改为仅在打开个股详情时才 import，
+// 命中 Suspense 懒分块，首屏不再加载图表库。
+const StockDetailDrawer = lazy(() => import('./components/StockDetailDrawer.jsx'))
 import Disclaimer from './components/Disclaimer'
 import IcpFooter from './components/IcpFooter'
 import ThemeToggle from './components/ThemeToggle'
 import { useTheme } from './theme.js'
+// §H7 / §FIX1012-M5：auth:expired 监听下沉为独立 hook（ref 镜像 + 转发壳），
+// App 与单测都只依赖 hook——原实现住在 App 里，测它要 import 整个 App+tdesign 链。
+import { useAuthExpired } from './hooks/useAuthExpired.js'
 import * as api from './api/index.js'
 import { dispatch as sseDispatch } from './sseBus.js'
 import { isNative, canNotify, requestPermission, notify as sendNotify, notifyThrottled } from './notify.js'
@@ -81,12 +88,14 @@ function Forbidden() {
 // 路由级权限守卫：根据后端已下发的角色/权限位决定是否渲染，无权限则重定向到 403。
 // 后端接口已做鉴权兜底，此处仅作体验层保护（避免直接渲染无权页面）。
 //   admin: 仅管理员可访问；perm: 指定权限位（管理员隐式全部）。
+//   §FIX1012-M8 enabled: 功能开关（如模拟盘 paperEnabled）——关时入口本就不存在，
+//   直拼 URL 进来一律回仪表盘，与侧边栏过滤语义保持一致；默认 true，不传即无该判定。
 //   §A5（20260918 审计批）checked: 服务端权威角色是否已完成对账（/api/auth/me 首拉返回）。
 //   未完成前不放行也不重定向（渲染加载占位），杜绝篡改 localStorage 角色后
 //   admin 壳先渲染、逐屏吃 403 的窗口期。
 //   English: §A5 — guarded routes stay on a loading placeholder until the authoritative role
 //   from GET /api/auth/me has been reconciled into storage.
-function ProtectedRoute({ admin, perm, checked, children }) {
+function ProtectedRoute({ admin, perm, checked, enabled = true, children }) {
   // §P1-13 路由守卫：未登录先跳转登录页（/ 由顶层 loggedIn 切换为登录视图），
   // 已登录但权限/角色不足才落到 /403，避免未登录直接暴露 401 空页面。
   if (!api.isLoggedIn()) {
@@ -94,6 +103,9 @@ function ProtectedRoute({ admin, perm, checked, children }) {
   }
   if (!checked) {
     return <PageFallback />
+  }
+  if (!enabled) {
+    return <Navigate to="/dashboard" replace />
   }
   const allowed = admin ? api.isAdmin() : perm ? api.hasPerm(perm) : true
   return allowed ? children : <Navigate to="/403" replace />
@@ -150,12 +162,11 @@ export default function App() {
   // §H7（2026-09-22 修复批）auth:expired 闭包死亡：挂载 effect 只注册一次监听器，旧实现的
   // onAuthExpired 直接捕获渲染态 loggedIn——首帧为 false 被永久冻结在闭包里，登录成功
   // （checkAuth 异步置真 / handleLogin）之后 auth:expired 事件到达仍恒早退，
-  // 登出提示在部分路径永不出现在。改法：latest 值镜像进 ref，回调只读 ref。
+  // 登出提示在部分路径永不出现在。§FIX1012-M5：整套 ref 镜像 + 转发壳下沉进
+  // useAuthExpired hook（行为不变），测试不再需要 import 整个 App+tdesign 链。
   // English: §H7 — mirror the latest render values into refs so the once-registered
-  // auth:expired listener never runs against the stale first-frame closure.
-  const loggedInRef = useRef(false)
-  // §H7：同样镜像最新 onAuthExpired 闭包（内含最新 logout/navigate），挂载 effect 经 ref 转发调用
-  const authExpiredHandler = useRef(null)
+  // auth:expired listener never runs against the stale first-frame closure (now in the hook).
+  const { loggedInRef } = useAuthExpired(loggedIn, onAuthExpired)
 
   // 根据当前用户权限刷新研究/管理入口可见性
   function applyRoleGates() {
@@ -343,16 +354,11 @@ export default function App() {
   function onAuthExpired() {
     // §H7：改读 ref 最新登录态——旧实现在此读渲染态 loggedIn（挂载闭包里恒为首帧 false），
     // 登录成功后的 auth:expired 事件被错误早退，登出提示丢失。未登录时仍应静默跳过。
+    // §FIX1012-M5：loggedInRef 由 useAuthExpired hook 提供（值镜像 + 转发壳整体下沉）。
     if (!loggedInRef.current) return
     MessagePlugin.error('登录已过期，请重新登录')
     logout()
   }
-
-  // §H7：每次渲染后把最新值/最新闭包镜像进 ref（无 deps，随每个 commit 执行）
-  useEffect(() => {
-    loggedInRef.current = loggedIn
-    authExpiredHandler.current = onAuthExpired
-  })
 
   // 启动状态轮询并订阅 SSE 推送
   function startPolling() {
@@ -369,19 +375,13 @@ export default function App() {
     if (unsubSSE.current) { unsubSSE.current(); unsubSSE.current = null }
   }
 
-  // 组件挂载：自动登录、启动轮询、监听认证过期；卸载时清理
+  // 组件挂载：自动登录、启动轮询；卸载时清理轮询与 SSE
+  // §FIX1012-M5：auth:expired 监听已整体下沉 useAuthExpired hook（挂载注册一次 + 转发壳），
+  // 本 effect 不再碰监听器，只保留登录态恢复与轮询生命周期。
   useEffect(() => {
     checkAuth().then((ok) => { if (ok) startPolling() })
     api.fetchPaperState().then(d => setPaperEnabled(!!d.enabled)).catch(() => setPaperEnabled(false))
-    // §H7：deps 保持 []（监听器只在挂载注册一次），但注册的是转发壳——
-    // 经 authExpiredHandler.current 取最新闭包执行，彻底绕开首帧陈旧闭包；
-    // 卸载时按同一壳引用注销。
-    const onExpired = () => {
-      if (authExpiredHandler.current) authExpiredHandler.current()
-    }
-    window.addEventListener('auth:expired', onExpired)
     return () => {
-      window.removeEventListener('auth:expired', onExpired)
       stopPolling()
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -629,33 +629,38 @@ export default function App() {
                 <Suspense fallback={<PageFallback />}>
                   {/*
                    * 路由表注释起点：下方 <Routes> 逐条登记 13 个业务页面 + 403 兜底 */}
-                  {/* 路由表：/settings /research /admin 均套 ProtectedRoute 权限守卫，
-                      其余页面默认全员可见（后端接口仍有鉴权兜底） */}
+                  {/* 路由表：§FIX1012-M8 起全部业务路由统一套 ProtectedRoute checked={meChecked}
+                      （token + 服务端角色对账门）；/settings /llm-debug /admin 另加 admin、
+                      /research 另加 research_approve、/paper 另加 paperEnabled 功能开关。
+                      不套的只有两条非业务路由："/" 重定向与 "/403" 兜底页。 */}
                   <Routes>
                     {/*
                      * 根路径重定向到仪表盘 */}
                     <Route path="/" element={<Navigate to="/dashboard" replace />} />
                     {/*
-                     * 首屏直接引入的落地页 Dashboard（不参与懒加载） */}
-                    <Route path="/dashboard" element={<Dashboard />} />
+                     * 首屏直接引入的落地页 Dashboard（不参与懒加载）
+                     * §FIX1012-M8：全部业务路由统一套 ProtectedRoute checked={meChecked}
+                     * ——不传 admin/perm 时退化为「token + 服务端角色对账」门，零行为变化地
+                     * 获得「localStorage 角色篡改不生效」的保护（后端逐接口鉴权仍是真兜底）。 */}
+                    <Route path="/dashboard" element={<ProtectedRoute checked={meChecked}><Dashboard /></ProtectedRoute>} />
                     {/*
                      * 信号页：策略评级信号列表，徽标角标展示未读数 */}
-                    <Route path="/signals" element={<Signals />} />
+                    <Route path="/signals" element={<ProtectedRoute checked={meChecked}><Signals /></ProtectedRoute>} />
                     {/*
                      * 自选股页 */}
-                    <Route path="/watchlist" element={<Watchlist />} />
+                    <Route path="/watchlist" element={<ProtectedRoute checked={meChecked}><Watchlist /></ProtectedRoute>} />
                     {/*
                      * 持仓页：实盘持仓管理 */}
-                    <Route path="/positions" element={<Positions />} />
+                    <Route path="/positions" element={<ProtectedRoute checked={meChecked}><Positions /></ProtectedRoute>} />
                     {/*
                      * 量化交易页：策略运行与调仓入口 */}
-                    <Route path="/quant" element={<Quant />} />
+                    <Route path="/quant" element={<ProtectedRoute checked={meChecked}><Quant /></ProtectedRoute>} />
                     {/*
                      * 热点页：热点板块/评分排名/宏观日历/IPO/资讯 */}
-                    <Route path="/hotspot" element={<Hotspot />} />
+                    <Route path="/hotspot" element={<ProtectedRoute checked={meChecked}><Hotspot /></ProtectedRoute>} />
                     {/*
                      * 消息中心：系统提醒与低级别通知（角标展示 alertCount 未读数） */}
-                    <Route path="/msgcenter" element={<MsgCenter />} />
+                    <Route path="/msgcenter" element={<ProtectedRoute checked={meChecked}><MsgCenter /></ProtectedRoute>} />
                     {/*
                      * 设置页：仅管理员（ProtectedRoute admin 守卫） */}
                     <Route path="/settings" element={<ProtectedRoute admin checked={meChecked}><Settings /></ProtectedRoute>} />
@@ -665,7 +670,7 @@ export default function App() {
                     <Route path="/llm-debug" element={<ProtectedRoute admin checked={meChecked}><LLMDebug /></ProtectedRoute>} />
                     {/*
                      * 股票咨询页：自然语言问询个股/板块 */}
-                    <Route path="/consult" element={<Consult />} />
+                    <Route path="/consult" element={<ProtectedRoute checked={meChecked}><Consult /></ProtectedRoute>} />
                     {/*
                      * 自动研究页：需 research_approve 权限（研究闭环审批入口） */}
                     <Route path="/research" element={<ProtectedRoute perm="research_approve" checked={meChecked}><Research /></ProtectedRoute>} />
@@ -673,11 +678,12 @@ export default function App() {
                      * 用户管理页：仅管理员 */}
                     <Route path="/admin" element={<ProtectedRoute admin checked={meChecked}><Admin /></ProtectedRoute>} />
                     {/*
-                     * 模拟盘页：纸面交易记账/自动撮合（入口受 paperEnabled 开关控制） */}
-                    <Route path="/paper" element={<Paper />} />
+                     * 模拟盘页：纸面交易记账/自动撮合（入口受 paperEnabled 开关控制，
+                     * §FIX1012-M8 路由级同步该开关——关时直拼 URL 也回仪表盘） */}
+                    <Route path="/paper" element={<ProtectedRoute checked={meChecked} enabled={paperEnabled}><Paper /></ProtectedRoute>} />
                     {/*
                      * 情绪回看页：涨停柱+账户净值+相位色带三合一（§情绪面板 C） */}
-                    <Route path="/emotion" element={<EmotionReview />} />
+                    <Route path="/emotion" element={<ProtectedRoute checked={meChecked}><EmotionReview /></ProtectedRoute>} />
                     {/*
                      * 403 无权限兜底页 */}
                     <Route path="/403" element={<Forbidden />} />
@@ -699,9 +705,13 @@ export default function App() {
             onClose={() => setPaletteOpen(false)}
           />
         )}
-        {/* §F6 全局个股详情抽屉（命令面板/未来任意入口共用），仅此处一份实例避免多页重复 */}
-        <StockDetailDrawer open={!!globalDetail} code={globalDetail?.code}
-          onClose={() => setGlobalDetail(null)} />
+        {/* §F6 全局个股详情抽屉（命令面板/未来任意入口共用）。§FIX1012-M9：仅当
+         * globalDetail 有值时才挂载，图表库随懒分块延后加载，移出首屏。 */}
+        {globalDetail && (
+          <Suspense fallback={null}>
+            <StockDetailDrawer open onClose={() => setGlobalDetail(null)} code={globalDetail.code} />
+          </Suspense>
+        )}
         </>
       )}
       {/*

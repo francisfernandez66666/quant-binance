@@ -66,6 +66,11 @@ export default [
       // 无 react 插件无从识别 JSX 引用，以 varsIgnorePattern 单点豁免，不改最小集承诺；
       // caughtErrors 保持默认 all：catch(e){} 吞错形参计入 warn，正对本批「空 catch 掩盖炸弹」形态。
       'no-unused-vars': ['warn', { varsIgnorePattern: '^React$', args: 'after-used' }],
+      // §FIX1012-M10：god component 失控闸门。仅 warn（不阻塞门禁），阈值 1000 行给足够余量；
+      // skipComments/skipBlankLines 让注释密集的页面不被无谓点名。目标是「新增大文件可见」，
+      // 而非一次性全红。配套：生产代码 console.* 必须收口到 web/src/utils/logger.js（见 §82 锁）。
+      // English: warn-only god-component guard; pairs with the logger convergence discipline.
+      'max-lines': ['warn', { max: 1000, skipComments: true, skipBlankLines: true }],
     },
   },
   {
