@@ -59,7 +59,7 @@ note(){ echo "  [NOTE] $1"; }
 skip(){ echo "  [SKIP] $1（本市场不适用）"; }
 
 if [ ! -f "$CFG" ]; then
-	echo "--- FAIL: 配置文件不存在：$CFG（先跑起过一次服务生成 config.json，或用 QUANT_DATA_DIR 指到真实数据目录）"
+	echo "--- FAIL: 配置文件不存在：${CFG}（先跑起过一次服务生成 config.json，或用 QUANT_DATA_DIR 指到真实数据目录）"
 	exit 1
 fi
 echo "==> §FIX1012-M2 开闸检查单 market=${MARKET} cfg=${CFG} dry_run=${DRY_RUN}"
@@ -187,7 +187,7 @@ fi
 if [ "$MARKET" = "binance" ]; then
 	DISC=$(read_cfg "str(c.get('rules', {}).get('binance', {}).get('disclaimer_signed_at', '') or '')")
 	if [ -n "$DISC" ]; then
-		ok "disclaimer_signed_at 已签（$DISC）"
+		ok "disclaimer_signed_at 已签（${DISC}）"
 	else
 		bad "disclaimer_signed_at 为空——美股/加密披露签署是开闸前置（与 leverage 确认同族语义）"
 	fi

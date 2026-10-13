@@ -249,6 +249,28 @@ vitest_gate() {
 	exit 1
 }
 
+# has_hit —— 「管道是否有命中」判定单一入口，返回 0=有命中 / 1=无命中。
+#
+# §2026-10-13 根治 SIGPIPE 假红（实测捕获：第 45 段 §XCHECK 死代码锁报「CrossCheckPrice
+# 又成死代码」，而该符号明明有 5 处消费、含 registry.go 两处真实接线）：
+#   旧写法 `if ! grep -rn … | grep -v … | grep -q .; then 判红`
+#   —— 管道末端 `grep -q .` 匹配到第一行就**提前退出**，上游 grep 随即收到 SIGPIPE(141)；
+#      `set -o pipefail` 把整个管道判为失败，`!` 取反 ⇒ 把「有命中」读成「没命中」⇒ 假红。
+#   根因与命中量相关：扫全仓（输出几十行以上）必现，扫单文件小输出常常侥幸不现——
+#   所以同一份锁代码平时绿、换个包就红，极难归因。
+# 修法：本函数**读完 stdin 全部内容**再判有无输出，管道里不存在「读端先退」，
+#      上游拿不到 SIGPIPE，pipefail 也就不会把命中读成未命中。
+# 用法：if grep -rn 'X' internal --include='*.go' | grep -v _test | has_hit; then … fi
+#       （管道内 glob 照常由调用侧 shell 展开，无需转义；无 glob 时可写 has_hit t -rn … 直接吃参数）
+has_hit() {
+	local _tmp
+	_tmp=$(mktemp)
+	cat > "$_tmp" 2>/dev/null || true
+	if [ -s "$_tmp" ]; then rm -f "$_tmp"; return 0; fi
+	rm -f "$_tmp"
+	return 1
+}
+
 # py_tests <目标文件或目录> [-k 过滤表达式]
 #
 # 运行 Python 测试。CI 装了 pytest，本机（macOS 开发机）通常没有，因此做一次能力探测后
@@ -998,7 +1020,7 @@ echo "==> 41 §M8 推送三通道内聚（禁双发铁律）+ EXPVAR 收权（20
 # EXPVAR：/debug/vars 与 /metrics 旧实现对成员全开（持仓/资金暴露面）——现 admin-only。
 go test -count=1 ./internal/notify/ -run 'TestM8' 2>&1 | grep -E '^(--- FAIL|FAIL|ok)'
 go test -count=1 ./internal/server/ -run 'TestExpvarMetricsAdminOnly|TestDebugVarsNotMounted' 2>&1 | grep -E '^(--- FAIL|FAIL|ok)'
-if grep -rn '\.PushGateway(' internal/engine cmd/quant --include='*.go' 2>/dev/null | grep -v _test.go | grep -v 'NewJPushGateway\|NewNtfyGateway\|NewWebhookGateway' >/dev/null; then
+if grep -rn '\.PushGateway(' internal/engine cmd/quant --include='*.go' 2>/dev/null | grep -v _test.go | grep -vE 'NewJPushGateway|NewNtfyGateway|NewWebhookGateway' >/dev/null; then
 	echo "--- FAIL: 禁双发铁律回归——业务调用方在 Push 之外又直调 PushGateway（M8 双发/分裂复活）"; exit 1; fi
 grep -q 'gatewayMinLevel' internal/notify/notify.go || { echo "--- FAIL: 网关级别闸丢失（M8）"; exit 1; }
 echo "ok - §M8/EXPVAR 专项守卫通过（行为锁 7 例 + 静态锁 2 道）"
@@ -1125,7 +1147,7 @@ grep -q 'price_cross_check' internal/risk/gate.go || { echo "--- FAIL: 价格复
 grep -q 'checkPriceCross' internal/risk/gate.go || { echo "--- FAIL: 复核闸判定函数丢失（§XCHECK）"; exit 1; }
 grep -q 'SetCrossPriceSource' internal/engine/registry.go || { echo "--- FAIL: registry 装配注入丢失（§XCHECK 接线断裂，复核源永不生效）"; exit 1; }
 grep -q 'cross_check_pct' internal/config/config.go || { echo "--- FAIL: 复核闸配置键丢失（§XCHECK）"; exit 1; }
-if ! grep -rn 'CrossCheckPrice' internal cmd --include='*.go' 2>/dev/null | grep -v _test.go | grep -v 'internal/data/source.go' | grep -q .; then
+if ! grep -rn 'CrossCheckPrice' internal cmd --include='*.go' 2>/dev/null | grep -v _test.go | grep -v 'internal/data/source.go' | has_hit; then
 	echo "--- FAIL: CrossCheckPrice 又成死代码（§XCHECK 消费链断裂，§LOW(a) 死代码形态复活）"; exit 1; fi
 echo "ok - §XCHECK 专项守卫通过（行为锁 1 组 6 态 + 静态锁 5 道）"
 
@@ -1138,7 +1160,7 @@ grep -q '"AndroidAuth"' mobile/app/src/main/java/com/liangzai/quant/MainActivity
 grep -q 'security-crypto' mobile/app/build.gradle.kts || { echo "--- FAIL: EncryptedSharedPreferences 依赖丢失（§NATIVEAUTH）"; exit 1; }
 grep -q 'nativeAuthBridge' web/src/api/index.js || { echo "--- FAIL: 前端桥探测丢失（§NATIVEAUTH）"; exit 1; }
 # 负锁：业务代码不得再直读 liangzai_token 字面量（api/index.js 存储层单点之外、滤注释行与测试）。
-if grep -rn "liangzai_token" web/src --include='*.js' --include='*.jsx' 2>/dev/null | grep -v __tests__ | grep -v 'src/api/index.js' | grep -vE ':[0-9]+:[[:space:]]*//' | grep -q .; then
+if grep -rn "liangzai_token" web/src --include='*.js' --include='*.jsx' 2>/dev/null | grep -v __tests__ | grep -v 'src/api/index.js' | grep -vE ':[0-9]+:[[:space:]]*//' | has_hit; then
 	echo "--- FAIL: localStorage token 直读复活（§NATIVEAUTH 必须收敛在 api 存储层）"; exit 1; fi
 echo "ok - §NATIVEAUTH 专项守卫通过（行为锁 1 组 + 静态锁 4 道 + 直读负锁）"
 
@@ -1199,7 +1221,7 @@ grep -q 'side != trading.SideBuy && side != trading.SideSell' internal/server/qm
 grep -q 'o.Side != SideBuy && o.Side != SideSell' internal/risk/gate.go || { echo "--- FAIL: 风控闸方向 fail-close 丢失（§N-4）"; exit 1; }
 grep -q 'side_unknown' internal/risk/gate.go || { echo "--- FAIL: 未知方向留痕标识丢失（§N-4 命中不可归因）"; exit 1; }
 # 负向锁：非法方向绝不许"缺省成买入"继续往下走（滤注释行，只拦真代码形态）。
-if grep -nE '^\s*side = trading\.SideBuy\s*$' internal/server/qmt.go | grep -vE ':[0-9]+:\s*//' | grep -q .; then
+if grep -nE '^\s*side = trading\.SideBuy\s*$' internal/server/qmt.go | grep -vE ':[0-9]+:\s*//' | has_hit; then
 	if ! grep -q 'side != trading.SideBuy && side != trading.SideSell' internal/server/qmt.go; then
 		echo "--- FAIL: 手动单方向又只剩空串缺省（§SIDEGATE-GO 白名单被绕开）"; exit 1; fi; fi
 echo "ok - §SIDEGATE 专项守卫通过（行为锁 4 组 + 静态锁 5 道 + 缺省回退负锁）"
@@ -1224,7 +1246,7 @@ grep -q '"tripped": ctrl != nil && ctrl.Tripped()' internal/server/qmt.go || { e
 go test -count=1 ./internal/server/ -run 'TestQMTReportBroadcastCarriesTripped' 2>&1 | grep -E '^(--- FAIL|FAIL|ok)'
 # §D5：注释与实现对齐后的命名不得回退（tripReasonLocked 自称不加锁却自己 RLock=自锁死锁陷阱）。
 grep -q 'func (c \*Controller) currentTripReason()' internal/trading/controller.go || { echo "--- FAIL: currentTripReason 改名回退（§D5）"; exit 1; }
-if grep -n 'tripReasonLocked' internal/trading/controller.go | grep -vE '^[0-9]+:[[:space:]]*(//|\*)' | grep -q .; then
+if grep -n 'tripReasonLocked' internal/trading/controller.go | grep -vE '^[0-9]+:[[:space:]]*(//|\*)' | has_hit; then
 	echo "--- FAIL: tripReasonLocked 真代码复活（§D5 命名/注释漂移陷阱）"; exit 1; fi
 echo "ok - §SETTLE/§M13/§D5 专项守卫通过（行为锁 2 组 + 顺序断言 + 静态锁 6 道 + 命名负锁）"
 
@@ -1262,7 +1284,7 @@ grep -qE '\{(state|st)\.cash_stale \? row\(.可用资金' web/src/pages/Quant.js
 grep -q "status='发送失败'" internal/store/real_positions.go || { echo "--- FAIL: 发送失败可重放腿丢失（§GAP2-W1 回归）"; exit 1; }
 grep -q "status='已撤' AND NOT EXISTS" internal/store/real_positions.go || { echo "--- FAIL: 已撤零成交可重放腿丢失（§H1-MG 撤单猝死复活）"; exit 1; }
 # 负向锁（滤注释行，只拦真代码形态）：旧两态消费 `if cash := ctrl.AvailableCash(); cash > 0` 不得复活。
-if grep -nE 'if cash := ctrl\.AvailableCash\(\); cash > 0' internal/engine/engine.go | grep -vE '^[0-9]+:[[:space:]]*(//|\*)' | grep -q .; then
+if grep -nE 'if cash := ctrl\.AvailableCash\(\); cash > 0' internal/engine/engine.go | grep -vE '^[0-9]+:[[:space:]]*(//|\*)' | has_hit; then
 	echo "--- FAIL: 旧两态资金消费形态复活（真 0 又被当成不设限，§M12 复活）"; exit 1; fi
 echo "ok - §MONEYGATE 专项守卫通过（行为锁 3 组 + 静态锁 6 道 + 两态复活负锁）"
 
@@ -1290,7 +1312,7 @@ grep -q 'EndDate string' internal/strategy_engine/types.go || { echo "--- FAIL: 
 grep -q 'AnnDate string' internal/strategy_engine/types.go || { echo "--- FAIL: FinancialData 披露日字段丢失（§N-5）"; exit 1; }
 grep -q 'COALESCE(ann_date' internal/store/store.go || { echo "--- FAIL: FinaHistory 对 NULL ann_date 的 COALESCE 丢失（一个空值即令整查询报错、财务因子全 0，§N-5 根因复活）"; exit 1; }
 # 负向锁（滤注释行）：fina_cache 旧「err == nil && len(rows) > 0」把查库错误折叠成"没有财报"的写法不得复活。
-if grep -n 'err == nil && len(rows) > 0' cmd/quant/fina_cache.go | grep -vE '^[0-9]+:[[:space:]]*(//|\*)' | grep -q .; then
+if grep -n 'err == nil && len(rows) > 0' cmd/quant/fina_cache.go | grep -vE '^[0-9]+:[[:space:]]*(//|\*)' | has_hit; then
 	echo "--- FAIL: fina_cache 又用单一条件吞掉查库错误（§N-5 静默因子丢失复活）"; exit 1; fi
 # ── M-5 行为锁：TTL 内可复用 + query 续传 + e2e 建链 ──
 go test -count=1 ./internal/server/ -run 'TestSSETicketReusableWithinTTL|TestSSEQueryLastEventIDReplaysRing' 2>&1 | grep -E '^(--- FAIL|FAIL|ok)'
@@ -1301,7 +1323,7 @@ grep -q 'Query().Get("last_event_id")' internal/server/handlers_fix.go || { echo
 grep -q 'func (s \*Server) useSSETicket' internal/server/sse.go || { echo "--- FAIL: useSSETicket 改名回退（票据又回到消费即废语义，§M5 复活）"; exit 1; }
 grep -q 'last_event_id=' web/src/api/index.js || { echo "--- FAIL: 前端重建 URL 不带续读位置（§M5 前端腿丢失）"; exit 1; }
 # 负向锁（滤注释行）：消费即废的旧函数形态不得复活（改名即报警）。
-if grep -rn 'consumeSSETicket' internal/ --include='*.go' | grep -vE ':[0-9]+:[[:space:]]*(//|\*)' | grep -q .; then
+if grep -rn 'consumeSSETicket' internal/ --include='*.go' | grep -vE ':[0-9]+:[[:space:]]*(//|\*)' | has_hit; then
 	echo "--- FAIL: consumeSSETicket 真代码复活（§M5 语义回退）"; exit 1; fi
 echo "ok - §CONTRACT 专项守卫通过（行为锁 4 组 + 静态锁 14 道 + 吞错/作废负锁 2 道）"
 
@@ -1327,9 +1349,9 @@ H3_VALIDATE=$(grep -c 'err == nil && data.ValidateKLine(klines)' internal/strate
 grep -q 'KLineUnadj  *bool' internal/strategy_engine/types.go || { echo "--- FAIL: StockMarketData 不复权标记字段丢失（§H3 拒参与不可见）"; exit 1; }
 grep -q 'dayk-unadjusted-fallback' internal/strategy_engine/engine.go || { echo "--- FAIL: 复权链降级的 opslog 告警丢失（§H3 降级不可观测）"; exit 1; }
 # 负向锁（滤注释行）：① 腾讯 qfqday 缺失静默回退不复权；② 日K不经 applyDayKLine 闸门直写。
-if grep -n 'rows = stk.Day' internal/data/tencent.go | grep -vE '^[0-9]+:[[:space:]]*(//|\*)' | grep -q .; then
+if grep -n 'rows = stk.Day' internal/data/tencent.go | grep -vE '^[0-9]+:[[:space:]]*(//|\*)' | has_hit; then
 	echo "--- FAIL: 腾讯无 qfqday 又静默回退不复权 day（冒充前复权，§H3 旁支复活）"; exit 1; fi
-if grep -n 'md.KLines = e\.fetchDayKLine\|md.KLines, md.MoneyFlow = e\.cachedKLine' internal/strategy_engine/engine.go | grep -vE '^[0-9]+:[[:space:]]*(//|\*)' | grep -q .; then
+if grep -nE 'md.KLines = e\.fetchDayKLine|md.KLines, md.MoneyFlow = e\.cachedKLine' internal/strategy_engine/engine.go | grep -vE '^[0-9]+:[[:space:]]*(//|\*)' | has_hit; then
 	echo "--- FAIL: 日K又绕过 applyDayKLine 直写 KLines（不复权兜底会静默进因子计算，§H3 复活）"; exit 1; fi
 echo "ok - §H3 专项守卫通过（行为锁 2 组 + 顺序断言 + 静态锁 3 道 + 负锁 2 道）"
 
@@ -1346,18 +1368,18 @@ go test -count=1 ./internal/research/ -run 'TestNoteWindowFailTrace' 2>&1 | grep
 grep -q 'const finaStaleMaxDays = 240' cmd/quant/fina_cache.go || { echo "--- FAIL: §M-7 阈值常量丢失"; exit 1; }
 grep -q 'finaReportStale(fina' cmd/quant/fina_cache.go || { echo "--- FAIL: §M-7 新鲜度闸未被 Lookup 调用（定义了个寂寞）"; exit 1; }
 grep -q 'fina-stale-report' cmd/quant/fina_cache.go || { echo "--- FAIL: §M-7 停用告警 opslog 键丢失"; exit 1; }
-if grep -n 'YYYY-MM-DD，如 2026-06-30' internal/strategy_engine/types.go | grep -q .; then
+if grep -n 'YYYY-MM-DD，如 2026-06-30' internal/strategy_engine/types.go | has_hit; then
 	echo "--- FAIL: FinancialData 报告期注释又写回 YYYY-MM-DD（研究库实际 YYYYMMDD，M-7 解析口径会被误导）"; exit 1; fi
 # M-8/N-6 CLI：两同步函数必须返回 error 且分发点转成非零退出（log.Fatalf）。
 grep -q 'func cmdHithinkSyncValuations(client \*data.HithinkClient, db \*store.DB) error {' cmd/dataload/hithink_sync.go || { echo "--- FAIL: 估值同步又无返回值（批次失败无法非零退出，§M-8 复活）"; exit 1; }
 grep -q 'func cmdHithinkSyncFinIndicators(client \*data.HithinkClient, db \*store.DB, args \[\]string) error {' cmd/dataload/hithink_sync.go || { echo "--- FAIL: 财务指标同步又无返回值（§M-8/N-6 复活）"; exit 1; }
-H_ERR=$(grep -c 'if err := cmdHithinkSync\(Valuations\|FinIndicators\)' cmd/dataload/hithink_sync.go)
+H_ERR=$(grep -cE 'if err := cmdHithinkSync(Valuations|FinIndicators)\(' cmd/dataload/hithink_sync.go || true)
 [ "$H_ERR" -ge 2 ] || { echo "--- FAIL: 分发点吃 err 的非零退出腿 $H_ERR < 2（§M-8 降级错误又被吞）"; exit 1; }
 # M-8/N-6 research：五处逐窗装配失败计数 + 统一降级行；ckpt save 双吞（_ =）必须绝迹。
 R_FAIL=$(grep -c 'failed++' internal/research/windowed.go)
 [ "$R_FAIL" -ge 5 ] || { echo "--- FAIL: 窗口装配失败计数点 $R_FAIL < 5（有腿又静默 continue，§N-6 复活）"; exit 1; }
 grep -q 'func noteWindowFail' internal/research/windowed.go || { echo "--- FAIL: 缺窗降级留痕函数丢失（§N-6）"; exit 1; }
-if grep -nE '_ = c\.db\.PutWindowCkpt' internal/research/windowed.go | grep -vE '^[0-9]+:[[:space:]]*(//|\*)' | grep -q .; then
+if grep -nE '_ = c\.db\.PutWindowCkpt' internal/research/windowed.go | grep -vE '^[0-9]+:[[:space:]]*(//|\*)' | has_hit; then
 	echo "--- FAIL: 断点落库又 \`_ =\` 吞错（整晚断点没存上不可见，§N-6 复活）"; exit 1; fi
 # M-8/N-6 sector_agent：成分股验证失败计数 + 降级文案。
 S_FAIL=$(grep -c 'verifyFailed' internal/sector_agent/agent.go)
@@ -1370,7 +1392,7 @@ N7_GO=$(grep -n 'go o\.loop(stopCh)' internal/notify/outbox.go | grep -vE '^[0-9
 [ -n "$N7_ADD" ] && [ -n "$N7_GO" ] || { echo "--- FAIL: saveWG/go loop 锚点丢失（§N-7 顺序锁失效）"; exit 1; }
 [ "$N7_ADD" -lt "$N7_GO" ] || { echo "--- FAIL: WaitGroup 计数又落在 loop 内（Stop 的 Wait 可在 Add 前返回，§N-7 -race 实录）"; exit 1; }
 # 负锁：每次变更各起一个写协程（并发 rename 互踩的根形）必须绝迹。
-if grep -nE 'go func\(path string, items \[\]outboxPersistItem\)' internal/notify/outbox.go | grep -q .; then
+if grep -nE 'go func\(path string, items \[\]outboxPersistItem\)' internal/notify/outbox.go | has_hit; then
 	echo "--- FAIL: saveLocked 又按变更各起写协程（Windows 并发 AtomicWrite Access denied 根因，§N-7 复活）"; exit 1; fi
 echo "ok - §ROBUST 专项守卫通过（行为锁 2 组 + 静态锁 9 道 + 顺序断言 + 负锁 3 道）"
 
@@ -1389,7 +1411,7 @@ if grep -qE '"POST /api/news/test-attribution", s\.authMiddleware' internal/serv
 	echo "--- FAIL: §M-14 又回退成 authMiddleware（普通成员可越权写全局信号簿）"; exit 1; fi
 # C6 静态锁：买入幂等键战法分量必须由 StrategyKeyOf 单点派生；旧 StrategyID?:Strategy 分叉形态绝迹。
 grep -q 'stratKey := signalctl.StrategyKeyOf(sig)' internal/engine/engine.go || { echo "--- FAIL: §C6 幂等键又绕开 StrategyKeyOf（与准入探针分叉复活）"; exit 1; }
-if grep -nE 'if sig\.StrategyID != "" \{[[:space:]]*stratKey' internal/engine/engine.go | grep -q .; then
+if grep -nE 'if sig\.StrategyID != "" \{[[:space:]]*stratKey' internal/engine/engine.go | has_hit; then
 	echo "--- FAIL: §C6 旧键派生（StrategyID 优先回退显示名）复活"; exit 1; fi
 # C9 静态锁：短路三要素在位（哨兵错误 / 阈值常量 / 自监控播报走站内两路）。
 grep -q 'ErrNtfyShortCircuit = ' internal/notify/ntfy.go || { echo "--- FAIL: §C9 短路哨兵错误丢失"; exit 1; }
@@ -1401,7 +1423,7 @@ if grep -A 3 'func (s \*Server) handleFixNotifyTest' internal/server/handlers_fi
 # A5 静态锁：网关两处时段判定都必须消费 trading_calendar；旧「仅 weekday」裸启发式绝迹（注释行除外）。
 grep -q 'from trading_calendar import' qmt_gateway/handler.py || { echo "--- FAIL: handler.py 又断开真日历接线（§A5 节假日误判复活）"; exit 1; }
 grep -q 'from trading_calendar import' qmt_gateway/qmt_bridge.py || { echo "--- FAIL: qmt_bridge.py 又断开真日历接线（§A5）"; exit 1; }
-if grep -nE '^    if now\.weekday\(\) >= 5:$' qmt_gateway/qmt_bridge.py | grep -vE '^[0-9]+:\s*#' | grep -q .; then
+if grep -nE '^    if now\.weekday\(\) >= 5:$' qmt_gateway/qmt_bridge.py | grep -vE '^[0-9]+:\s*#' | has_hit; then
 	echo "--- FAIL: qmt_bridge 工作日启发式又做主判定（应只在无日历兜底分支）"; exit 1; fi
 grep -q 'closed_days' qmt_gateway/trading_calendar.py || { echo "--- FAIL: 交易日历读取模块丢失（§A5）"; exit 1; }
 # §A5 部署清单锁（09-21 qmt_bridge_strategy 漏列同族教训）：日历模块必须随网关一起下发，
@@ -1480,7 +1502,7 @@ grep -q 'func mapBinanceReportStatus' internal/trading/binance_report.go || { ec
 grep -q 'ApplyOrderReportTx' internal/trading/binance_report.go || { echo "--- FAIL: §P2 回报腿绕过 ApplyOrderReportTx 权威写口"; exit 1; }
 grep -q '"ext:"' internal/trading/binance_report.go || { echo "--- FAIL: §P2 缺 §F5 ext: 占位信号键（手工/先到回报会撞 UNIQUE）"; exit 1; }
 # 负锁：回报腿绝不许直写 INSERT 旁路（必须走 store 权威写口，秩守卫/幂等判重都在那里）。
-if grep -q 'INSERT INTO orders\|INSERT INTO fills' internal/trading/binance_report.go; then echo "--- FAIL: §P2 回报腿直写 INSERT（必须走 store 权威写口）"; exit 1; fi
+if grep -qE 'INSERT INTO orders|INSERT INTO fills' internal/trading/binance_report.go; then echo "--- FAIL: §P2 回报腿直写 INSERT（必须走 store 权威写口）"; exit 1; fi
 # §15.2 隔离：ForMarket 聚合族在位 + real_account 复合主键（漏改=跨币种串账/账户行互相覆盖）。
 NG=$(grep -c 'func (d \*DB) .*ForMarket' internal/store/risk_gates.go)
 [ "$NG" -ge 5 ] || { echo "--- FAIL: §P2 ForMarket 聚合仅 $NG 处（<5，日亏/集中度/买入纪律族漏改）"; exit 1; }
@@ -1512,7 +1534,10 @@ go test -count=1 ./internal/strategies/xasset/ 2>&1 | grep -E '^(--- FAIL|FAIL|o
 go test -count=1 ./internal/risk/ -run 'TestGateMarketHaltP3' 2>&1 | grep -E '^(--- FAIL|FAIL|ok)'
 go test -count=1 ./internal/trading/ -run 'Feed' 2>&1 | grep -E '^(--- FAIL|FAIL|ok)'
 # 前端市场维度 + M-10 轮询后到丢弃守卫（两条 vitest 文件级锁，非全量 npm test——全量在 -full 档）
-( cd web && npx vitest run src/__tests__/binance_market_p4.test.jsx src/__tests__/m10_stale_guard.test.jsx >/dev/null 2>&1 ) || { echo "--- FAIL: §P4 前端市场维度/staleGuard vitest 未通过"; exit 1; }
+# §2026-10-13 迁入 vitest_gate：原为裸 `( cd web && npx vitest run … >/dev/null 2>&1 )`，
+# 内存不足时输出 `Tests no tests`（Duration 卡满 60s）却被判「§P4 vitest 未通过」——M1 负锁
+# 只拦 `npm test` 形态，这类 `npx vitest` 写法整体漏网。输出不再被 /dev/null 吞，便于归因。
+vitest_gate "§P4 前端市场维度/staleGuard" 'npx vitest run src/__tests__/binance_market_p4.test.jsx src/__tests__/m10_stale_guard.test.jsx' 'binance_market_p4 m10_stale_guard'
 # ---- 静态锁 ----
 # 缺陷①负锁：组合流分流比较必须走 LowerForm——混大小写直比 "@"+常量 的旧写法复活即红
 # （旧形态下 tradingStatus 分支永远不可达，闸恒"无证据"，US 单被 fail-close 全拒还是假绿全靠这条钉）。
@@ -1559,7 +1584,7 @@ go test -count=1 ./internal/btreplay/ -run 'WalkForward' 2>&1 | grep -E '^(--- F
 go test -count=1 ./internal/engine/ -run 'SlipFracs|FNGSnapshot|XEvents' 2>&1 | grep -E '^(--- FAIL|FAIL|ok)'
 go test -count=1 ./internal/server/ -run 'BinanceKline|BinanceStateFNG|BinanceStateXEvents|BinanceConfigEvents' 2>&1 | grep -E '^(--- FAIL|FAIL|ok)'
 # B5 前端图表试点两文件（文件级锁，非全量 npm test——全量在 -full 档）
-( cd web && npx vitest run src/__tests__/xpro_chart_p5.test.jsx src/__tests__/binance_xpro_p5.test.jsx >/dev/null 2>&1 ) || { echo "--- FAIL: §ENH-B5 XProChart vitest 两文件未通过"; exit 1; }
+vitest_gate "§ENH-B5 XProChart 两文件" 'npx vitest run src/__tests__/xpro_chart_p5.test.jsx src/__tests__/binance_xpro_p5.test.jsx' 'xpro_chart_p5 binance_xpro_p5'
 # ---- 静态锁：正锁（装配断链=证据腿整块蒸发）----
 grep -q 'func (r \*Registry) FNGSnapshot' internal/engine/registry_fng.go || { echo "--- FAIL: §ENH-A1 Registry.FNGSnapshot 证据出口丢失"; exit 1; }
 grep -q 'func (r \*Registry) attachXEventSource' internal/engine/registry_events.go || { echo "--- FAIL: §ENH-A4/B8 Registry.attachXEventSource 事件腿装配口丢失"; exit 1; }
@@ -1582,22 +1607,22 @@ test -f web/src/components/XProChart.jsx || { echo "--- FAIL: §ENH-B5 XProChart
 grep -q 'lightweight-charts' web/package.json || { echo "--- FAIL: §ENH-B5 web 图表依赖声明丢失"; exit 1; }
 # ---- 静态锁：负锁（工厂默认值/依赖红线/页级未授权接入）----
 # B6 负锁：装配层不得出现 WalkForward: nil 显式占位（nil=关闭由零值天然达成，显式写出=口径漂移信号；测试夹具除外）。
-if grep -rn 'WalkForward: nil' internal cmd --include='*.go' | grep -v _test.go | grep -q .; then echo "--- FAIL: §ENH-B6 非测试代码出现 WalkForward: nil 显式占位"; exit 1; fi
+if grep -rn 'WalkForward: nil' internal cmd --include='*.go' | grep -v _test.go | has_hit; then echo "--- FAIL: §ENH-B6 非测试代码出现 WalkForward: nil 显式占位"; exit 1; fi
 # B7 工厂默认锁：internal/config/ 任何 .go 不得字面量初始化 SlippagePassthrough（工厂必须 0=关=字节兼容）。
-if grep -rn 'SlippagePassthrough:' internal/config/ --include='*.go' | grep -q .; then echo "--- FAIL: §ENH-B7 internal/config/ 出现 SlippagePassthrough 非零初始化（工厂必须保持 0=关）"; exit 1; fi
+if grep -rn 'SlippagePassthrough:' internal/config/ --include='*.go' | has_hit; then echo "--- FAIL: §ENH-B7 internal/config/ 出现 SlippagePassthrough 非零初始化（工厂必须保持 0=关）"; exit 1; fi
 # Go 零新依赖红线（§2.9）：图表依赖只准留在 web/，go.mod/go.sum 出现 lightweight 即违例。
 if grep -qi 'lightweight' go.mod go.sum; then echo "--- FAIL: §ENH-B5 go.mod/go.sum 出现 lightweight 依赖（Go 侧零新依赖红线）"; exit 1; fi
 # B5 试点范围锁：XProChart 原为「组件+测试」试点；§市场分家-1（2026-09-24 owner 缺陷单）
 # 只授权扩展 Positions.jsx 展开行（US/CRYPTO 专业蜡烛图，替代 CN 分时误挂）。白名单外的
 # pages/ 出现 XProChart 仍是越界——试点扩面要逐页授权，不允许借修复批整体解禁。
-if grep -rl 'XProChart' web/src/pages/ | grep -v '^web/src/pages/Positions.jsx$' | grep -q .; then echo "--- FAIL: §ENH-B5 XProChart 进入未授权页面（白名单仅 Positions.jsx）"; exit 1; fi
+if grep -rl 'XProChart' web/src/pages/ | grep -v '^web/src/pages/Positions.jsx$' | has_hit; then echo "--- FAIL: §ENH-B5 XProChart 进入未授权页面（白名单仅 Positions.jsx）"; exit 1; fi
 # ---- A2/A3 观测面交付物：三文件在位 + 可解析 + 明文密钥负锁 ----
 test -f ops/gatus/config.yaml && test -f ops/grafana/dashboard.json && test -f ops/prometheus/prometheus.yml || { echo "--- FAIL: §ENH-A2/A3 ops/ 观测面三件套缺失"; exit 1; }
 ruby -ryaml -e 'YAML.safe_load(File.read(ARGV[0]))' ops/prometheus/prometheus.yml || { echo "--- FAIL: §ENH-A2 prometheus.yml YAML 解析失败"; exit 1; }
 ruby -ryaml -e 'YAML.safe_load(File.read(ARGV[0]))' ops/gatus/config.yaml || { echo "--- FAIL: §ENH-A2 gatus config.yaml YAML 解析失败"; exit 1; }
 python3 -c "import json;json.load(open('ops/grafana/dashboard.json'))" || { echo "--- FAIL: §ENH-A3 grafana dashboard.json JSON 解析失败"; exit 1; }
 # 明文密钥负锁：ops/ 任何 yml/yaml/json 不得出现 token/key/secret 明文赋值（ENV 占位除外）。
-if grep -RniE '(token|key|secret)[[:space:]]*[:=][[:space:]]*["'"'"']?[A-Za-z0-9_-]{8,}' ops --include='*.yml' --include='*.yaml' --include='*.json' | grep -v '\${' | grep -viE 'cryptopanic_token"|_masked|has_crypto' | grep -q .; then echo "--- FAIL: §ENH-A2/A3 ops/ 出现明文密钥赋值（只准 ENV 变量占位）"; exit 1; fi
+if grep -RniE '(token|key|secret)[[:space:]]*[:=][[:space:]]*["'"'"']?[A-Za-z0-9_-]{8,}' ops --include='*.yml' --include='*.yaml' --include='*.json' | grep -v '\${' | grep -viE 'cryptopanic_token"|_masked|has_crypto' | has_hit; then echo "--- FAIL: §ENH-A2/A3 ops/ 出现明文密钥赋值（只准 ENV 变量占位）"; exit 1; fi
 echo "ok - §ENH 增强批 A+B 专项守卫通过（行为锁 7 组 + 静态锁 26 道〔等值锁 1：slipFracs=2；负锁 5：WalkForward 占位 / config 工厂默认 / Go 依赖红线 / pages 试点越界 / ops 明文密钥；ops 解析锁 3；余为正锁/定点锁〕）"
 
 echo "==> 61 §MR 市场实际改造批：数据面/交易面拆分 + 7×24 维护节拍 + NYSE 规则日历 + 清扫按市场（2026-09-23 PLAN_MARKET_REALITY）..."
@@ -1691,7 +1716,7 @@ go_run_gate internal/server 'TestQuoteEndpoint' '§市场分家-1 /api/binance/q
 # 行为锁②：币安现货帧解析回归（真 "e" 字段帧必须可解——回归即整链 0 命中复辟）
 go_run_gate internal/data 'TestParseSpot' '§市场分家-1 现货帧解析回归未过'
 # 行为锁③：前端全局过滤 8 例（面板代码识别/四页 tab 门/自选添加入口拒收/抽屉现价腿双向互斥）
-( cd web && npx vitest run src/__tests__/mkt_split_p1.test.jsx >/dev/null 2>&1 ) || { echo "--- FAIL: §市场分家-1 前端市场过滤 vitest 未通过"; exit 1; }
+vitest_gate "§市场分家-1 前端市场过滤" 'npx vitest run src/__tests__/mkt_split_p1.test.jsx' 'mkt_split_p1'
 # ---- 静态锁：后端接线三点 + 碰撞吸收字段 ----
 grep -q '"GET /api/binance/quote"' internal/server/server.go || { echo "--- FAIL: §市场分家-1 现价路由丢失"; exit 1; }
 grep -q 'srv.SetQuoteSource(' cmd/quant/main.go || { echo "--- FAIL: §市场分家-1 现价闭包未注入（端点恒「链未装配」）"; exit 1; }
@@ -1723,7 +1748,7 @@ grep -q 'func reevalAllowsSettle(' internal/trading/discipline.go || { echo "---
 grep -q 'if extendHold && !reevalAllowsSettle(st.Line, line)' internal/trading/discipline.go || { echo "--- FAIL: §P0-C 准入判据未被调用（定义了个寂寞）"; exit 1; }
 grep -q 'func isLossLine(' internal/trading/discipline.go || { echo "--- FAIL: §P0-C 损失族判定丢失（止盈延持跌进损失线无法识别）"; exit 1; }
 # 负锁：延持态无条件 early-return 的旧形态绝迹（同族教训：只在注释里说改过、代码没改）。
-if grep -nE 'if st\.Settled && !st\.Confirmed \{[[:space:]]*return' internal/trading/discipline.go | grep -q .; then
+if grep -nE 'if st\.Settled && !st\.Confirmed \{[[:space:]]*return' internal/trading/discipline.go | has_hit; then
 	echo "--- FAIL: §P0-C 延持态又无条件 early-return（终态失明复活）"; exit 1; fi
 # 正锁：已确认态短路仍在（Settled && Confirmed 重放处置单，修复不得顺手放宽成重复出卡）
 grep -q 'if st.Settled && st.Confirmed {' internal/trading/discipline.go || { echo "--- FAIL: §P0-C 已确认态短路丢失（确认后会逐轮重复出卡）"; exit 1; }
@@ -1929,7 +1954,7 @@ pos_snap=$(printf '%s\n' "$locked_body" | grep -n 'gaugeSnapshot()' | head -1 | 
 { [ -n "$pos_refresh" ] && [ -n "$pos_snap" ] && [ "$pos_refresh" -lt "$pos_snap" ]; } \
 	|| { echo "--- FAIL: 刷新未发生在 gaugeSnapshot 之前（读到旧值）"; exit 1; }
 # 负锁②：禁止用「累计值直接相除」冒充窗口失败率（早期一次失败会永久挂着 5% 红线）。
-if grep -nE 'ordersRejected\.Load\(\) \* 1000 / \(ordersPlaced\.Load\(\) \+ ordersRejected\.Load\(\)\)' internal/metrics/*.go | grep -q .; then
+if grep -nE 'ordersRejected\.Load\(\) \* 1000 / \(ordersPlaced\.Load\(\) \+ ordersRejected\.Load\(\)\)' internal/metrics/*.go | has_hit; then
 	echo "--- FAIL: 又用全生命周期累计比冒充 5 分钟窗口失败率"; exit 1
 fi
 # 负锁③：静默跳过分支不得"什么都不写"（不写 = 保留上一轮残值，对账降级日会持续误报）。
@@ -1958,8 +1983,7 @@ if [ "$rc_g" -ne 0 ] || printf '%s\n' "$g_race" | grep -q '\[no test files\]'; t
 	printf '%s\n' "$g_race" | tail -10
 	echo "--- FAIL: §CFGSMASH-concurrency -race 未过（rc=${rc_g}；getter 又回退成别名活体，或测试被整删输出 ok [no test files] 同样判红）"; exit 1; fi
 go_run_gate internal/server 'TestSetStrategyConfig' '§N-4 端点级行为锁（部分键保存/409/坏结构 400，§UATFIX929 捕获式形态迁移）'
-( cd web && npx vitest run src/__tests__/n4_cfg_smash.test.jsx >/dev/null 2>&1 ) \
-  || { echo "--- FAIL: §N-4 前端三态加载/409 冲突锁未过（E1/E3/E4 之一失效）"; exit 1; }
+vitest_gate "§N-4 前端三态加载/409 冲突锁（E1/E3/E4）" 'npx vitest run src/__tests__/n4_cfg_smash.test.jsx' 'n4_cfg_smash'
 grep -q 'func (m \*Manager) MergeStrategyConfig(patch map\[string\]json.RawMessage' internal/config/config.go \
   || { echo "--- FAIL: 稀疏 merge 入口签名变更（回到整 struct 反序列化=缺键即清零）"; exit 1; }
 grep -q 'var ErrStrategyVersionConflict' internal/config/config.go || { echo "--- FAIL: 乐观锁哨兵错误丢失"; exit 1; }
@@ -1971,7 +1995,7 @@ grep -q 'UpdatedAt string `json:"updated_at,omitempty"`' internal/config/config.
 if ! grep -q 'json.RawMessage' <(sed -n '/func (s \*Server) handleSetStrategyConfig/,/^}/p' internal/server/server.go); then
 	echo "--- FAIL: handleSetStrategyConfig 不再走稀疏 merge（缺键清零复活）"; exit 1; fi
 # 负锁 2：前端 renderField 的 `?? 0` 兜底绝迹（缺失渲染成 0 是本缺陷的第二重）。
-if grep -nE '\?\? 0[[:space:]]*\}[[:space:]]*$|value=\{[^}]*\?\? 0\}' web/src/pages/Settings.jsx | grep -vE '^[0-9]+:[[:space:]]*(//|\*)' | grep -q .; then
+if grep -nE '\?\? 0[[:space:]]*\}[[:space:]]*$|value=\{[^}]*\?\? 0\}' web/src/pages/Settings.jsx | grep -vE '^[0-9]+:[[:space:]]*(//|\*)' | has_hit; then
 	echo "--- FAIL: 前端又用 ?? 0 渲染缺失字段（空表单被提交成全 0）"; exit 1; fi
 echo "ok - §CFGSMASH 专项守卫通过（行为锁 4 组含 -race + 静态锁 4 道 + 负锁 2 道）"
 
@@ -1999,7 +2023,7 @@ if grep -qE 'FROM daily d LEFT JOIN adj_factor a ON a\.ts_code=d\.ts_code AND a\
 # 路由唯一入口：导出变量形态绝迹 + 任何进程不得直改 + 装配点覆盖 8 个入口文件。
 if grep -qE '^var (PrimarySourceThsDaily|ThsFactorsReady) ' internal/store/source_routing.go internal/store/store.go; then
 	echo "--- FAIL: 路由开关又被导出成包级变量（cmd 可绕过唯一入口裸赋值，§P0-A）"; exit 1; fi
-if grep -rn 'store\.PrimarySourceThsDaily\|store\.ThsFactorsReady' --include='*.go' cmd internal 2>/dev/null | grep -q .; then
+if grep -rnE 'store\.PrimarySourceThsDaily|store\.ThsFactorsReady' --include='*.go' cmd internal 2>/dev/null | has_hit; then
 	echo "--- FAIL: 又出现 store.PrimarySourceThsDaily 直改（§P0-A 唯一入口失效）"; exit 1; fi
 [ "$(grep -rlE 'store\.ConfigureSource' --include='*.go' cmd internal | wc -l | tr -d ' ')" -ge 8 ] || { echo "--- FAIL: 路由装配点 < 8 个文件（有进程又走默认旧表口径）"; exit 1; }
 echo "ok - §ADJ 专项守卫通过（行为锁 3 例 + 静态锁 5 道 + 负锁 3 道）"
@@ -2056,7 +2080,7 @@ if LC_ALL=C awk '/^func \(e \*Engine\) storeDayKLine/{f=1;next} /^func /{if(f)ex
 	| grep -vE '^[[:space:]]*//' | grep -qE 'UPDATE |DELETE |INSERT |\.Exec\('; then
 	echo "--- FAIL: 库内日K腿里出现写库调用（打分链取数只准读）"; exit 1; fi
 # 负锁②：不复权兜底不得重新进 KLines（§H3 的收口成果不许被本批"加兜底"顺手抵消）。
-if grep -nE 'md\.KLines = .*GetSinaKLine|md\.KLines = .*GetTHSKLine' internal/strategy_engine/engine.go | grep -vE '^[0-9]+:[[:space:]]*(//|\*)' | grep -q .; then
+if grep -nE 'md\.KLines = .*GetSinaKLine|md\.KLines = .*GetTHSKLine' internal/strategy_engine/engine.go | grep -vE '^[0-9]+:[[:space:]]*(//|\*)' | has_hit; then
 	echo "--- FAIL: 不复权腿又直写 md.KLines（除权日因子失真复活，§H3）"; exit 1; fi
 echo "ok - §KLINE-CHAIN-3 守卫通过（行为锁 2 组 + 链序锁 2 + 四道守卫锁 5 + 留痕计数锁 1 + 装配锁 2 + 缓存锁 2 + 负锁 2）"
 
@@ -2121,10 +2145,10 @@ grep -q 'if adjBasis == ""' internal/store/emotion_matrix.go \
 # 只用裸 grep 会误伤说明性文字（store.go 的注释与日志里就在描述"旧行落成 adj_basis=''"这件事，
 # 那是正确行为，不是查询条件），故滤掉 // 行注释与 log.Printf 文案两族。
 if grep -rn "adj_basis *= *''" internal/store/store.go internal/store/backtest_jobs.go internal/store/emotion_matrix.go \
-	| grep -vE ':[0-9]+:[[:space:]]*(//|\*)' | grep -v 'log\.Printf' | grep -q .; then
+	| grep -vE ':[0-9]+:[[:space:]]*(//|\*)' | grep -v 'log\.Printf' | has_hit; then
 	echo "--- FAIL: 出现按空串口径查询（把改前旧行当成可复用的当前口径结果）"; exit 1; fi
 # 负锁：调用方不得图省事传空串（口径位必须由 research.AdjBaselineVersion 供给）。
-if grep -rn 'ListEmotionStrategyMatrix(' internal/server/*.go | grep -vE ':[0-9]+:[[:space:]]*(//|\*)' | grep -vE 'research\.AdjBaselineVersion' | grep -q .; then
+if grep -rn 'ListEmotionStrategyMatrix(' internal/server/*.go | grep -vE ':[0-9]+:[[:space:]]*(//|\*)' | grep -vE 'research\.AdjBaselineVersion' | has_hit; then
 	echo "--- FAIL: 情绪矩阵调用点未传 research.AdjBaselineVersion（口径位又变成可选参数）"; exit 1; fi
 echo "ok - §ADJ-BASIS-3 守卫通过（行为锁 2 组 + 主键锁 1 + 迁移锁 1 + 守恒锁 4 + 降级锁 2 + 聚合锁 3 + 负锁 2）"
 
@@ -2149,10 +2173,10 @@ grep -qE '"eslint": ' web/package.json \
 grep -q 'npm run lint -- --quiet' .github/workflows/ci.yml \
 	|| { echo "--- FAIL: CI 未跑 lint（本地门禁不约束合并）"; exit 1; }
 # 行为锁：健康载荷下「实盘链路」必须真的渲染出来（防"整行静默不渲染"回退——改名不重要，断言才是锁）。
-if ! ( cd web && npx vitest run src/__tests__/n1_qmt_link.test.jsx ) >/dev/null 2>&1; then
+if vitest_gate "§LINTGATE 实盘链路渲染（E1/E2/E3）" 'npx vitest run src/__tests__/n1_qmt_link.test.jsx' 'n1_qmt_link'; then :; else
 	echo "--- FAIL: §LINTGATE 实盘链路渲染行为锁未通过（E1 渲染/E2 熔断如实展示/E3 未启用不渲染）"; exit 1; fi
 # 负锁（滤注释行）：未声明符号的实调用形态绝迹。
-if grep -n 'setQMTState' web/src/pages/Dashboard.jsx | grep -vE '^[0-9]+:[[:space:]]*(//|\*)' | grep -q .; then
+if grep -n 'setQMTState' web/src/pages/Dashboard.jsx | grep -vE '^[0-9]+:[[:space:]]*(//|\*)' | has_hit; then
 	echo "--- FAIL: 又出现 setQMTState 实调用（未声明符号，会被空 catch 吞成静默失效）"; exit 1; fi
 # 实跑：全 src 的 error 必须为 0（warn 不阻塞）。
 if ! ( cd web && npx eslint src --quiet ); then
@@ -2162,7 +2186,7 @@ if ! ( cd web && npx eslint src --quiet ); then
 #       还在——于是界面把"这台机器上根本不会再有网关"说成"网关开着但一切正常/等开盘就好"，
 #       运维去排查一条不存在的链路。修法=三态（frozen/off/down）单源裁决 + 三处展示位分流。
 # 行为锁：三态裁决语义单测 + 量化页冻结态渲染回归（含「按钮保留但禁用、点了不发切换请求」）。
-if ! ( cd web && npx vitest run src/__tests__/gateway_link_state.test.js src/__tests__/quant_frozen_panel.test.jsx ) >/dev/null 2>&1; then
+if vitest_gate "§QMT-FROZEN 三态裁决/冻结面板行为锁" 'npx vitest run src/__tests__/gateway_link_state.test.js src/__tests__/quant_frozen_panel.test.jsx' 'gateway_link_state quant_frozen_panel'; then :; else
 	echo "--- FAIL: §QMT-FROZEN 三态裁决/冻结面板行为锁未通过"; exit 1; fi
 # 浏览器端行为锁的**静态半边**（实跑半边在 nightly-e2e 与本仓收口批的 playwright 全量里）：
 # 为什么要单独立锁——vitest 里 api 整体是 mock 的，它证明不了 App.jsx 那条 cn_master 转发腿在
@@ -2264,7 +2288,7 @@ if ! ( go test -count=1 ./internal/config/ -run 'StaleAdjBasis|StaleBasis' >/dev
 	echo "--- FAIL: §ADJ-BASIS-2 处置档（shadow|disable + 未知值归一）行为锁未通过"; exit 1; fi
 if ! ( go test -count=1 ./internal/metrics/ -run 'StaleBasis' >/dev/null 2>&1 ); then
 	echo "--- FAIL: §ADJ-BASIS-2 两条 p1 告警行为锁未通过"; exit 1; fi
-if ! ( cd web && npx vitest run src/__tests__/library_adj_basis_badge.test.jsx >/dev/null 2>&1 ); then
+if vitest_gate "§ADJ-BASIS-2 前端红标渲染" 'npx vitest run src/__tests__/library_adj_basis_badge.test.jsx' 'library_adj_basis_badge'; then :; else
 	echo "--- FAIL: §ADJ-BASIS-2 前端红标渲染行为锁未通过"; exit 1; fi
 # 常量单源与跨语言等值（Go 侧三段拼接 + JS 侧一份副本必须同值）。
 grep -q 'const AdjBaselineVersion = "hfq-forward-fill-1"' internal/research/windowed.go \
@@ -2291,9 +2315,12 @@ JS_ADJ=$(grep -oE "CURRENT_ADJ_BASELINE = '[^']*'" web/src/pages/Research.jsx | 
 [ "$(grep -c 'failClose && .*StaleAdjBasis' internal/research/apply.go || true)" -eq 2 ] \
 	|| { echo "--- FAIL: 实盘注入的 stale 硬闸不是恰好 2 处（因子/形态各一，多一处=有人新开注入腿绕过判定）"; exit 1; }
 # 告警与路由：两条规则名/指标名逐字对齐，且显式 RoutePush（靠 DefaultRoute 兜=推送面静默漂移）。
-[ "$(grep -c 'applied_factor_stale_basis\|applied_pattern_stale_basis' internal/metrics/alerter.go || true)" -eq 2 ] \
+# §2026-10-13 修恒红：这两条原写成 BRE `grep -c 'a\|b'`，本机 grep（shim/toybox）不支持 BRE 的
+# `\|` 交替、按字面量匹配 ⇒ 恒 0 命中 ⇒ `-eq 2` 从写下那天起就没绿过，而告警规则其实一直在。
+# 与 §H_ERR 同族。凡要写多分支正则，一律 `-E` + `|`（无 `-E` 时用 `grep -E`），禁用 BRE 交替。
+[ "$(grep -cE 'applied_factor_stale_basis|applied_pattern_stale_basis' internal/metrics/alerter.go || true)" -eq 2 ] \
 	|| { echo "--- FAIL: 两条 stale 口径告警规则丢失（发现面没了，只剩展示面）"; exit 1; }
-[ "$(grep -c 'applied_factor_stale_basis\|applied_pattern_stale_basis' internal/metrics/alert_routing.go || true)" -eq 2 ] \
+[ "$(grep -cE 'applied_factor_stale_basis|applied_pattern_stale_basis' internal/metrics/alert_routing.go || true)" -eq 2 ] \
 	|| { echo "--- FAIL: 两条告警的 RoutePush 显式路由丢失（改走 DefaultRoute=推送面不可预期）"; exit 1; }
 # 配置键与装配（活回调：热重载后处置档要跟着变，静态值=改配置不生效还得不到提示）。
 [ "$(grep -cF 'json:"stale_adj_basis_action' internal/config/config.go || true)" -eq 1 ] \
@@ -2309,7 +2336,7 @@ if grep -qE 'ConfigureStaleAdjBasisAction\(' cmd/quant/main.go; then
 [ "$(grep -cF '<AdjBasisStaleTag' web/src/pages/Research.jsx || true)" -eq 1 ] \
 	|| { echo "--- FAIL: 前端红标渲染点不是恰好 1 处"; exit 1; }
 # 负锁：派生位禁止落盘 tag（internal/research 侧；server/library.go 的展示字段是合法的，别误圈）。
-if grep -rnF 'json:"stale_adj_basis' internal/research/*.go | grep -v '_test' | grep -q .; then
+if grep -rnF 'json:"stale_adj_basis' internal/research/*.go | grep -v '_test' | has_hit; then
 	echo "--- FAIL: internal/research 里给派生位加了落盘 tag（旧文件里的 false 会永久自证清白）"; exit 1; fi
 # 负锁（切片版，防半边盲区）：isAdjBasisStale 函数体内不得出现按 kind 分流——
 # 因子与形态必须同规。全仓 grep 'kind ===' 会命中无关的候选过滤（实测 3 处），故按函数体切片判。
@@ -2349,7 +2376,7 @@ echo "==> 77 §UAT-SESSION + §Z4 e2e 会话单源与冻结位订阅腿（2026-0
 #       编译期红一律先怀疑测试侧，别拿放宽断言去掩盖。
 if ! ( cd web && npx playwright test --list >/dev/null 2>&1 ); then
 	echo "--- FAIL: e2e spec 解析/收集失败（playwright --list）——先怀疑测试自身，禁止改断言"; exit 1; fi
-if ! ( cd web && npx vitest run src/__tests__/n1_qmt_link.test.jsx src/__tests__/gateway_link_state.test.js >/dev/null 2>&1 ); then
+if vitest_gate "§Z4 冻结位晚到自唤醒 + 订阅广播契约" 'npx vitest run src/__tests__/n1_qmt_link.test.jsx src/__tests__/gateway_link_state.test.js' 'n1_qmt_link gateway_link_state'; then :; else
 	echo "--- FAIL: §Z4 行为锁未通过（E5 冻结位晚到时整行自唤醒 + 订阅广播契约）"; exit 1; fi
 # 静态锁：订阅腿与依赖腿（缺一即"缓存变了没人重算"）。
 grep -q 'const cnMaster = useSyncExternalStore(subscribeCnMaster, getCnMaster, getCnMaster)' web/src/pages/Dashboard.jsx \
@@ -2437,7 +2464,7 @@ echo "ok - §UAT-SESSION/§Z4 守卫通过（行为锁 2 组 + 静态锁 6 + 接
 # ══════════════════════════════════════════════════════════════════════════════
 echo "==> 78 §AUDITFIX925 审计批七条锁（D4 接警/D2 fetch 契约/D6a-d 部署面/D9 深探针）..."
 # ── 行为锁①：前端两族新用例（binance_halt 接警 + 币安 fetch 层等值契约）───────────────
-if ! ( cd web && npx vitest run src/__tests__/utils.test.js src/__tests__/binance_contract.test.js >/dev/null 2>&1 ); then
+if vitest_gate "§AUDITFIX925 行为锁①（接警映射 / 币安 fetch 契约等值）" 'npx vitest run src/__tests__/utils.test.js src/__tests__/binance_contract.test.js' 'utils.test binance_contract'; then :; else
 	echo "--- FAIL: §AUDITFIX925 行为锁①未过（vitest：接警映射 / 币安 fetch 层契约等值断言）"; exit 1; fi
 # ── 行为锁②：/api/health 双形态（默认体字节等价 golden + deep 同源对拍）──────────────
 go test -count=1 ./internal/server -run 'TestHealth' 2>&1 | grep -E '^(--- FAIL|FAIL|ok)'
@@ -2622,15 +2649,21 @@ if "adminMiddleware" in lines[0]:
 print("ok - §N5 按钮 isAdmin 包裹在位 + §D3 adminMiddleware 负锁通过")
 PY
 # ── 行为锁：五组真跑（pytest 双文件 / Go 三包定向 / vitest D1 组件用例）─────────
-if ! python3 -m pytest qmt_gateway/tests/test_report_token_guard.py qmt_gateway/tests/test_pydata_token_n4.py -q >/dev/null 2>&1; then
-	echo "--- FAIL: §N2/N3/N4 python 行为锁未通过（口令双源拒启/白名单预警/pydata 闸）"; exit 1; fi
+# §2026-10-13 修恒红：此处原是裸 `python3 -m pytest a.py b.py -q`，而**本机没装 pytest**
+# （脚本头注释里早就写明"py_tests() 会自动退回 unittest"这个既有事实），裸调用于是必然红、
+# 且输出被 >/dev/null 2>&1 吞掉看不出原因。改走 py_tests 单源出口（两文件各跑一次）。
+# 不吞输出：真红时要能在日志里看到 pytest/unittest 的失败详情，否则又是一条"红得不明不白"的锁。
+if ! py_tests qmt_gateway/tests/test_report_token_guard.py 2>&1 | tail -3 | has_hit; then
+	echo "--- FAIL: §N2/N3 口令双源拒启/白名单预警行为锁未通过（test_report_token_guard.py）"; exit 1; fi
+if ! py_tests qmt_gateway/tests/test_pydata_token_n4.py 2>&1 | tail -3 | has_hit; then
+	echo "--- FAIL: §N4 pydata 闸行为锁未通过（test_pydata_token_n4.py）"; exit 1; fi
 if ! go test ./internal/trading -run 'TestQMTHealth' -count=1 >/dev/null 2>&1; then
 	echo "--- FAIL: §N3 Go 健康探测分流用例红（403 人话/判定语义不变）"; exit 1; fi
 if ! go test ./internal/data -run 'TestBaostock' -count=1 >/dev/null 2>&1; then
 	echo "--- FAIL: §N4 baostock 口令头用例红（空 token 逐字节兼容/配置即发头）"; exit 1; fi
 if ! go test ./internal/server -run 'TestRoutePermsGolden|TestExecuteDeviationGate|TestWritePerms' -count=1 >/dev/null 2>&1; then
 	echo "--- FAIL: §N10 权限矩阵 golden / §D1 偏离闸行为 / 写端点普查红"; exit 1; fi
-if ! ( cd web && npx vitest run src/__tests__/d1_price_deviation_confirm.test.jsx >/dev/null 2>&1 ); then
+if vitest_gate "§D1 偏离二次确认组件用例" 'npx vitest run src/__tests__/d1_price_deviation_confirm.test.jsx' 'd1_price_deviation_confirm'; then :; else
 	echo "--- FAIL: §D1 偏离二次确认组件用例红（弹窗分流/confirm_deviation 重发/普通错误不误弹）"; exit 1; fi
 echo "ok - §AUDITFIX926 专项守卫通过（行为锁 5 组 + 静态/正负锁 30 道）"
 
@@ -2695,7 +2728,7 @@ if ! grep -q 'SETUP_OLD' scripts/deploy_seoul.sh; then
 # 后端锁 TestUATFIX929StateDisclaimer 两用例（signed 值等 config 面逐字节 / 未签也必发键）；
 # 前端 vitest 锁渲染优先级（state 有值不回落 config）。
 go_run_gate internal/server 'TestUATFIX929StateDisclaimer' '§UATFIX929-C state 面披露签署键行为锁'
-if ! ( cd web && npx vitest run src/__tests__/uatfix929_card_disclaimer.test.jsx >/dev/null 2>&1 ); then
+if vitest_gate "§UATFIX929-C 币安状态卡披露签署组件" 'npx vitest run src/__tests__/uatfix929_card_disclaimer.test.jsx' 'uatfix929_card_disclaimer'; then :; else
 	echo "--- FAIL: §UATFIX929-C 币安状态卡披露签署组件用例红（state 优先渲染/空值显未签署）"; exit 1; fi
 # ── M4-lite 行为锁：模拟柜台保真五修 + 撤单终态码值 ─────────────────────────
 # 背景：审计 P2-E 保真差中「马上能改」的五条（cancel 409 / broker_mode / feed_age_sec /
@@ -2729,8 +2762,16 @@ echo "==> 82 §FIX1012 全栈审计施工批守卫（M1 vitest 假红兜底 / M3
 # 第 8 段 `npm test -- icp_footer` 被 SIGKILL（exit 137）零用例执行，pipefail 下整轮
 # 验收门退出 1 却无一条 FAIL 行，与本段头注释记录的 2026-10-12 事故同形。负锁改为
 # 拦一切**行首裸调用**（带不带 `--` 过滤都拦），只放行函数体内的默认参数与注释。
+#
+# ★ 同日二次修正：上面那条只拦 `npm test` 形态，而**另有 11 处写成 `npx vitest run …`**
+# 的裸调用（含 `>/dev/null 2>&1` 吞输出的），负锁一概没拦到。实测第 59 段
+# `( cd web && npx vitest run binance_market_p4.test.jsx … >/dev/null 2>&1 )` 在内存
+# 不足时输出 `Tests no tests` + Duration 60s 超时，被判「§P4 vitest 未通过」——正是本段
+# 要根治的假红，只是换了调用形态。负锁一并覆盖 `npx vitest`。
 if grep -qE '^[[:space:]]*\([[:space:]]*cd web && npm test' scripts/verify_changes.sh; then
 	echo "--- FAIL: §FIX1012-M1 裸 npm test 复活（worker 启动失败会被当成真红，无兜底）"; exit 1; fi
+if grep -qE '^[[:space:]]*(if[[:space:]]+!?[[:space:]]*)?\([[:space:]]*cd web && npx vitest' scripts/verify_changes.sh; then
+	echo "--- FAIL: §FIX1012-M1 裸 npx vitest 复活（换写法绕过 vitest_gate，worker 失败即假红）"; exit 1; fi
 if ! grep -q 'vitest_gate ' scripts/verify_changes.sh; then
 	echo "--- FAIL: §FIX1012-M1 vitest_gate 单源出口缺失"; exit 1; fi
 if ! grep -q 'vitest.serial.config.js' scripts/verify_changes.sh; then
@@ -2755,6 +2796,48 @@ if ! grep -q '降级仍零用例' scripts/verify_changes.sh; then
 gofmt_off=$(gofmt -l internal cmd 2>/dev/null | wc -l | tr -d ' ' || true)
 if [ "${gofmt_off:-0}" -ne 0 ]; then
 	echo "--- FAIL: §FIX1012 gofmt 未格式化文件计 ${gofmt_off}（须 0）：$(gofmt -l internal cmd 2>/dev/null | tr '\n' ' ')"; exit 1; fi
+# ── BRE 交替防回潮（2026-10-13 第三次修正）──────────────────────────────────────
+# 背景：本机 grep（shim/toybox）**不支持 BRE 的 `\|` 交替**，按字面量匹配且**不报错**，
+# 于是一条 `grep -c 'a\|b' … -eq 2` 恒为 0 → 断言恒红，肉眼完全看不出来。§76 那两条
+# stale 告警规则锁就是这么从写下那天起就没绿过（规则一直在，是锁写错了）；普查还揪出
+# 4 处同类：其中 3 处是**负锁**（§P2 直写 INSERT、THS 主源旁路、§H3 日K直写 KLines、
+# M8 PushGateway 白名单）——负锁恒 0 意味着「将来违规也永远不会报警」，是更隐蔽的假绿。
+# 规则：本脚本内凡需多分支正则，一律 `-E` + `|`；`grep -v` 白名单同理。
+# 正锁：扫本脚本自身，命中即红。排除两类假阳性——① 注释行（^[[:space:]]*#）；
+#       ② **已带 -E 的形态**（如 `grep -qE 'if x == "" \|\| y()'`：ERE 里 \| 是合法字面量，
+#       它匹配的是 Go 源码里的 || 运算符，不是 BRE 交替问题，本就正确）。
+BRE_ALT_HITS=$(grep -nE "grep [^|]*'[^']*\\\\\|[^']*'" scripts/verify_changes.sh | grep -vE '^[0-9]+:[[:space:]]*#' | grep -vE "grep [^|]*-[a-zA-Z]*E[a-zA-Z]* " | grep -vE "printf .*AAA" | has_hit || true)
+if [ -n "${BRE_ALT_HITS}" ]; then
+	echo "--- FAIL: BRE 交替写法复活（$BRE_ALT_HITS）——本机 grep 不支持 \| 交替，按字面量匹配且不报错，正锁恒红/负锁恒绿；请改 -E + |"; exit 1; fi
+# 反证：临时植入一条 BRE 交替写法的假锁，**必须被扫出来**（扫出=本锁有效，判绿）；
+# 扫不出来=本锁恒不命中、形同虚设，才判红。判定方向别写反——`if (…); then` 成立即"有命中"。
+if ( T=$(mktemp); cp scripts/verify_changes.sh "$T"; \
+     printf '%s\n' 'if grep -q '"'"'AAA\|BBB'"'"' x.go; then echo x; fi' >> "$T"; \
+     grep -nE "grep [^|]*'[^']*\\\\\|[^']*'" "$T" | grep -vE '^[0-9]+:[[:space:]]*#' | grep -vE "grep [^|]*-[a-zA-Z]*E[a-zA-Z]* " | grep -vE "printf .*AAA" | has_hit ); then
+	:
+else
+	echo "--- FAIL: §BRE 交替反证塌方：植入的 BRE 交替写法未被扫出（本锁恒不命中、形同虚设）"; exit 1; fi
+echo "ok - §BRE 交替守卫通过（零 BRE \| 写法 / 反证植入即红）"
+# ── 裸 pytest 负锁（2026-10-13 第四次修正）───────────────────────────────────────
+# 背景：§79 段行为锁原是裸 `python3 -m pytest a.py b.py -q`，而**本机没装 pytest**（脚本头
+# 注释早就写明"py_tests() 会自动退回 unittest"）⇒ 必然红，且 `>/dev/null 2>&1` 把原因吞掉，
+# 表现就是一条"红得不明不白"的锁（CI 装了 pytest 会绿 ⇒ 本地与 CI 长期分叉却无人发现）。
+# 规则：跑 py 测试一律走 py_tests 单源出口（内部按 pytest 是否存在自动分流）。
+# 正锁：helper 之外不得再出现 `python3 -m pytest`。**必须排除 py_tests 函数体**
+# （284/286 行那两处正是 py_tests 内部按 pytest 是否存在走的分流，是合法存在）——
+# 用行号区间排除：py_tests 起止行由 awk 现取，函数体内容随代码变动也不会失配。
+_PYT_H_START=$(awk '/^py_tests\(\) \{/{print NR; exit}' scripts/verify_changes.sh || true)
+_PYT_H_END=$(awk -v s="${_PYT_H_START:-0}" 'NR>=s && NR>s && /^\}/{print NR; exit}' scripts/verify_changes.sh || true)
+if grep -nE '^[[:space:]]*(if[[:space:]]+!?[[:space:]]+)?(if[[:space:]]+!?[[:space:]]+)?python3 -m pytest' scripts/verify_changes.sh \
+	| awk -F: -v s="${_PYT_H_START:-0}" -v e="${_PYT_H_END:-0}" '!($1>=s && $1<=e)' | has_hit; then
+	echo "--- FAIL: 裸 python3 -m pytest 复活（helper 外，本机无 pytest ⇒ 必然恒红且原因被吞；请走 py_tests）"; exit 1; fi
+if ( T=$(mktemp); cp scripts/verify_changes.sh "$T"; \
+     printf '%s\n' 'python3 -m pytest qmt_gateway/tests/x.py -q' >> "$T"; \
+     TAIL_LINE=$(wc -l < "$T" | tr -d ' '); \
+     grep -nE '^[[:space:]]*(if[[:space:]]+!?[[:space:]]+)?(if[[:space:]]+!?[[:space:]]+)?python3 -m pytest' "$T" \
+	| awk -F: -v s="${_PYT_H_START:-0}" -v e="${_PYT_H_END:-0}" '!($1>=s && $1<=e)' | grep -q "^[0-9]*:${TAIL_LINE}$" ); then
+	echo "--- FAIL: §裸 pytest 反证塌方：植入的裸调用未被扫出（本锁恒不命中、形同虚设）"; exit 1; fi
+echo "ok - §裸 pytest 守卫通过（零裸调用 / 反证植入即红）"
 echo "ok - §FIX1012-M1 守卫通过（零裸调用 / helper 在位 / 降级配置在位 / 反证 / 降级-SKIP 腿在位 / gofmt 干净）"
 # ── M3 静态锁：e2e 侧登录频控注释必须写实（10/min，不是 5/min）────────────────────
 # 背景：两处注释把 login 频控写成 5/分钟，实际 server.go:1209 是 10 次/分/IP；5/min 是
@@ -2808,7 +2891,7 @@ if ! grep -q 'attest-e2e' scripts/preflight_open_gate.sh; then
 # 这些文件从未被跟踪、且 .gitignore 已忽略；本锁反向验证——它们必须被 git check-ignore 命中。
 for secret in 'qmt_gateway/config.xt.json' 'scripts/ops.env' 'mobile/keystore.jks' 'mobile/keystore.pass' 'mobile/keystore-v2.jks'; do
 	if [ -f "$secret" ] && ! git check-ignore -q "$secret" 2>/dev/null; then
-		echo "--- FAIL: §FIX1012-M12 密钥文件未被 gitignore 拦截：$secret（入库即泄漏事故）"; exit 1; fi
+		echo "--- FAIL: §FIX1012-M12 密钥文件未被 gitignore 拦截：${secret}（入库即泄漏事故）"; exit 1; fi
 done
 if git ls-files 2>/dev/null | grep -qE '\.(jks|pass)$|ops\.env$|config\.xt\.json$'; then
 	echo "--- FAIL: §FIX1012-M12 git 跟踪列表含密钥文件（立即排查是否已被提交）"; exit 1; fi

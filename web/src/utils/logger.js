@@ -13,15 +13,25 @@
 
 const LEVELS = { debug: 0, info: 1, warn: 2, error: 3 }
 
-// 运行期级别：优先 Vite 注入的 import.meta.env.VITE_LOG_LEVEL，其次 Node 的 process.env，
-// 两者皆无则回落 'debug'（开发环境全开）。生产构建若未注入该变量，仍保持全开——
-// 这是保守选择：宁可多打也不丢错误分支；需要收敛时显式设 VITE_LOG_LEVEL=warn 即可。
+// 运行期级别：优先 Vite 注入的 import.meta.env.VITE_LOG_LEVEL，其次 globalThis.process.env
+// （兼容非 Vite 宿主，如直接被 Node 侧 import 的场景），两者皆无则回落 'debug'（开发全开）。
+// 生产构建若未注入该变量，仍保持全开——这是保守选择：宁可多打也不丢错误分支；
+// 需要收敛时显式设 VITE_LOG_LEVEL=warn 即可。
+//
+// §2026-10-13 修 §LINTGATE 真红：原实现直写 `typeof process !== 'undefined' && process.env…`，
+// 运行时虽安全（typeof 守卫），但 eslint 的 no-undef 是**静态**判定、不认 typeof 守卫，
+// 而 web 的 eslint 配置对 src/** 只开了 globals.browser（没有 node）⇒ `'process' is not defined`
+// 判红（第 75 段拦下）。改走 globalThis.process：浏览器与 Node 都提供 globalThis，
+// 既保持跨宿主兼容，又不引入未声明全局。
 function readLevel() {
   if (typeof import.meta !== 'undefined' && import.meta.env && import.meta.env.VITE_LOG_LEVEL) {
     return import.meta.env.VITE_LOG_LEVEL
   }
-  if (typeof process !== 'undefined' && process.env && process.env.VITE_LOG_LEVEL) {
-    return process.env.VITE_LOG_LEVEL
+  // globalThis 在浏览器与 Node 均存在；逐层守卫，任何一环缺失都安全回落。
+  const g = typeof globalThis !== 'undefined' ? globalThis : null
+  const proc = g && g.process
+  if (proc && proc.env && proc.env.VITE_LOG_LEVEL) {
+    return proc.env.VITE_LOG_LEVEL
   }
   return 'debug'
 }
