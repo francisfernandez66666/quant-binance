@@ -3,10 +3,11 @@
 // （Evaluate 的行情拉取链路需真实数据源，留给集成层，本文件只锁「不依赖网络也能验证」的分支）。
 //
 // 选取依据（按 plan M7「分支密度×出错代价」排序）：
-//   · normalizeCode / absScore / tradingDaysBefore / livePrevClose：纯转换，输入边界多；
-//   · cacheReusable（§KLINE-CHAIN-3 昨收锚点判过期）：四态分支，错判会让历史基准混进今日涨跌幅；
-//   · countSuccess / collectBearStocks / enrichSectorData：聚合逻辑，去重/空 scanner 早退；
-//   · attribution / BuildHotSectors：事件→板块分流（个股级跳过、按 Score 符号分池、同名合并取最大 |score|）。
+//
+//	· normalizeCode / absScore / tradingDaysBefore / livePrevClose：纯转换，输入边界多；
+//	· cacheReusable（§KLINE-CHAIN-3 昨收锚点判过期）：四态分支，错判会让历史基准混进今日涨跌幅；
+//	· countSuccess / collectBearStocks / enrichSectorData：聚合逻辑，去重/空 scanner 早退；
+//	· attribution / BuildHotSectors：事件→板块分流（个股级跳过、按 Score 符号分池、同名合并取最大 |score|）。
 //
 // English: branch tests for strategy_engine covering dependency-free logic only (no marketAPI/scanner needed).
 package strategy_engine
@@ -30,10 +31,10 @@ func TestNormalizeCode(t *testing.T) {
 		{"600000.SH", "600000"},
 		{"000001.SZ", "000001"},
 		{"123456.BJ", "123456"},
-		{"600000", "600000"},   // 已干净
+		{"600000", "600000"},       // 已干净
 		{"  SH600000  ", "600000"}, // 先 trim 再剥离
-		{"AB", "AB"},          // 长度 ≤2，不动
-		{"SH", "SH"},          // 长度恰好 2，前缀判定不触发
+		{"AB", "AB"},               // 长度 ≤2，不动
+		{"SH", "SH"},               // 长度恰好 2，前缀判定不触发
 	}
 	for _, c := range cases {
 		if got := normalizeCode(c.in); got != c.want {
@@ -102,8 +103,8 @@ func TestCacheReusable(t *testing.T) {
 // ── countSuccess：Price>0 且无 Error 才算成功 ──────────────────────────────────
 func TestCountSuccess(t *testing.T) {
 	m := map[string]*StockMarketData{
-		"a": {Code: "a", Price: 10, Error: ""},   // 成功
-		"b": {Code: "b", Price: 0, Error: ""},    // 价 0 不算
+		"a": {Code: "a", Price: 10, Error: ""},       // 成功
+		"b": {Code: "b", Price: 0, Error: ""},        // 价 0 不算
 		"c": {Code: "c", Price: 5, Error: "timeout"}, // 有错不算
 	}
 	if n := countSuccess(m); n != 1 {

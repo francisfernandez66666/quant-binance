@@ -9,12 +9,13 @@
 // 无编译强制；后端改字段，前端只能靠运行期炸。本锁把「形状维度」从人盯变成机器锁。
 //
 // 机制：
-//   · 测试扫描本包全部非 _test.go 文件里的 s.mux.HandleFunc("<方法组> <路径>", <表达式>) 注册行；
-//   · 与 golden 逐条对比：代码无 golden 有的端点＝端点被删/改名（红）；handler 表达式变化＝handler 被换（红）；
-//   · 对 curated 条目（request_struct 非空）：解码结构体必须存在，且其 json tag 须包含契约声明的必填字段
-//     （后端删/改名了前端 POST 体依赖的字段即红）；
-//   · 显式重生成：REGEN_ENDPOINT_PAYLOADS=1 go test ./internal/server -run TestEndpointPayloadsGolden，
-//     写完 golden 即 t.Skip——强制改契约的人经过「重生成+看 diff+人审提交」这一步。
+//
+//	· 测试扫描本包全部非 _test.go 文件里的 s.mux.HandleFunc("<方法组> <路径>", <表达式>) 注册行；
+//	· 与 golden 逐条对比：代码无 golden 有的端点＝端点被删/改名（红）；handler 表达式变化＝handler 被换（红）；
+//	· 对 curated 条目（request_struct 非空）：解码结构体必须存在，且其 json tag 须包含契约声明的必填字段
+//	  （后端删/改名了前端 POST 体依赖的字段即红）；
+//	· 显式重生成：REGEN_ENDPOINT_PAYLOADS=1 go test ./internal/server -run TestEndpointPayloadsGolden，
+//	  写完 golden 即 t.Skip——强制改契约的人经过「重生成+看 diff+人审提交」这一步。
 //
 // 范围取舍：v1 先锁「端点身份 + handler + 请求体形状」三件事（最高价值的漂移面）；
 // 响应体形状维度因多为 map/slice 字面量构造、无统一解码结构体，留作 curated response_fields 文档，

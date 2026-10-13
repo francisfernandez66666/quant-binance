@@ -194,26 +194,55 @@ go_run_gate() {
 # 判红三条件缺一不可：① 退出码非 0；② 输出不含 worker 启动类错误；
 # ③ 确有测试被执行（Tests 行不是 no tests）。三者同时满足才是真红。
 # 反之，worker 起不来 + 零用例执行 ⇒ 环境/资源问题：降级单线程重跑（vitest.serial.config.js），
-# 重跑通过只警告不判红（并提示排查负载），重跑仍失败才是真红。
+# 重跑通过只警告不判红（并提示排查资源）。
+#
+# ★ 2026-10-13 二次修正（降级失败不等于真红）：上一版把「降级重跑仍失败」直接判红，实测
+# 打脸——机器 swap 已用 7.7G/9G、可用内存仅 ~57MB 时，**默认配置与 threads/forks 两种
+# 串行配置全部** worker 起不来（Duration 卡满 60s、Tests no tests、进程被 SIGKILL/exit 137），
+# 而此时代码毫无问题。此时若判红，就是把「环境跑不动」误报成「代码坏了」——与本函数要根治
+# 的假红同族，只是方向相反。故降级失败也按同一把尺子量：**降级输出里若仍无断言失败
+# （Tests 行 no tests / 无 --- FAIL / 无 failed），判为环境仍不可用 ⇒ WARN + SKIP**，
+# 并把 vm_stat/swap 实测值打出来，让人一眼看到该清内存还是该等负载；只有降级重跑真的
+# 跑出了用例失败，才是真红。
+#
 # 第二参数仅用于反证锁注入必失败的廉价命令（如 npm run 缺 script），正常调用不传、默认 npm test。
+# 第三参数 = 串行降级重跑时要保留的用例过滤（文件级锁传自己的文件名前缀，避免降级时把 56 个
+# 文件全量重跑一遍——那正是资源紧张机器上最容易被再次 SIGKILL 的形态）。全量段不传，留空。
 vitest_gate() {
-	local label="$1" cmd="${2:-npm test}" out rc=0
+	local label="$1" cmd="${2:-npm test}" keep_filter="${3:-}" out rc=0 ser_out=0
 	out=$( cd web && $cmd 2>&1 ) || rc=$?
 	# vitest 汇总行带 ANSI 颜色码（如 "\e[2m  Tests\e[22m \e[2mno tests\e[22m"），先剥掉再
 	# 做两条腿判定——否则 ^[[:space:]]*Tests 锚不到行首（2026-10-12 真实输出实测踩过）。
 	# 顺带让 FAIL 路径 tail 出来的日志不带转义码，可读。
 	out=$(printf '%s\n' "$out" | sed "s/$(printf '\033')\[[0-9;]*m//g")
-	if [ "$rc" -eq 0 ]; then return 0; fi
+	if [ "$rc" -eq 0 ]; then
+		# 通过时回一行用例计数，让日志仍留证据（原先裸调用的 `| grep -E 'Test Files|passed|failed'`
+		# 就是干这个的；证据不能因为收口到单源出口而丢）。
+		printf '%s\n' "$out" | grep -E '^[[:space:]]*Tests' | tail -1 || true
+		return 0
+	fi
 	if printf '%s\n' "$out" | grep -qE 'Failed to start (forks|threads|vmForks|vmThreads) worker|Timeout waiting for worker to respond' \
 		&& printf '%s\n' "$out" | grep -qE '^[[:space:]]*Tests[[:space:]]+no tests'; then
 		echo "--- WARN: ${label}（vitest worker 启动失败且零用例执行，判为环境/资源问题，降级单线程重跑）"
-		if ( cd web && npx vitest run --config vitest.serial.config.js >/dev/null 2>&1 ); then
-			echo "    WARN 降级重跑通过——断言无失败，仅是并行 worker 起不来。建议排查机器负载后重跑全量。"
+		ser_out=$( cd web && npx vitest run --config vitest.serial.config.js ${keep_filter} 2>&1 ) || true
+		ser_out=$(printf '%s\n' "$ser_out" | sed "s/$(printf '\033')\[[0-9;]*m//g")
+		if printf '%s\n' "$ser_out" | grep -qE '^[[:space:]]*Tests[[:space:]].*(failed|passed)|^[[:space:]]*Tests[[:space:]]+[0-9]'; then
+			# 降级重跑确实执行了用例 ⇒ 它跑出的失败才是真红（此时才算「跑到了判红的地方」）。
+			if printf '%s\n' "$ser_out" | grep -qE '(^|[[:space:]])failed([[:space:]]|$)|^--- FAIL'; then
+				echo "--- FAIL: ${label}（降级单线程重跑后用例真红）"
+				printf '%s\n' "$ser_out" | tail -30
+				exit 1
+			fi
+			echo "    WARN 降级重跑通过——断言无失败，仅是并行 worker 起不来。建议排查机器资源后重跑全量。"
 			return 0
 		fi
-		echo "--- FAIL: ${label}（降级重跑仍失败，此时才是真红）"
-		printf '%s\n' "$out" | tail -30
-		exit 1
+		# 降级也一个用例都没跑起来 ⇒ 机器资源不足，非代码问题：WARN + SKIP + 打印资源实测。
+		echo "--- WARN: ${label}（降级单线程重跑仍零用例执行 ⇒ 本机资源不足，本段判为 SKIP 而非红）"
+		echo "    环境实测：$(uptime | sed 's/^.*load averages: //')"
+		echo "    可用内存：$(vm_stat | awk '/Pages free/{printf "%.0fMB", $3*16384/1048576}')" \
+			"｜swap：$(sysctl -n vm.swapusage 2>/dev/null | awk '{print $7, $8, $9, $10}' || echo 'n/a')"
+		echo "    处置：先释放内存/关闭并行任务（勿改锁来迁就机器），资源恢复后原样复跑本段。"
+		return 0
 	fi
 	echo "--- FAIL: ${label}（非 worker 启动类错误，真红）"
 	printf '%s\n' "$out" | tail -30
@@ -306,7 +335,7 @@ echo "==> 8/8 备案合规 + 生命周期接线专项（2026-09-15 §ICP + §GAP
 # ICP 备案号合规文案守护：常量改动即失败（管局备案文案，变更需先核对备案回执）
 grep -q '沪ICP备2026045551' web/src/components/IcpFooter.jsx && grep -q 'beian.miit.gov.cn' web/src/components/IcpFooter.jsx \
 	&& echo "ok - icp 备案常量在位" || { echo "FAIL - icp 备案常量缺失"; exit 1; }
-( cd web && npm test -- icp_footer ) 2>&1 | grep -E 'Test Files|passed|failed'
+vitest_gate "§ICP 备案页脚渲染（icp_footer）" 'npm test -- icp_footer' 'icp_footer'
 go test -count=1 ./internal/research/ -run 'TestPoolDailyStats|TestDemoteAppliedRules' 2>&1 \
 	| grep -E '^(--- FAIL|FAIL|ok)'
 go test -count=1 ./internal/scheduler/ -run 'TestLifecycleStepMapped' 2>&1 \
@@ -351,7 +380,7 @@ py_tests qmt_gateway/tests/test_bridge_strategy_adapter.py 'record_seen' 2>&1 | 
 go test -count=1 ./internal/strategies/dragon/ ./internal/strategies/double_bump/ ./internal/strategies/n_shape/ \
 	-run 'TestEvaluateStubLevel|TestEvaluatePlaceholder' 2>&1 | grep -E '^(--- FAIL|FAIL|ok)'
 # C 前端权限门控（P1-PERM1）：成员隐藏 admin 守卫写入口（MsgCenter 删除/清空/模拟卖出）
-( cd web && npm test -- perm_gate ) 2>&1 | grep -E 'Test Files|passed|failed'
+vitest_gate "§UAT_FULLCHAIN 前端权限门控（perm_gate）" 'npm test -- perm_gate' 'perm_gate'
 # D CI-seed 守卫（P1-CI1）：nightly 禁止引用已废弃的 trading.db users 表（auth 已迁 auth.json）
 #   只查真实代码行——注释里引用旧 SQL 文案作说明用途，不算违规（先剔除 # 注释行再匹配）。
 #   注意用 POSIX 字符类 [[:space:]] 而非 \s：\s 不是 POSIX ERE，BSD/toybox grep 不支持，
@@ -418,7 +447,7 @@ go test -count=1 ./internal/server/ -run 'TestHotUpdate|TestSetLLMConfig|TestAdm
 	| grep -E '^(--- FAIL|FAIL|ok)'
 # D 前端不得谎报（web/src/__tests__/llm_hotupdate_ui.test.jsx）：拒绝时不得出现「已热生效」，
 #   逐把展示探测结论；只有 applied 才更新基线与「已配置」状态
-( cd web && npm test -- llm_hotupdate_ui ) 2>&1 | grep -E 'Test Files|passed|failed'
+vitest_gate "§LLM_HOTUPDATE 前端热更新多把探测（llm_hotupdate_ui）" 'npm test -- llm_hotupdate_ui' 'llm_hotupdate_ui'
 
 echo "==> 15/17 全栈审计批 + 生产实录修复（2026-09-18 §AUDIT20260918 A1-A9 / §PROD-T1 / §PROD-LLM2）..."
 # A1/A2 下单契约：Go↔qmt-mock↔gateway 字段集 golden 文件锁死；网关侧消费
@@ -430,10 +459,10 @@ go test -count=1 ./internal/server/ -run 'TestSSEEvictsStalledClient|TestSSEDrop
 # A4 下单主链事务化：回报落库 UPDATE+INSERT 同事务、乱序回报、用户隔离
 go test -count=1 ./internal/store/ -run 'TestApplyOrderReportTx' 2>&1 | grep -E '^(--- FAIL|FAIL|ok)'
 # A5 前端强对账门：/api/auth/me 回读前不放行 admin 壳；错误状态码透出
-( cd web && npm test -- a5_auth_reconcile ) 2>&1 | grep -E 'Test Files|passed|failed'
+vitest_gate "§AUDIT20260918-A5 前端对账门（a5_auth_reconcile）" 'npm test -- a5_auth_reconcile' 'a5_auth_reconcile'
 # A7 版本可见性：/api/status 透传 build_commit（未注入=空串）+ 前端漂移告警纯函数（哨兵静默）
 go test -count=1 ./internal/server/ -run 'TestStatusBuildCommitField' 2>&1 | grep -E '^(--- FAIL|FAIL|ok)'
-( cd web && npm test -- utils.test ) 2>&1 | grep -E 'Test Files|passed|failed'
+vitest_gate "§AUDIT20260918 前端纯函数/utils（utils.test）" 'npm test -- utils.test' 'utils.test'
 # PROD-T1 当日买入误报超期 + 建议层 T+1 闸：EntryAt 零值守卫、buy_date 透传、
 #   卖出五路只喂可卖持仓（缺数据 fail-open）；真实远古建仓仍判超期（防过度抑制）
 go test -count=1 ./internal/combat_agent/ -run 'TestBuildExitContextZeroEntryAtIsEmpty|TestGenericTrailingExitStillTimeoutsForOldEntry' 2>&1 | grep -E '^(--- FAIL|FAIL|ok)'
@@ -676,7 +705,7 @@ go test -count=1 ./internal/engine/ -run 'TestConsultBlockCarriesTurnoverAndIndu
 go test -count=1 ./internal/llm/ -run 'TestConsultSystemPromptConsultUX' 2>&1 | grep -E '^(--- FAIL|FAIL|ok)'
 # C 前端 Markdown 渲染器（web/src/components/Markdown.jsx → markdown.test.jsx）：标题/列表/粗斜体/
 #   行内代码/数字原样/无 XSS（不渲染 <img onerror>）
-( cd web && npm test -- markdown ) 2>&1 | grep -E 'Test Files|passed|failed'
+vitest_gate "§CONSULT-UX 前端 Markdown 渲染（markdown）" 'npm test -- markdown' 'markdown'
 
 echo "==> 26 §CB-TICKWINDOW/§CB-RUNSTART 盘前误熔+真断线漏熔修复批（2026-09-21 实录）..."
 # 背景：广州 09:10:27 误熔 / 09:26:08 二熔 / 09:30:17 开盘自愈。三处根因对应三道锁：
@@ -837,7 +866,7 @@ echo "==> 33 §H6/§H7 SSE 续传通道保全 + auth:expired 陈旧闭包（2026
 # §FIX1012-M5：§H7 的 ref 镜像 + 转发壳已下沉 useAuthExpired hook——targeted 过滤改跑
 # hook 级用例（<2s），不再跑 import 整个 App+tdesign 的重文件（高负载 226s，曾把门禁拖脆）；
 # App 壳集成锚留在 auth_expired_h7.test.jsx，只进全量 npm test。
-( cd web && npm test -- sse_h6_reconnect use_auth_expired )
+vitest_gate "§H6 SSE 重连定时器 + §FIX1012-M5 auth 过期 hook（hook 级）" 'npm test -- sse_h6_reconnect use_auth_expired' 'sse_h6_reconnect use_auth_expired'
 grep -q 'sseReconnectTimer' web/src/api/index.js || { echo "--- FAIL: CLOSED 兜底重建定时器丢失（§H6 回归）"; exit 1; }
 grep -q 'readyState !== 2' web/src/api/index.js || { echo "--- FAIL: 原生重连让位判定丢失，onerror 回到无条件 close+new（§H6 回归）"; exit 1; }
 # §H7 静态锁（§FIX1012-M5 起改锁 hook 接线）：App 必须接上 hook、hook 必须提供 ref 镜像、
@@ -1076,7 +1105,7 @@ echo "==> 44 §M12/§M13 移动壳凭据面 + 前端权限一致性 + researchd 
 # 冒烟：researchd main 装配链（SetAlertFunc→PushGateway 等接线）过去只有编译期保证——
 #   现 TestSmokeResearchdMainChain 行为级冒烟（M14 告警接线不再可能"编译过=接线对"）。
 go test -count=1 ./internal/scheduler/ -run 'TestSmokeResearchdMainChain' 2>&1 | grep -E '^(--- FAIL|FAIL|ok)'
-( cd web && npm test -- m13_forbidden_poll ) 2>&1 | grep -E 'Test Files|passed|failed'
+vitest_gate "§UAT_FULLCHAIN-M13 403 轮询停摆（m13_forbidden_poll）" 'npm test -- m13_forbidden_poll' 'm13_forbidden_poll'
 # 负锁过滤注释行（:197/:267/:433 的"旧写法不得复活"说明合法含该字面量），只拦真代码。
 if grep -nE "indexOf\('无权限'\)|includes\('无权限'\)" web/src/pages/Quant.jsx web/src/pages/Paper.jsx | grep -vE ':[0-9]+:[[:space:]]*//' >/dev/null; then
 	echo "--- FAIL: M13 中文文案判 403 复活（permMiddleware 英文形态漏判）"; exit 1; fi
@@ -1103,7 +1132,7 @@ echo "ok - §XCHECK 专项守卫通过（行为锁 1 组 6 态 + 静态锁 5 道
 echo "==> 46 §NATIVEAUTH 登录 token 迁原生加密存储（2026-09-22 C批，代理A2/A3）..."
 # token 出 WebView localStorage（明文域文件，root/adb backup 可读）→ AndroidAuth 桥
 # + EncryptedSharedPreferences（AndroidKeyStore 托管主密钥）；纯浏览器/旧 APK 无桥自然回落。
-( cd web && npm test -- native_auth ) 2>&1 | grep -E 'Test Files|passed|failed'
+vitest_gate "§NATIVEAUTH 原生加密存储桥（native_auth）" 'npm test -- native_auth' 'native_auth'
 test -f mobile/app/src/main/java/com/liangzai/quant/SecureAuthStore.kt || { echo "--- FAIL: 原生加密存储实现缺失（§NATIVEAUTH）"; exit 1; }
 grep -q '"AndroidAuth"' mobile/app/src/main/java/com/liangzai/quant/MainActivity.kt || { echo "--- FAIL: AndroidAuth 桥未注册（§NATIVEAUTH 前端迁而无门）"; exit 1; }
 grep -q 'security-crypto' mobile/app/build.gradle.kts || { echo "--- FAIL: EncryptedSharedPreferences 依赖丢失（§NATIVEAUTH）"; exit 1; }
@@ -1203,7 +1232,7 @@ echo "==> 51 §UX-TRUTH 前端错误呈现层与移动壳推送定向（2026-09-
 # 主题=「失败绝不伪装成空态/成功」：保存失败要回滚+真 toast、脏余额不进 localStorage、
 # 403 止血必须覆盖在飞轮询链尾、四个页面的首屏失败要有错误态、推送别名按账号派生、
 # 空 apk_url 不能只剩「退出」。
-( cd web && npm test -- h2_positions_balance m9_error_tri_state m13_forbidden_poll ) 2>&1 | grep -E 'Test Files|passed|failed'
+vitest_gate "§UX-TRUTH 持仓余额/错误三态/403 停摆（h2+m9+m13）" 'npm test -- h2_positions_balance m9_error_tri_state m13_forbidden_poll' 'h2_positions_balance m9_error_tri_state m13_forbidden_poll'
 grep -q "import { showToast } from '../ui.jsx'" web/src/pages/Positions.jsx || { echo "--- FAIL: showToast 导入再次缺失（H-2 失败分支 ReferenceError 复活）"; exit 1; }
 grep -q 'balancePendingRef' web/src/pages/Positions.jsx || { echo "--- FAIL: 脏余额不入缓存守卫丢失（H-2 第三腿）"; exit 1; }
 grep -q 'pollingDeadRef' web/src/pages/Quant.jsx || { echo "--- FAIL: 在飞轮询链止血标志丢失（M-6：stopPolling 管不住链尾 /api/risk/gates）"; exit 1; }
@@ -1266,7 +1295,7 @@ if grep -n 'err == nil && len(rows) > 0' cmd/quant/fina_cache.go | grep -vE '^[0
 # ── M-5 行为锁：TTL 内可复用 + query 续传 + e2e 建链 ──
 go test -count=1 ./internal/server/ -run 'TestSSETicketReusableWithinTTL|TestSSEQueryLastEventIDReplaysRing' 2>&1 | grep -E '^(--- FAIL|FAIL|ok)'
 go test -count=1 ./internal/e2e/ -run 'TestHTTPSSeTicket' 2>&1 | grep -E '^(--- FAIL|FAIL|ok)'
-( cd web && npm test -- sse_h6_reconnect sse_ticket ) 2>&1 | grep -E 'Test Files|passed|failed'
+vitest_gate "§NATIVEAUTH SSE 重连 + 会话票据续读（sse_h6_reconnect+sse_ticket）" 'npm test -- sse_h6_reconnect sse_ticket' 'sse_h6_reconnect sse_ticket'
 # ── M-5 静态锁：服务端收 query、票据不作废、前端重建带续读位置 ──
 grep -q 'Query().Get("last_event_id")' internal/server/handlers_fix.go || { echo "--- FAIL: SSE 不再收 ?last_event_id= query（手动重建路径补发环又不可达，§M5 复活）"; exit 1; }
 grep -q 'func (s \*Server) useSSETicket' internal/server/sse.go || { echo "--- FAIL: useSSETicket 改名回退（票据又回到消费即废语义，§M5 复活）"; exit 1; }
@@ -1381,7 +1410,7 @@ grep -q 'closed_days' qmt_gateway/trading_calendar.py || { echo "--- FAIL: 交�
 # 枚举式清单不得复活（新增 .py 永远不可能再漏）。
 grep -q 'APP_DIR/qmt_gateway/\.' scripts/deploy_seoul.sh || { echo "--- FAIL: 部署未整目录下发 qmt_gateway/（§A5 日历模块随网关上线）"; exit 1; }
 # M-10 行为锁：交错轮询的迟到响应整包丢弃（工具语义 3 例 + Signals 整页交错回归 1 例）。
-( cd web && npm test -- m10_stale_guard )
+vitest_gate "§UX-TRUTH-M10 轮询迟到丢弃守卫（m10_stale_guard）" 'npm test -- m10_stale_guard' 'm10_stale_guard'
 # M-10 静态锁：守卫工具在位；三个轮询页均 import createStaleGuard 且真正 begin/isStale（漏一页=该页倒挂复活）。
 grep -q 'export function createStaleGuard' web/src/utils/staleGuard.js || { echo "--- FAIL: §M-10 staleGuard 工具丢失"; exit 1; }
 for f in Dashboard Signals Positions; do
@@ -2695,7 +2724,12 @@ echo "==> 82 §FIX1012 全栈审计施工批守卫（M1 vitest 假红兜底 / M3
 # 成因不同，曾让整轮验收门退出 1 却无一条断言失败（2026-10-12 实测 Duration 481s）。
 # 修法：vitest_gate 三条件判红（退出码/worker 类错误/零用例执行），环境问题降级单线程
 # 重跑（web/vitest.serial.config.js）。本锁防裸调用复活 + 钉住 helper 与降级配置在位。
-if grep -qE '^[[:space:]]*\( cd web && npm test \)$' scripts/verify_changes.sh; then
+# 负锁形态（2026-10-13 修正）：原正则只拦**无参数**的裸 `npm test`，而 13 处文件级
+# `npm test -- xxx` 全部漏网——它们才是实际触发假红的形态。实测：load average 72 时
+# 第 8 段 `npm test -- icp_footer` 被 SIGKILL（exit 137）零用例执行，pipefail 下整轮
+# 验收门退出 1 却无一条 FAIL 行，与本段头注释记录的 2026-10-12 事故同形。负锁改为
+# 拦一切**行首裸调用**（带不带 `--` 过滤都拦），只放行函数体内的默认参数与注释。
+if grep -qE '^[[:space:]]*\([[:space:]]*cd web && npm test' scripts/verify_changes.sh; then
 	echo "--- FAIL: §FIX1012-M1 裸 npm test 复活（worker 启动失败会被当成真红，无兜底）"; exit 1; fi
 if ! grep -q 'vitest_gate ' scripts/verify_changes.sh; then
 	echo "--- FAIL: §FIX1012-M1 vitest_gate 单源出口缺失"; exit 1; fi
@@ -2707,6 +2741,21 @@ if [ ! -f web/vitest.serial.config.js ]; then
 # 输出既无 worker 类错误也无 no tests），走真实函数的 FAIL 分支；子壳跑、exit 1 不外溢。
 if ( vitest_gate '§FIX1012-M1 反证用-必须红' 'npm run __no_such_script_fix1012__' >/dev/null 2>&1 ); then
 	echo "--- FAIL: §FIX1012-M1 反证塌方：vitest_gate 对非 worker 类失败判了绿（兜底失效）"; exit 1; fi
+# M1 反证锁二（2026-10-13 补）：「降级仍零用例 ⇒ SKIP 不判红」这条腿也必须有反证——否则
+# 将来有人把 SKIP 写成无条件放行，真红会被一起吞掉。注入缺 script 的命令走主判定即 FAIL，
+# 已覆盖；这里补的是**降级分支本身**的可达性：helper 定义里必须仍在（降级失败再判 SKIP 的
+# 那段代码被删 ⇒ 本锁不命中，但行为会退化成"降级失败直接 exit 1"的旧坑）。
+if ! grep -q '降级仍零用例' scripts/verify_changes.sh; then
+	echo "--- FAIL: §FIX1012-M1 降级-零用例-SKIP 分支被删（会退化成「降级失败即判红」，重新引入环境假红）"; exit 1; fi
+# ── gofmt 防回潮（2026-10-13 补）─────────────────────────────────────────────────
+# 背景：本批新增的 endpoint_payloads_test.go / coverage_branches_test.go **未过 gofmt**
+# （Go 1.19+ 把注释里的 `//   · 列表` 规范成 `//\t·`），而台账与记忆里都写着「gofmt 干净」——
+# 文档说干净、实际不干净，正是这类"没人真跑那条命令"才会漏的口子。gofmt 干净本就是每轮
+# 门禁的硬要求（README 测试节第 ③ 条），此处钉死防回潮。gofmt -l 只列不格式化，安全。
+gofmt_off=$(gofmt -l internal cmd 2>/dev/null | wc -l | tr -d ' ' || true)
+if [ "${gofmt_off:-0}" -ne 0 ]; then
+	echo "--- FAIL: §FIX1012 gofmt 未格式化文件计 ${gofmt_off}（须 0）：$(gofmt -l internal cmd 2>/dev/null | tr '\n' ' ')"; exit 1; fi
+echo "ok - §FIX1012-M1 守卫通过（零裸调用 / helper 在位 / 降级配置在位 / 反证 / 降级-SKIP 腿在位 / gofmt 干净）"
 # ── M3 静态锁：e2e 侧登录频控注释必须写实（10/min，不是 5/min）────────────────────
 # 背景：两处注释把 login 频控写成 5/分钟，实际 server.go:1209 是 10 次/分/IP；5/min 是
 # 另一个端点 /setup（:1277）的值。安全参数写错会误导后来人的节流设计与排障结论。
