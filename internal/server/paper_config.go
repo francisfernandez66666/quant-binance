@@ -109,7 +109,11 @@ func (s *Server) handleSetPaperConfig(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	// 局部落库：只覆盖本次显式携带的指针字段，未传字段保持原值（与 /api/config/qmt 同契约）。
-	// SetPaperConfigFor 原子更新该账号 rules.paper 并持久化到 config.json。
+	// SetPaperConfigFor 原子更新该账号 rules.paper 并持久化到**该账号的 per-user 配置存储**
+	// （config.Manager 的 KVStore，即 auth.Manager 的 auth.json；store 缺失的单文件部署回落全局
+	// config.json）。注意这不是全局 config.json——boot 路径（cmd/quant/main.go:246）只读全局，
+	// 故开启态能跨重启保留依赖 registry.GetPaper 的 per-user 回放（§AUDIT1019-M1，
+	// 见 internal/engine/registry.go）。热同步见下方两层（全局模板引擎 + 注册表模板扩散）。
 	s.cfg.SetPaperConfigFor(uid, func(p *config.PaperConfig) {
 		if req.Enabled != nil { // 总开关：立即决定引擎是否继续接收信号/撮合
 			p.Enabled = *req.Enabled

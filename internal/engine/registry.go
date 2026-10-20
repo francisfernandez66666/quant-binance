@@ -280,7 +280,26 @@ func (r *Registry) GetPaper(userID string) *paper.Engine {
 
 	// §E9 修复：磁盘恢复 IO（paper.New 读 paper.json）此前发生在全局锁内，会卡住所有账号
 	// 的 5s 调度路径；改为锁外构建、重取锁二次检查后再注册。
+	//
+	// §AUDIT1019-M1 per-user rules.paper 回放（第三轮审计新发现 P1）：
+	// 热更新路径（internal/server/paper_config.go:135-149）已把 per-user 配置同步进模板
+	// （GetRulesFor → UpdateConfig + SetPaperConfig 扩散），但 **boot 路径**
+	// （cmd/quant/main.go:246 `cfgMgr.Rules.Paper`）只读全局 config.json——而
+	// SetPaperConfigFor 在 store 非空时写的是 per-user auth store（config.go:2000-2012），
+	// 于是"开过一次模拟盘"的账号重启后回到关闭态：GET /api/paper/config 仍回显
+	// enabled=true（读 per-user），引擎实为 false（读 boot 模板），表现为 UI 显示开启却买不进。
+	// 此处按账号补上回放：per-user 显式开启时用其全量配置覆盖 boot 模板，语义与热更新路径
+	// 一致；userRules 无 per-user 覆盖时返回全局副本（config.go:1813-1815），故未配置账号
+	// 自然回落模板、不会被误开；全局开启而本账号显式关闭的场景同样安全（条件不成立→回落全局）。
+	// English: replay the per-user rules.paper at lazy-build time — the hot-update path already
+	// syncs per-user config into the template, but boot only ever read the global config.json,
+	// so an account that had paper enabled lost the switch across restarts.
 	cfg := r.opts.Paper.Cfg()
+	if cm := r.opts.CfgMgr; cm != nil && userID != "" {
+		if rules := cm.GetRulesFor(userID); rules != nil && rules.Paper.Enabled {
+			cfg = paper.ConfigFromRules(rules.Paper)
+		}
+	}
 	pe := paper.New(cfg, r.paperPath(userID))
 	// §SIGNAL_CONTROLLER 20260917：统一纪律（买入确认窗）注入已随 paper 状态机删除——
 	// rules.paper.discipline 现由引擎 paperSignalPolicy 装配进信号控制器 paper 通道裁定。

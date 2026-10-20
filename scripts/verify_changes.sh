@@ -2900,25 +2900,39 @@ if git ls-files 2>/dev/null | grep -qE '\.(jks|pass)$|ops\.env$|config\.xt\.json
 # §FIX1012-M9 把 StockDetailDrawer/lightweight-charts 改懒加载移出首屏；本闸给 10% 余量
 # 防回潮——首屏（index.html 直接引用、非异步分块的 script/link）总字节超阈值即判红。
 # dist 不存在时跳过（构建是独立步骤，门禁不负责构建），只告警不拦。
+#
+# §AUDIT1019-M2 修复「闸恒过」（2026-10-20 新发现，门禁自身缺陷）：
+#   原写法 `os.path.join(dist, r)` 遇上 Vite 产物的**绝对路径引用**（`/assets/index-xxx.js`）时，
+#   os.path.join 的第 2 个参数为绝对路径会**整个覆盖**第 1 个参数 ⇒ p 变成 `/assets/xxx`
+#   ⇒ isfile 全 False ⇒ total 恒 0 ⇒ 永远 `0 < 阈值`，**从写下那天起没拦过任何东西**
+#   （2026-10-20 实测：6 个引用全部 isfile=False，门禁口径 total=0；剥前导斜杠后实得
+#   1,593,059 B=1.52MiB，与审计报告数字精确复现）。与上轮 BRE 交替 / SIGPIPE 假红同族。
+#   修法：join 前剥前导斜杠。反证要求见下方 verify_changes 段的 §AUDIT1019-M2 段。
 if [ -d web/dist ]; then
-	first_screen=$(cd web/dist && python3 - "$PWD" <<'PY'
-import json, sys, re, os
+	fs_out=$(cd web/dist && python3 - "$PWD" <<'PY'
+import re, os, sys
 dist = sys.argv[1]
 html = open(os.path.join(dist, 'index.html'), encoding='utf-8').read()
-refs = re.findall(r'(?:src|href)="([^"]+)"', html)
 total = 0
-for r in refs:
+miss = 0
+for r in re.findall(r'(?:src|href)="([^"]+)"', html):
     if r.startswith(('http://', 'https://', '//', 'data:')):
         continue
-    p = os.path.join(dist, r)
+    p = os.path.join(dist, r.lstrip('/'))
     if os.path.isfile(p):
         total += os.path.getsize(p)
-print(total)
+    else:
+        miss += 1
+print(total, miss)
 PY
 )
+	first_screen=$(printf '%s\n' "$fs_out" | awk '{print $1}')
+	miss_refs=$(printf '%s\n' "$fs_out" | awk '{print $2}')
 	if [ "${first_screen:-0}" -gt 1750000 ]; then
 		echo "--- FAIL: §FIX1012-M9 首屏资源总字节 ${first_screen} > 1.75MiB（懒加载回潮或又引入同步大依赖）"; exit 1; fi
 	echo "    INFO §FIX1012-M9 首屏资源 ${first_screen} 字节（阈值 1.75MiB）"
+	if [ "${miss_refs:-0}" -gt 0 ]; then
+		echo "--- FAIL: §FIX1012-M9 index.html 有 ${miss_refs} 个引用解析不到文件（体积统计漏算=闸失效）"; exit 1; fi
 else
 	echo "    SKIP §FIX1012-M9 首屏体积闸（web/dist 不存在，构建步骤独立完成）"
 fi
@@ -3005,6 +3019,101 @@ for token in 'go_esc' 'ProxyHandler' 'PASS' 'FAIL' '[K]'; do
 done
 echo "ok - §AUDIT1019-A2 独立字节级 UAT 工具在位（go_esc/ProxyHandler 不变量 + A-K 段齐）"
 echo "    实跑方式：bash scripts/uat_bootstrap.sh up && python3 tools/indep_byte_uat_1019.py（需三件套栈，不进门禁以免拖慢提交门）"
+
+echo ""
+echo "==> 84 §AUDIT1019-M1 paper 撮合配置重启回放（P1 产品缺陷修复 + 反证锁，2026-10-20）..."
+# ── 背景：第三轮审计（AUDIT_FULL_BYTELEVEL_UAT_20261019）新发现 P1 ───────────────────
+# 现象：POST /api/paper/config 开启模拟盘后热生效、能买入；进程重启后引擎以「模拟盘未启用」
+#   启动、买入 400，而 GET /api/paper/config 仍回显 enabled=true——UI 显示开启、实际买不进。
+# 根因（四条路径两套真相源）：写入侧 SetPaperConfigFor 在 store 非空时走 saveUserRules
+#   （config.go:2000-2012）落 **per-user auth store**；而 boot 侧 cmd/quant/main.go:246
+#   只读全局 cfgMgr.Rules.Paper、懒加载侧 registry.go GetPaper 用 boot 模板——
+#   重启后 per-user 的开启态没有任何一条路径读它。
+# 修法：registry.GetPaper 懒加载处按账号回放——per-user 显式开启时用其全量配置覆盖
+#   boot 模板（userRules 无覆盖时回落全局副本，未配置账号不会被误开）。
+# ── 锁①：行为锁（go_run_gate 单源出口，含测试内对照组 + 已做植入式反证）──────────────
+# 测试自身带两组对照：① per-user 写入不污染全局；② 重启后 boot 模板确实是关闭态
+#   （排除"模板本来就开着所以恒绿"）。反证实测：临时删掉回放赋值行，测试精确报红。
+go_run_gate internal/engine 'TestPaperConfigSurvivesRestart' '§AUDIT1019-M1 paper 开启态跨重启'
+# ── 锁②：静态锁——回放钩子必须在位（防修复被静默删除）────────────────────────────
+if ! /usr/bin/grep -q 'GetRulesFor(userID); rules != nil && rules.Paper.Enabled' internal/engine/registry.go; then
+	echo "--- FAIL: §AUDIT1019-M1 registry.GetPaper 的 per-user 回放条件被删（重启丢开启态缺陷复活）"; exit 1; fi
+if ! /usr/bin/grep -q 'cfg = paper.ConfigFromRules(rules.Paper)' internal/engine/registry.go; then
+	echo "--- FAIL: §AUDIT1019-M1 registry.GetPaper 的 per-user 配置覆盖赋值被删（回放形同虚设）"; exit 1; fi
+# ── 锁③：注释保真——paper_config.go 的自陈必须与实现一致（防再写成"持久化到 config.json"）──
+if /usr/bin/grep -q '持久化到 config.json' internal/server/paper_config.go; then
+	echo "--- FAIL: §AUDIT1019-M1 paper_config.go 仍自称「持久化到 config.json」（实现是 per-user KVStore，注释失实会误导后人）"; exit 1; fi
+echo "ok - §AUDIT1019-M1 paper 重启回放在位（行为锁 + 回放钩子静态锁 + 注释保真）"
+
+echo ""
+echo "==> 85 §AUDIT1019-M2 首屏体积闸路径修复（门禁自身缺陷根治 + 防回潮，2026-10-20）..."
+# ── 背景：M9 体积闸曾「恒过」（第三轮审计新发现 P2，门禁自身缺陷）──────────────────
+# 原写法 os.path.join(dist, r) 遇 Vite 产物绝对路径引用（/assets/xxx）时，绝对路径会整个
+# 覆盖 dist 前缀 ⇒ isfile 全 False ⇒ total 恒 0 ⇒ 永远低于阈值。2026-10-20 实测：6 个引用
+# 全部 isfile=False、门禁口径 total=0；剥前导斜杠后实得 1,593,059 B（1.52MiB），与审计
+# 报告数字精确复现——数字一直是真的，只是闸量不到。与上轮 BRE 交替 / SIGPIPE 假红同族。
+# 修法：join 前 lstrip('/')；并新增「引用解析不到文件即判红」腿（漏算=闸失效）。
+# 反证实测（两条腿都做过）：① 把资产文件改名 → miss_refs=1 → 闸 FAIL；② 阈值置 0 →
+#   1,593,059 > 0 → 闸 FAIL。均已恢复。
+# ── 锁①：路径修正必须在位（防恒过形态回潮）──────────────────────────────────────
+if ! /usr/bin/grep -q "r.lstrip('/')" scripts/verify_changes.sh; then
+	echo "--- FAIL: §AUDIT1019-M2 体积闸的 lstrip('/') 路径修正被删（绝对路径引用会再次让 total 恒 0=闸恒过）"; exit 1; fi
+# ── 锁②：旧的失效形态不得复活 ─────────────────────────────────────────────────
+if /usr/bin/grep -qE 'p = os\.path\.join\(dist, r\)$' scripts/verify_changes.sh; then
+	echo "--- FAIL: §AUDIT1019-M2 体积闸出现未剥斜杠的 os.path.join(dist, r)（恒过形态复活）"; exit 1; fi
+# ── 锁③：漏算判红腿在位 ───────────────────────────────────────────────────────
+if ! /usr/bin/grep -q '体积统计漏算=闸失效' scripts/verify_changes.sh; then
+	echo "--- FAIL: §AUDIT1019-M2 「引用解析不到即判红」腿被删（漏算无人察觉）"; exit 1; fi
+# ── 行为腿：dist 存在时当场实测一次（阈值取 0 必须判红=证明闸真的在量）────────────
+if [ -d web/dist ]; then
+	fs_now=$(cd web/dist && python3 - "$PWD" <<'PY'
+import re, os, sys
+dist = sys.argv[1]
+html = open(os.path.join(dist, 'index.html'), encoding='utf-8').read()
+total = 0
+for r in re.findall(r'(?:src|href)="([^"]+)"', html):
+    if r.startswith(('http://', 'https://', '//', 'data:')):
+        continue
+    p = os.path.join(dist, r.lstrip('/'))
+    if os.path.isfile(p):
+        total += os.path.getsize(p)
+print(total)
+PY
+)
+	if [ "${fs_now:-0}" -eq 0 ]; then
+		echo "--- FAIL: §AUDIT1019-M2 体积闸实测输出 0（路径修正失效或 dist 被清空——闸又在恒过）"; exit 1; fi
+	echo "ok - §AUDIT1019-M2 体积闸实测 ${fs_now} 字节（非 0 ⇒ 真的在量；三项静态锁齐）"
+else
+	echo "ok - §AUDIT1019-M2 三项静态锁齐（dist 不存在，行为腿跳过）"
+fi
+
+echo ""
+echo "==> 86 §AUDIT1019-M4 vitest 降级配置迁移 Vitest 4 语法（P2 + 防回潮，2026-10-20）..."
+# ── 背景：poolOptions 嵌套形态被 Vitest 4 移除，原降级配置的 singleThread 实际被忽略 ──
+# 第三轮审计 4 配置矩阵实测：forks 默认 / threads maxWorkers=2 / 顶层 singleThread /
+#   vitest.serial.config.js（旧 poolOptions 形态）在 worker 起不来的机器上全部 0 用例。
+#   旧配置的问题不只是"语法旧"——它让人误以为降级路径是真单线程，其实 poolOptions
+#   整个被忽略，仍是多 worker 池。已迁移为顶层 singleThread: true（Vitest 4 新位置）。
+# 诚实边界：语法修好不替代机器资源（内存耗尽时四种配置同样起不来），判定仍归 vitest_gate。
+# ── 锁①：新语法在位 ───────────────────────────────────────────────────────────
+if ! /usr/bin/grep -q '^    singleThread: true,$' web/vitest.serial.config.js; then
+	echo "--- FAIL: §AUDIT1019-M4 vitest.serial.config.js 缺少顶层 singleThread: true（降级路径又不是真单线程）"; exit 1; fi
+# ── 锁②：已移除的 poolOptions 形态不得复活 ────────────────────────────────────
+# 注意只查**非注释行**：文件头注释为解释历史会提及 poolOptions 一词（说明它为何被移除），
+# 若连注释一起扫就会误判——这与本批刚修掉的 M9 恒过同族（锁自身失效比没有锁更坏）。
+if /usr/bin/grep -v '^[[:space:]]*//' web/vitest.serial.config.js | /usr/bin/grep -q 'poolOptions'; then
+	echo "--- FAIL: §AUDIT1019-M4 vitest.serial.config.js 代码行出现 poolOptions（Vitest 4 已移除，singleThread 会被忽略）"; exit 1; fi
+# ── 锁③：执行拓扑不得被放宽（防有人为求绿删掉串行化）──────────────────────────
+for key in "pool: 'threads'" 'fileParallelism: false' "testTimeout: 60000"; do
+	if ! /usr/bin/grep -qF "$key" web/vitest.serial.config.js; then
+		echo "--- FAIL: §AUDIT1019-M4 vitest.serial.config.js 缺少 ${key}（降级配置的执行拓扑被放宽）"; exit 1; fi
+done
+# ── 锁④：断言集必须与原配置一致（include/setupFiles 同口径，不许缩范围）────────
+inc_serial=$(/usr/bin/grep -c "include: \['src/__tests__/\*\*/\*.test.{js,jsx}'\]" web/vitest.serial.config.js || true)
+inc_main=$(/usr/bin/grep -c "include: \['src/__tests__/\*\*/\*.test.{js,jsx}'\]" web/vitest.config.js || true)
+if [ "${inc_serial:-0}" -lt 1 ] || [ "${inc_main:-0}" -lt 1 ]; then
+	echo "--- FAIL: §AUDIT1019-M4 降级配置与原配置的 include 口径不一致（断言集被缩小=放水）"; exit 1; fi
+echo "ok - §AUDIT1019-M4 降级配置用 Vitest 4 顶层 singleThread（poolOptions 零复活 + 拓扑未放宽 + 断言集同口径）"
 
 echo ""
 echo "==> 全部通过"
