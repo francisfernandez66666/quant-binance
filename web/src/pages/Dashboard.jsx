@@ -89,6 +89,10 @@ const healthMark = (v) => {
   return v ? '●' : '○'
 }
 
+// Dashboard 仪表盘首页：聚合信号统计、热门个股、宏观日历、IPO、热门板块、资讯、
+// 战法胜率归因、数据源健康与实盘链路三态（§QMT-FROZEN）。
+// §市场分家-1：本页全部腿都是 A股监控链——顶部切到美股/加密货币时整页早返回去向提示，
+// 不把 A股首页冒充新市场仪表盘。
 export default function Dashboard() {
   // 策略信号列表（来自后端扫描结果）
   const [signals, setSignals] = useState([])

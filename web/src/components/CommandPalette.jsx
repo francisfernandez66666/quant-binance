@@ -15,6 +15,9 @@ import { useNavigate } from 'react-router-dom'
 // US dotted codes, CRYPTO quote-suffix pairs). Bare letter tickers stay ambiguous with page-name
 // searches on purpose; the drawer already branches by parseCode for quote/chart legs.
 const PALETTE_PAIR_RE = /(USDT|USDC|BUSD|FDUSD|TUSD|USDD|DAI|BTC|ETH|BNB|EUR|TRY|JPY|AUD)$/
+// stockLikeQuery 判定输入是否为"直达个股代码"：返回规范化代码（大写）或 null。
+// 判定形态见上方 §市场分家-1 注释（CN 六位/带后缀、US 点分、CRYPTO 币对）；
+// 纯字母 ticker（AAPL）故意返回 null——面板查询是自由文本，纯字母词会误命中页面搜索。
 export function stockLikeQuery(q) {
   const s = String(q || '').trim().toUpperCase()
   if (!s) return null

@@ -5,6 +5,8 @@
 // footer and consult answer tail so wording never drifts across places. `variant` tunes density.
 import React from 'react'
 
+// DISCLAIMER_TEXT 免责声明唯一权威文案：登录页底部 / 仪表盘页脚 / 咨询回答尾注三处引用同一份，
+// 集中管理避免各处漂移（variant 控制展示密度，见下方组件注释）。合规口径变更必须改这一处。
 export const DISCLAIMER_TEXT =
   '本平台为量化研究与交易辅助工具，所有信号、评分、资讯与 AI 回答均由模型自动生成，仅供研究参考，'
   + '不构成任何投资建议或买卖要约。证券市场有风险，据此操作风险自负，请独立判断并自行承担后果。'

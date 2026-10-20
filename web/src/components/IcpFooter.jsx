@@ -8,6 +8,7 @@ import React from 'react'
 
 // 备案号与工信部链接（管局合规固定文案，勿随意改动）
 export const ICP_NUMBER = '沪ICP备2026045551'
+// ICP_URL 工信部备案查询首页（点击备案号后跳转的链接，管局合规固定地址）。
 export const ICP_URL = 'https://beian.miit.gov.cn/'
 
 /**

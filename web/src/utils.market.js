@@ -12,8 +12,11 @@
 
 // 市场枚举（与 Go 侧 validTsCode / RealPosition.Market 取值一致）
 export const MARKET_CN = 'CN'
+// US=美股（.US 后缀点分代码，如 AAPL.US / BRK.B）
 export const MARKET_US = 'US'
+// CRYPTO=加密货币（币安计价币对，如 BTCUSDT）
 export const MARKET_CRYPTO = 'CRYPTO'
+// MARKETS 三市场全集：顶部市场切换 Tab 与全站全局过滤器共用同一份顺序（CN 在最前=缺省市场）。
 export const MARKETS = [MARKET_CN, MARKET_US, MARKET_CRYPTO]
 
 // 中文名映射（Tab 与表头展示）

@@ -82,9 +82,14 @@ func SessionUS(tradingSession string) SessionRule {
 // cnSessionRule A 股规则：包装 trade_time 的活跃时段/交易日判定，时区取 cntime 北京单源。
 type cnSessionRule struct{}
 
-func (cnSessionRule) Active(t time.Time) bool     { return IsActiveSession(t) }
+// Active 返回该时刻是否落在 A 股连续竞价时段内（委托 IsActiveSession，含午休与休市判定）。
+func (cnSessionRule) Active(t time.Time) bool { return IsActiveSession(t) }
+
+// TradingDay 返回该日期是否为 A 股交易日（委托 IsTradingDay，含周末与法定节假日判定）。
 func (cnSessionRule) TradingDay(t time.Time) bool { return IsTradingDay(t) }
-func (cnSessionRule) Loc() *time.Location         { return cntime.Loc }
+
+// Loc 返回 A 股记账时区（北京，cntime 单源），所有时段换算都以它为基准。
+func (cnSessionRule) Loc() *time.Location { return cntime.Loc }
 
 // CloseSweepHHMM 1452 与 config.QMTConfig.CloseSweepAt 出厂默认同值；运行时覆盖以配置层为准
 // （Controller 现读 cfg.CloseSweepAt，本方法是矩阵/文档口径的缺省权威）。
@@ -95,10 +100,17 @@ func (cnSessionRule) CloseSweepHHMM() int { return 1452 }
 // cryptoSessionRule 加密现货恒开市（币安现货无休市概念），记账时区 UTC。
 type cryptoSessionRule struct{}
 
-func (cryptoSessionRule) Active(time.Time) bool     { return true }
+// Active 加密现货 7×24 恒开市：任何时刻都视为可交易时段。
+func (cryptoSessionRule) Active(time.Time) bool { return true }
+
+// TradingDay 加密现货无休市概念：任何日期都视为交易日。
 func (cryptoSessionRule) TradingDay(time.Time) bool { return true }
-func (cryptoSessionRule) Loc() *time.Location       { return time.UTC }
-func (cryptoSessionRule) CloseSweepHHMM() int       { return -1 }
+
+// Loc 返回加密市场记账时区（UTC，与交易所口径一致）。
+func (cryptoSessionRule) Loc() *time.Location { return time.UTC }
+
+// CloseSweepHHMM -1：加密市场无收盘清单动作（7×24 不间断，不做日终清扫）。
+func (cryptoSessionRule) CloseSweepHHMM() int { return -1 }
 
 // —— US：America/New_York ——
 //
@@ -185,6 +197,8 @@ func nyLocation() *time.Location {
 // English: US session now uses a rule-based NYSE calendar (holidays + 13:00 half-days).
 type usSessionRule struct{ window string }
 
+// Active 返回该时刻是否落在美股交易时段内：24H 变体恒真；RTH 为 09:30–收市（16:00，半日 13:00）；
+// EXTENDED 为 04:00–20:00（半日 17:00）。周末与 NYSE 节假日一律 false。
 func (u usSessionRule) Active(t time.Time) bool {
 	if u.window == "24H" {
 		return true
@@ -206,11 +220,14 @@ func (u usSessionRule) Active(t time.Time) bool {
 	return m >= 930 && m < closeHHMM // RTH：09:30–收市（16:00/半日 13:00）
 }
 
+// TradingDay 返回该日期是否为 NYSE 交易日（节假日闭市返回 false）；半交易日仍为 true，
+// 只是当日收市时刻提前到 13:00（由 usMarketClose 统一裁决）。
 func (u usSessionRule) TradingDay(t time.Time) bool {
 	_, ok := usMarketClose(t.In(nyLocation()))
 	return ok
 }
 
+// Loc 返回美股记账时区（America/New_York，含夏令时自动切换；时区库缺失时回退固定 UTC-5）。
 func (u usSessionRule) Loc() *time.Location { return nyLocation() }
 
 // CloseSweepHHMM -1：美股收盘清单由 tradingStatus/DAY 过期回报驱动（PLAN §10），不做本地清单。

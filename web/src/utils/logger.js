@@ -50,6 +50,8 @@ function sink(level, prefix, args) {
   console[level](tag, ...args)
 }
 
+// logger 分级日志出口：每个方法签名为 (prefix, ...args)，prefix 会拼成 [tag] 前缀便于按模块筛日志。
+// 低于当前配置级别（localStorage 里的日志级别）的调用直接被 shouldLog 丢弃，不产生 console 输出。
 export const logger = {
   error: (prefix, ...args) => sink('error', prefix, args),
   warn: (prefix, ...args) => sink('warn', prefix, args),

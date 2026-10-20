@@ -97,10 +97,14 @@ func (f *BinanceStatusFeed) Watch(symbols ...string) {
 // Store 证据库本体（只读出口：/api/binance/state 展示 Halted/Unconfirmed 计数用）。
 func (f *BinanceStatusFeed) Store() *BinanceTradingStatus { return f.store }
 
-// Healthy / SilenceMs / Frames 通道健康面（router.RegisterFeed 闭包注册的形状）。
-func (f *BinanceStatusFeed) Healthy() bool    { return f.ws.Healthy() }
+// Healthy 通道健康位：WS 在心跳阈值内有实帧且未断连时为真；假即触发行情陈旧闸。
+func (f *BinanceStatusFeed) Healthy() bool { return f.ws.Healthy() }
+
+// SilenceMs 返回自上一帧以来的静默毫秒数——涨到心跳阈值即判定链路哑火（供观测面与熔断判定用）。
 func (f *BinanceStatusFeed) SilenceMs() int64 { return f.ws.SilenceMs() }
-func (f *BinanceStatusFeed) Frames() int64    { return f.ws.MessageCount() }
+
+// Frames 返回自连接建立以来累计收到的消息帧数（用于判断"连上了但没数据"的假活形态）。
+func (f *BinanceStatusFeed) Frames() int64 { return f.ws.MessageCount() }
 
 // GateSource §9 market_halt 闸的注入面：risk.Gate.SetHaltEvidenceSource(feed.GateSource())。
 // 返回 (hasEvidence, halted)——**无证据≠可交易**：HasEvidence false 时第二返回值为

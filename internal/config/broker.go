@@ -35,21 +35,50 @@ var _ BrokerConfig = QMTConfig{}
 
 // —— QMTConfig 接口实现：一行包装现有字段，零行为变化 ——
 
-func (q QMTConfig) BrokerEnabled() bool            { return q.Enabled }
-func (q QMTConfig) BrokerMode() string             { return q.Mode }
-func (q QMTConfig) BrokerHalted() bool             { return q.Halted }
-func (q QMTConfig) BrokerCancelStaleSec() int      { return q.CancelStaleSec }
-func (q QMTConfig) BrokerCloseSweepAt() int        { return q.CloseSweepAt }
-func (q QMTConfig) BrokerMissHeartbeat() int       { return q.MissHeartbeatSec }
-func (q QMTConfig) BrokerFixedAmount() float64     { return q.FixedAmount }
-func (q QMTConfig) BrokerMaxPositions() int        { return q.MaxPositions }
-func (q QMTConfig) BrokerDailyMaxBuys() int        { return q.DailyMaxBuys }
-func (q QMTConfig) BrokerDailyBudget() float64     { return q.DailyBudgetAmount }
-func (q QMTConfig) BrokerInitialCapital() float64  { return q.InitialCapital }
-func (q QMTConfig) BrokerStrategies() []string     { return q.Strategies }
-func (q QMTConfig) BrokerBlacklist() []string      { return q.Blacklist }
+// BrokerEnabled 返回 QMT 实盘总开关（Enabled）：false 时 Controller 装配空执行器，真单结构上发不出。
+func (q QMTConfig) BrokerEnabled() bool { return q.Enabled }
+
+// BrokerMode 返回下单模式（auto=自动 / manual=人工确认后下单）。
+func (q QMTConfig) BrokerMode() string { return q.Mode }
+
+// BrokerHalted 返回 kill-switch 熔断位：置 true 后一切新单被拒（既有持仓与卖出逻辑不受影响）。
+func (q QMTConfig) BrokerHalted() bool { return q.Halted }
+
+// BrokerCancelStaleSec 返回未成交委托的自动撤单阈值（秒）；0=不自动撤。
+func (q QMTConfig) BrokerCancelStaleSec() int { return q.CancelStaleSec }
+
+// BrokerCloseSweepAt 返回收盘清单时刻（HHMM）；-1 表示该券商无收盘清单动作。
+func (q QMTConfig) BrokerCloseSweepAt() int { return q.CloseSweepAt }
+
+// BrokerMissHeartbeat 返回心跳超时熔断阈值（秒）：网关心跳断连超过该值即判定链路不可用。
+func (q QMTConfig) BrokerMissHeartbeat() int { return q.MissHeartbeatSec }
+
+// BrokerFixedAmount 返回单票固定买入金额（元）：每笔下单按此金额换算整手数量。
+func (q QMTConfig) BrokerFixedAmount() float64 { return q.FixedAmount }
+
+// BrokerMaxPositions 返回最大并发持仓数：达到上限后新开仓被拒（不减既有持仓）。
+func (q QMTConfig) BrokerMaxPositions() int { return q.MaxPositions }
+
+// BrokerDailyMaxBuys 返回单日最大买入笔数：当日累计买入达上限后当日不再开新仓。
+func (q QMTConfig) BrokerDailyMaxBuys() int { return q.DailyMaxBuys }
+
+// BrokerDailyBudget 返回单日买入预算（元）：当日累计买入金额的上限。
+func (q QMTConfig) BrokerDailyBudget() float64 { return q.DailyBudgetAmount }
+
+// BrokerInitialCapital 返回初始资金基线（元），用于净值/收益率口径的分母。
+func (q QMTConfig) BrokerInitialCapital() float64 { return q.InitialCapital }
+
+// BrokerStrategies 返回允许下单的战法白名单：空表示不按战法过滤。
+func (q QMTConfig) BrokerStrategies() []string { return q.Strategies }
+
+// BrokerBlacklist 返回下单黑名单（标的代码）：命中即拒单，优先级高于白名单。
+func (q QMTConfig) BrokerBlacklist() []string { return q.Blacklist }
+
+// BrokerRiskGate 返回风控闸参数集合（涨跌停/行情陈旧/价格复核等各闸的阈值与开关）。
 func (q QMTConfig) BrokerRiskGate() RiskGateConfig { return q.RiskGate }
-func (q QMTConfig) BrokerEnforceT1() bool          { return q.EnforceT1Enabled() }
+
+// BrokerEnforceT1 返回 T+1 守卫是否生效：A 股恒为 true（当日买入次日方可卖出）。
+func (q QMTConfig) BrokerEnforceT1() bool { return q.EnforceT1Enabled() }
 
 // BrokerMarket QMT 只服务 A 股账户：识别出非 CN 形态的代码也返回 "CN"（下游 validTsCode 会拒），
 // 推断逻辑仅用于日志/兜底展示。

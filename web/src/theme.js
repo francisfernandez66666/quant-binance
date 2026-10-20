@@ -10,6 +10,7 @@
 // matching the previous build (zero regression).
 import { useEffect, useState } from 'react'
 
+// THEME_KEY 主题偏好存入 localStorage 的键名（同一键被 useTheme 读写，改键等于丢用户偏好）。
 export const THEME_KEY = 'app_theme_v1'
 const VALID = new Set(['light', 'dark'])
 

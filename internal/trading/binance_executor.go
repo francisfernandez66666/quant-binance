@@ -389,6 +389,7 @@ type binanceRejected struct {
 	msg        string
 }
 
+// Error 返回人类可读的拒单描述（含交易所业务码、原文与 HTTP 状态），供日志与上层错误传播使用。
 func (r *binanceRejected) Error() string {
 	return fmt.Sprintf("binance 拒单 code=%d msg=%s (HTTP %d)", r.code, r.msg, r.httpStatus)
 }

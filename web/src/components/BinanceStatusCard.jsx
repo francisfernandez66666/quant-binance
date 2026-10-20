@@ -12,6 +12,8 @@ import * as bapi from '../api/binance.js'
 
 const POLL_MS = 60000 // 与实盘持仓兜底轮询同频；回报类事件后续走 SSE 接线
 
+// BinanceStatusCard 币安链路状态卡：与 QMT 状态卡并列，展示 /api/binance/state 的实发契约
+// （controllers/reporters/feeds/dispatch 四段）。端点不可用时降级为"未接入"占位，不渲染假绿灯。
 export default function BinanceStatusCard() {
   const [state, setState] = useState(null)     // /api/binance/state 响应（形状见 §6.2 契约）
   const [unavailable, setUnavailable] = useState(false) // 端点未上线/不可达 → 降级占位

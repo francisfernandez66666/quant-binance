@@ -2971,4 +2971,40 @@ check_cov "internal/server" 44
 echo "ok - §FIX1012 首批守卫通过（M1 单源+反证 / M3 注释写实 / M4 fail-fast+autostart / M5 见 §33 / M8 路由对账门 / M2 检查单 / M12 密钥守卫 / M9 体积闸 / M10 日志收敛+max-lines / M6 载荷契约 golden / M7 核心包覆盖下限）"
 
 echo ""
+echo "==> 83 §AUDIT1019 全栈审计工具守卫（独立依赖图 / 独立字节级 UAT 在位，2026-10-19）..."
+# ── A1 独立依赖图：环检测 + 拓扑分层（tools/dep_graph_1019.py）──────────────────
+# 背景：第三轮全栈审计（AUDIT_FULL_BYTELEVEL_UAT_20261019）把"零依赖环"从人工结论变成
+#   机器可复跑断言——自建脚本扫 internal+cmd 生产代码建包级有向图，DFS 检环 + 拓扑排序
+#   双重互证（排序成功 ⇔ 无环）。本段锁住三件事：① 脚本在位；② 环数为 0（出现环即判红，
+#   环会摧毁"单向分层"这一架构不变量）；③ 包数形态下限（防图被误清空/扫描面被改窄后
+#   "0 环"变成空集合上的假绿——与 §GATEFIX927 的空跑即红同一族纪律）。
+if [ ! -f tools/dep_graph_1019.py ]; then
+	echo "--- FAIL: §AUDIT1019-A1 tools/dep_graph_1019.py 缺失（独立依赖环检测工具被删）"; exit 1; fi
+dep_out=$(python3 tools/dep_graph_1019.py 2>&1) || true
+cyc=$(printf '%s\n' "$dep_out" | sed -n 's/^CYCLES *: *\([0-9]*\)$/\1/p')
+pkgs=$(printf '%s\n' "$dep_out" | sed -n 's/^internal packages *: *\([0-9]*\)$/\1/p')
+if [ "${cyc:-x}" != "0" ]; then
+	echo "--- FAIL: §AUDIT1019-A1 依赖环检出 ${cyc:-?} 个（单向分层架构不变量被破坏）"; printf '%s\n' "$dep_out" | tail -20; exit 1; fi
+if [ -z "${pkgs:-}" ] || [ "$pkgs" -lt 40 ]; then
+	echo "--- FAIL: §AUDIT1019-A1 依赖图包数 ${pkgs:-0} < 40（扫描面被改窄或图被清空，0 环可能是空集合假绿）"; exit 1; fi
+topo=$(printf '%s\n' "$dep_out" | sed -n 's/^topological sort ok *: *\([A-Za-z]*\).*/\1/p')
+if [ "$topo" != "True" ]; then
+	echo "--- FAIL: §AUDIT1019-A1 拓扑排序未通过（${topo:-?}）——与环数 0 矛盾，图构建逻辑损坏"; exit 1; fi
+echo "ok - §AUDIT1019-A1 依赖图：${pkgs} 包 / 0 环 / 拓扑排序通过（环=0 与排序成功双重互证）"
+# ── A2 独立字节级 UAT 工具在位锁（tools/indep_byte_uat_1019.py）────────────────
+# 说明：字节级 UAT 需要"mock 柜台 + quant 引擎 + vite"三件套在跑（起栈约 1 分钟 + 用例
+#   分钟级），放进门禁会让每次提交都起一次全栈——与门禁"快"的定位冲突，故本段只做
+#   **在位与形态锁**：工具在、关键不变量断言在位（go_esc 复现 Go JSON 转义 /
+#   ProxyHandler 绕沙箱代理 / PASS-FAIL 汇总形态）。实跑入口见脚本头注释与
+#   AUDIT_FULL_BYTELEVEL_UAT_20261019.md §8.2（uat_bootstrap.sh up → 跑脚本）。
+if [ ! -f tools/indep_byte_uat_1019.py ]; then
+	echo "--- FAIL: §AUDIT1019-A2 tools/indep_byte_uat_1019.py 缺失（独立字节级 UAT 工具被删）"; exit 1; fi
+for token in 'go_esc' 'ProxyHandler' 'PASS' 'FAIL' '[K]'; do
+	if ! /usr/bin/grep -q "$token" tools/indep_byte_uat_1019.py; then
+		echo "--- FAIL: §AUDIT1019-A2 字节级 UAT 工具缺少 ${token}（核心断言/转义复现被删）"; exit 1; fi
+done
+echo "ok - §AUDIT1019-A2 独立字节级 UAT 工具在位（go_esc/ProxyHandler 不变量 + A-K 段齐）"
+echo "    实跑方式：bash scripts/uat_bootstrap.sh up && python3 tools/indep_byte_uat_1019.py（需三件套栈，不进门禁以免拖慢提交门）"
+
+echo ""
 echo "==> 全部通过"

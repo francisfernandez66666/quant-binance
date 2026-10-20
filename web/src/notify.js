@@ -102,5 +102,7 @@ function notifyThrottled(key, title, body) {
   return notify(title, body)
 }
 
+// 统一出口：isNative=是否原生壳环境；canNotify=当前是否已获授权且支持；requestPermission=申请授权；
+// notify=发一条通知；notifyThrottled=按 key 节流后发送（同 key 在 THROTTLE_WINDOW_MS 内只发一次）。
 export { isNative, canNotify, requestPermission, notify, notifyThrottled }
 

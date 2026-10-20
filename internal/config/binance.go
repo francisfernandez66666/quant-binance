@@ -505,25 +505,45 @@ func (v BinanceBrokerView) BrokerEnabled() bool {
 // 的构造闸用它——数据面模式下即使误配了凭证也不会出现真单通道。
 // English: trading plane requires Cfg.Enabled; the data plane can never satisfy it, so a live
 // executor/reporter channel is structurally impossible without the trading switch.
-func (v BinanceBrokerView) TradingActive() bool       { return v.Cfg.Enabled && v.profile().Enabled }
-func (v BinanceBrokerView) BrokerMode() string        { return v.Cfg.Mode }
-func (v BinanceBrokerView) BrokerHalted() bool        { return v.Cfg.Halted }
+func (v BinanceBrokerView) TradingActive() bool { return v.Cfg.Enabled && v.profile().Enabled }
+
+// BrokerMode 返回该市场档案的下单模式（auto=自动 / manual=人工确认后下单）。
+func (v BinanceBrokerView) BrokerMode() string { return v.Cfg.Mode }
+
+// BrokerHalted 返回该市场 kill-switch 熔断位：置 true 后该市场一切新单被拒。
+func (v BinanceBrokerView) BrokerHalted() bool { return v.Cfg.Halted }
+
+// BrokerCancelStaleSec 返回未成交委托的自动撤单阈值（秒）；0=不自动撤。
 func (v BinanceBrokerView) BrokerCancelStaleSec() int { return v.Cfg.CancelStaleSec }
 
 // BrokerCloseSweepAt -1：币安侧无收盘清单（CRYPTO 7×24；美股清单由 tradingStatus 流驱动，Phase 1 不做）。
 func (v BinanceBrokerView) BrokerCloseSweepAt() int { return -1 }
 
-func (v BinanceBrokerView) BrokerMissHeartbeat() int   { return v.Cfg.MissHeartbeatSec }
+// BrokerMissHeartbeat 返回 WS 心跳超时熔断阈值（秒）：超过即判定行情/回报链路不可用。
+func (v BinanceBrokerView) BrokerMissHeartbeat() int { return v.Cfg.MissHeartbeatSec }
+
+// BrokerFixedAmount 返回该市场档案的单票固定买入金额（计价币种），按档案区分 US/CRYPTO 各自预算。
 func (v BinanceBrokerView) BrokerFixedAmount() float64 { return v.profile().FixedAmount }
-func (v BinanceBrokerView) BrokerMaxPositions() int    { return v.profile().MaxPositions }
-func (v BinanceBrokerView) BrokerDailyMaxBuys() int    { return v.profile().DailyMaxBuys }
+
+// BrokerMaxPositions 返回该市场档案的最大并发持仓数；达上限后新开仓被拒。
+func (v BinanceBrokerView) BrokerMaxPositions() int { return v.profile().MaxPositions }
+
+// BrokerDailyMaxBuys 返回该市场档案的单日最大买入笔数（按市场独立计数）。
+func (v BinanceBrokerView) BrokerDailyMaxBuys() int { return v.profile().DailyMaxBuys }
+
+// BrokerDailyBudget 返回该市场档案的单日买入预算（计价币种），与本市场其他档案隔离计数。
 func (v BinanceBrokerView) BrokerDailyBudget() float64 { return v.profile().DailyBudgetAmount }
 
 // BrokerInitialCapital 0=不设资金基线（币安侧初始资金由账户实时权益驱动，P2 接 paper 后补）。
 func (v BinanceBrokerView) BrokerInitialCapital() float64 { return 0 }
 
-func (v BinanceBrokerView) BrokerStrategies() []string     { return v.profile().Strategies }
-func (v BinanceBrokerView) BrokerBlacklist() []string      { return v.profile().Blacklist }
+// BrokerStrategies 返回该市场档案允许下单的战法白名单；空表示不按战法过滤。
+func (v BinanceBrokerView) BrokerStrategies() []string { return v.profile().Strategies }
+
+// BrokerBlacklist 返回该市场档案的下单黑名单（标的代码），命中即拒单。
+func (v BinanceBrokerView) BrokerBlacklist() []string { return v.profile().Blacklist }
+
+// BrokerRiskGate 返回该市场的风控闸参数集合（与 QMT 共用同一 RiskGateConfig 形态，阈值按市场分档）。
 func (v BinanceBrokerView) BrokerRiskGate() RiskGateConfig { return v.Cfg.RiskGate }
 
 // BrokerShortMarginRate §MR-4A 市场档案做空保证金率（0=禁做空）。刻意不入 BrokerConfig 接口：
@@ -542,7 +562,10 @@ func (v BinanceBrokerView) FuturesActive() bool {
 }
 
 // BrokerLeverage / BrokerLiqDistMinPct §MR-4B 档案杠杆与强平距离阈值的对外读取口。
-func (v BinanceBrokerView) BrokerLeverage() int          { return v.profile().Leverage }
+// BrokerLeverage 返回该市场档案的合约杠杆倍数（现货档案为 1）。
+func (v BinanceBrokerView) BrokerLeverage() int { return v.profile().Leverage }
+
+// BrokerLiqDistMinPct 返回强平距离最小阈值（百分比）：距强平价近于此值即禁止新开仓，防止一开仓就被强平。
 func (v BinanceBrokerView) BrokerLiqDistMinPct() float64 { return v.profile().LiqDistMinPct }
 
 // PaperActive §战法批 纸面成交柜台装配判定：交易面未激活（总开关关）且市场子开关开且

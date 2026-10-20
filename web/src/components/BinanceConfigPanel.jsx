@@ -33,6 +33,9 @@ const emptyForm = () => ({
   cp_token: '', llm_key: '',
 })
 
+// BinanceConfigPanel 币安配置面板（设置页）：读写 /api/config/binance（admin），
+// 含 API 密钥掩码回显、杠杆红线确认戳、派发/事件源/纸面柜台三组子开关。
+// 提交采用指针式局部合并——只发用户改过的字段，未传字段后端保持原值。
 export default function BinanceConfigPanel() {
   const [form, setForm] = useState(emptyForm())
   const [masked, setMasked] = useState({ api_key_masked: '', api_secret_masked: '', cp: '', llm: '' })

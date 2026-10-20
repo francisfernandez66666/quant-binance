@@ -30,6 +30,8 @@ function emotionColor(name) {
   return EMOTION_STYLE[k] || 'var(--app-muted-2)'
 }
 
+// SentimentCard 情绪相位卡（仪表盘）：展示当前市场情绪相位与近 30 日历史色带，
+// 点击可跳转情绪回看页（§C 档）。未知/空相位回落灰色，不显示"正常"误导。
 export default function SentimentCard() {
   // 跳转情绪回看页（§C 档）用
   const nav = useNavigate()

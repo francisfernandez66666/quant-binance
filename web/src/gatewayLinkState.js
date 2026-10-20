@@ -19,6 +19,9 @@ let cnMaster = null
 // 恰好复刻 §LINTGATE 那条"链路行永不渲染"的事故形状。
 const listeners = new Set()
 
+// subscribeCnMaster 订阅 cn_master 变化：返回一个退订函数（组件卸载时调用）。
+// 存在意义见上方 listeners 注释——缓存变了必须能叫醒把值读进 useMemo 依赖的组件，
+// 否则网关 503 时链路行会静默消失（§Z4 抓到的事故形状）。
 export function subscribeCnMaster(fn) {
   listeners.add(fn)
   return () => listeners.delete(fn)
@@ -33,14 +36,21 @@ export function setCnMaster(v) {
   for (const fn of listeners) fn()
 }
 
+// getCnMaster 读取当前缓存的 A 股总开关：true/false=已取到；null=未知（老服务端无该字段或首轮未到达）。
 export function getCnMaster() {
   return cnMaster
 }
 
+// 链路状态枚举（gatewayVerdict 的返回值，三处展示位同源消费）
+// frozen=A股链路已冻结维护（广州执行机不再是部署目标，网关永不上报）
 export const LINK_FROZEN = 'frozen'
+// off=链路在但没启用（rules.qmt.enabled=false）
 export const LINK_OFF = 'off'
+// down=已启用且探测过但探不到（异常，需排查）
 export const LINK_DOWN = 'down'
+// live=已启用且探测正常（或尚未探测但配置正常）
 export const LINK_LIVE = 'live'
+// unknown=网关快照还没拿到，不做任何判定
 export const LINK_UNKNOWN = 'unknown'
 
 // 冻结横幅文案：三处展示位共用一句，避免各页写法漂移成三种"看起来都像正常"的说法。

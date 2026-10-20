@@ -996,11 +996,16 @@ type statusCapture struct {
 // Header 与真实 writer 共享头部 map；WriteHeader 只记首个状态码（HTTP 语义后写无效）；
 // 体先进缓冲，放行时再整体写回，供中间件在不解包业务代码的前提下"偷看"响应。
 func (c *statusCapture) Header() http.Header { return c.header }
+
+// WriteHeader 记录业务 handler 写入的状态码；只认首次写入（HTTP 语义下后写无效），
+// 未显式调用时在首次 Write 处落 200。
 func (c *statusCapture) WriteHeader(code int) {
 	if c.status == 0 {
 		c.status = code
 	}
 }
+
+// Write 把响应体写入内部缓冲（不直接发往客户端）；首次写入时若尚未设置状态码则补 200。
 func (c *statusCapture) Write(p []byte) (int, error) {
 	if c.status == 0 {
 		c.status = http.StatusOK
