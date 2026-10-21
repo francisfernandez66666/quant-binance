@@ -335,11 +335,11 @@ export type _FrontendPathsInContract = Expect<
 // ── 人审清单 B：契约里查无此路径（5 条，不进编译断言）──
 // 可能原因：① 前端拼接残片（如 '/api/x/' + id）；② 契约遗漏（后端应补 golden）；
 //           ③ 前端独有/第三方路由。逐条判明前不要把它们加进断言，否则闸门假红。
-//   /api/depth                                     ← web/src/api/index.js:771
-//   /api/holdings/balance                          ← web/src/api/index.js:1164
-//   /api/qmt/cancel                                ← web/src/api/index.js:947
-//   /api/research/backtest                         ← web/src/api/index.js:1909
-//   /api/research/task                             ← web/src/api/index.js:1837
+//   /api/depth                                     ← web/src/api/signals.js:42
+//   /api/holdings/balance                          ← web/src/api/positions.js:328
+//   /api/qmt/cancel                                ← web/src/api/positions.js:111
+//   /api/research/backtest                         ← web/src/api/research.js:105
+//   /api/research/task                             ← web/src/api/research.js:33
 
 // ── 断言 4：4 个请求体的字段级契约形状 ──
 // 后端改字段（改名/改类型/必填性变化）未重新生成，这里即编译红。

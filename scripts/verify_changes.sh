@@ -889,8 +889,8 @@ echo "==> 33 §H6/§H7 SSE 续传通道保全 + auth:expired 陈旧闭包（2026
 # hook 级用例（<2s），不再跑 import 整个 App+tdesign 的重文件（高负载 226s，曾把门禁拖脆）；
 # App 壳集成锚留在 auth_expired_h7.test.jsx，只进全量 npm test。
 vitest_gate "§H6 SSE 重连定时器 + §FIX1012-M5 auth 过期 hook（hook 级）" 'npm test -- sse_h6_reconnect use_auth_expired' 'sse_h6_reconnect use_auth_expired'
-grep -q 'sseReconnectTimer' web/src/api/index.js || { echo "--- FAIL: CLOSED 兜底重建定时器丢失（§H6 回归）"; exit 1; }
-grep -q 'readyState !== 2' web/src/api/index.js || { echo "--- FAIL: 原生重连让位判定丢失，onerror 回到无条件 close+new（§H6 回归）"; exit 1; }
+grep -q 'sseReconnectTimer' web/src/api/sse.js || { echo "--- FAIL: CLOSED 兜底重建定时器丢失（§H6 回归）"; exit 1; }
+grep -q 'readyState !== 2' web/src/api/sse.js || { echo "--- FAIL: 原生重连让位判定丢失，onerror 回到无条件 close+new（§H6 回归）"; exit 1; }
 # §H7 静态锁（§FIX1012-M5 起改锁 hook 接线）：App 必须接上 hook、hook 必须提供 ref 镜像、
 # hook 级用例必须不碰 App（保持 <2s 的单元粒度）。删接线/回退渲染态闭包读取即判红。
 grep -q 'useAuthExpired(loggedIn' web/src/App.jsx || { echo "--- FAIL: App 未接线 useAuthExpired hook（§H7 功能死）"; exit 1; }
@@ -1158,9 +1158,9 @@ vitest_gate "§NATIVEAUTH 原生加密存储桥（native_auth）" 'npm test -- n
 test -f mobile/app/src/main/java/com/liangzai/quant/SecureAuthStore.kt || { echo "--- FAIL: 原生加密存储实现缺失（§NATIVEAUTH）"; exit 1; }
 grep -q '"AndroidAuth"' mobile/app/src/main/java/com/liangzai/quant/MainActivity.kt || { echo "--- FAIL: AndroidAuth 桥未注册（§NATIVEAUTH 前端迁而无门）"; exit 1; }
 grep -q 'security-crypto' mobile/app/build.gradle.kts || { echo "--- FAIL: EncryptedSharedPreferences 依赖丢失（§NATIVEAUTH）"; exit 1; }
-grep -q 'nativeAuthBridge' web/src/api/index.js || { echo "--- FAIL: 前端桥探测丢失（§NATIVEAUTH）"; exit 1; }
+grep -q 'nativeAuthBridge' web/src/api/shared.js || { echo "--- FAIL: 前端桥探测丢失（§NATIVEAUTH）"; exit 1; }
 # 负锁：业务代码不得再直读 liangzai_token 字面量（api/index.js 存储层单点之外、滤注释行与测试）。
-if grep -rn "liangzai_token" web/src --include='*.js' --include='*.jsx' 2>/dev/null | grep -v __tests__ | grep -v 'src/api/index.js' | grep -vE ':[0-9]+:[[:space:]]*//' | has_hit; then
+if grep -rn "liangzai_token" web/src --include='*.js' --include='*.jsx' 2>/dev/null | grep -v __tests__ | grep -v 'src/api/shared.js' | grep -v 'src/api/index.js' | grep -vE ':[0-9]+:[[:space:]]*//' | has_hit; then
 	echo "--- FAIL: localStorage token 直读复活（§NATIVEAUTH 必须收敛在 api 存储层）"; exit 1; fi
 echo "ok - §NATIVEAUTH 专项守卫通过（行为锁 1 组 + 静态锁 4 道 + 直读负锁）"
 
@@ -1321,7 +1321,7 @@ vitest_gate "§NATIVEAUTH SSE 重连 + 会话票据续读（sse_h6_reconnect+sse
 # ── M-5 静态锁：服务端收 query、票据不作废、前端重建带续读位置 ──
 grep -q 'Query().Get("last_event_id")' internal/server/handlers_fix.go || { echo "--- FAIL: SSE 不再收 ?last_event_id= query（手动重建路径补发环又不可达，§M5 复活）"; exit 1; }
 grep -q 'func (s \*Server) useSSETicket' internal/server/sse.go || { echo "--- FAIL: useSSETicket 改名回退（票据又回到消费即废语义，§M5 复活）"; exit 1; }
-grep -q 'last_event_id=' web/src/api/index.js || { echo "--- FAIL: 前端重建 URL 不带续读位置（§M5 前端腿丢失）"; exit 1; }
+grep -q 'last_event_id=' web/src/api/sse.js || { echo "--- FAIL: 前端重建 URL 不带续读位置（§M5 前端腿丢失）"; exit 1; }
 # 负向锁（滤注释行）：消费即废的旧函数形态不得复活（改名即报警）。
 if grep -rn 'consumeSSETicket' internal/ --include='*.go' | grep -vE ':[0-9]+:[[:space:]]*(//|\*)' | has_hit; then
 	echo "--- FAIL: consumeSSETicket 真代码复活（§M5 语义回退）"; exit 1; fi
@@ -2983,7 +2983,7 @@ check_cov() {
 }
 check_cov "internal/strategy_engine" 44
 check_cov "internal/engine" 46
-check_cov "internal/server" 44
+check_cov "internal/server" 46
 echo "ok - §FIX1012 首批守卫通过（M1 单源+反证 / M3 注释写实 / M4 fail-fast+autostart / M5 见 §33 / M8 路由对账门 / M2 检查单 / M12 密钥守卫 / M9 体积闸 / M10 日志收敛+max-lines / M6 载荷契约 golden / M7 核心包覆盖下限）"
 
 echo ""
@@ -3185,4 +3185,65 @@ else
 fi
 
 echo ""
+echo ""
+echo "==> 88 §AUDIT1019-M6 第二批 handlers_fix 纯函数分支（P1 覆盖补强 + 真实缺陷修复，2026-10-21）..."
+# ── 背景：server 包 154 个零覆盖函数里，语句量最大的前 8 个全在 handlers_fix.go ──────────
+# （handleFixNews 82 / handleFixMinute 56 / handleFixSetHoldings 47 / handleFixAlerts 40 …）。
+# 那是前端主链路出口（/api/signals、/api/holdings、/api/news、/api/alerts 全在这），但端点
+# handler 需要真引擎 + 真数据源，单测硬啃会退化成「为凑数写无用断言」；故第二批先啃
+# **不依赖外部世界的纯函数**——它们是 handler 的组装零件，改坏了同样让前端整列算错，
+# 而此前一条断言都没有（改坏不红）。成果：server 覆盖率 46.3% → 48.5%（+2.2pp），
+# 零 IO / 零网络 / 零落盘，全部表驱动 + 边界值。
+# ── 锁①：行为锁（go_run_gate 单源出口：退出码 + [no tests to run] + RUN 数三重判红）──────
+go_run_gate internal/server 'TestNormImpactLevel|TestRoundHelpers|TestScoreToRemindLevel|TestSignalGeneratedAtText|TestDimScores|TestToFixSignals|TestAlertGeneratedAtKey|TestNormalizeTitle|TestPickBestEvent|TestResolveSectorNewsItems|TestNormalizeNewsTime|TestNewsTimeFromEpoch|TestTruncateTitle|TestHoldingLots|TestBuildHoldingFallback' '§AUDIT1019-M6 handlers_fix 纯函数分支'
+# ── 锁②：静态锁——本批撞出的真实缺陷，其守卫必须在位 ───────────────────────────────
+# 缺陷：新闻标题归一下来是空串（空白 / 纯标点）时，子串匹配 strings.Contains(n, "")
+#   **恒为真** ⇒ 这条空标题会匹配到任意一条新闻事件，而 map 遍历顺序不定 ⇒ 命中哪条
+#   是随机的（溯源弹窗展示与本板块无关的新闻，且每次可能不同）。
+#   反证实测：删掉 resolveSectorNewsItems 里的空串守卫后，TestResolveSectorNewsItems
+#   精确报红（误命中"新能源补贴政策落地"），恢复即绿。
+if ! /usr/bin/grep -q 'if nt == ""' internal/server/handlers_fix.go; then
+	echo "--- FAIL: §AUDIT1019-M6 resolveSectorNewsItems 的空标题守卫被删（空串子串匹配恒真 ⇒ 随机命中任意新闻，缺陷复活）"; exit 1; fi
+# ── 锁③：静态锁——15 个被测函数在测试文件里都真有断言（防覆盖被掏空成恒真）────────────
+for fn in normImpactLevel r2 scoreToRemindLevel signalGeneratedAtText dimScores toFixSignals alertGeneratedAtKey normalizeTitle pickBestEvent resolveSectorNewsItems normalizeNewsTime newsTimeFromEpoch truncateTitle holdingLots buildHolding; do
+	if ! /usr/bin/grep -q "${fn}(" internal/server/handlers_fix_pure_test.go; then
+		echo "--- FAIL: §AUDIT1019-M6 测试文件缺少对 ${fn} 的断言（本批覆盖被掏空）"; exit 1; fi
+done
+echo "ok - §AUDIT1019-M6 handlers_fix 纯函数分支在位（行为锁 + 空标题守卫静态锁 + 15 函数断言清单）"
+
+echo ""
+echo "==> 89 §AUDIT1019-M8-b 门禁锁路径修复（M8 拆分打瞎的门禁自身缺陷，2026-10-22 门禁自咬）..."
+# ── 背景：本仓施工自己引入的门禁缺陷（不是产品缺陷）────────────────────────────────
+# §AUDIT1019-M8 把 web/src/api/index.js（2161 行）按域拆成 16 个模块后，index.js 只剩
+# `export *` 统一出口 + 头部端点说明——**运行时导出面保住了（`export *`），但门禁/CI 里
+# 写死的文件路径没保住**：7 处静态锁仍在 grep index.js（sseReconnectTimer / readyState !== 2 /
+# last_event_id= / nativeAuthBridge，以及 liangzai_token 负锁的"存储层单点"豁免）。
+# 这些符号已分别迁入 sse.js / shared.js ⇒ 锁全部"查无此符号"⇒ 恒红。
+# 发现方式：2026-10-22 全量门禁跑到第 33 段当场报红（CLOSED 兜底重建定时器丢失），
+# 与 §85/§23 那几例同族——**锁自身失真，靠人眼读不出来，只能靠门禁自己咬出来**。
+# ── 锁①：四个符号必须在拆分后的真实归属模块（正向锁：位置对）─────────────────────
+grep -q 'sseReconnectTimer' web/src/api/sse.js || { echo "--- FAIL: §H6 CLOSED 兜底重建定时器丢失（§H6 回归）"; exit 1; }
+grep -q 'readyState !== 2' web/src/api/sse.js || { echo "--- FAIL: 原生重连让位判定丢失，onerror 回到无条件 close+new（§H6 回归）"; exit 1; }
+grep -q 'last_event_id=' web/src/api/sse.js || { echo "--- FAIL: 前端重建 URL 不带续读位置（§M5 前端腿丢失）"; exit 1; }
+grep -q 'nativeAuthBridge' web/src/api/shared.js || { echo "--- FAIL: §NATIVEAUTH 前端桥探测丢失"; exit 1; }
+# ── 锁②：负锁——门禁与 CI 不得再把业务符号的锁指向 index.js ──────────────────────
+# index.js 已无业务实现；后人照抄旧形态写新锁会再次失真（且是恒红，不是恒绿，更难发现）。
+# 只拦 grep -q 的"正向锁"形态；负锁里的 `grep -v 'src/api/index.js'` 豁免链不受影响。
+# 过滤注释行（# 起手），避免本段自己的说明文字自指。
+# 只拦"把业务符号的锁指向 index.js"这一形态；index.js 自身形态锁（如 export * 出口锁）
+# 与负锁里的 `grep -v` 豁免链不受影响。两处 anti-self-match 处理（都是本仓踩过的坑）：
+#   ① 模式写成 inde[x]\.js —— 正则仍匹配 index.js，但本行文本含 '[' 不再自匹配；
+#   ② 过滤 # 起手的注释行，避免本段说明文字自指。
+if grep -nE "grep -q .*(sseReconnectTimer|readyState|nativeAuthBridge|last_event_id).* web/src/api/inde[x]\.js" scripts/verify_changes.sh .github/workflows/ci.yml 2>/dev/null | grep -vE ':[0-9]+:[[:space:]]*#' | has_hit; then
+	echo "--- FAIL: §AUDIT1019-M8-b 门禁/CI 仍有锁把业务符号指向 web/src/api/index.js（拆分后该文件只有 export * 出口 ⇒ 锁恒红）";
+	grep -nE "grep -q .*(sseReconnectTimer|readyState|nativeAuthBridge|last_event_id).* web/src/api/inde[x]\.js" scripts/verify_changes.sh .github/workflows/ci.yml 2>/dev/null | grep -vE ':[0-9]+:[[:space:]]*#' | head -5; exit 1; fi
+# ── 锁③：静态锁——16 个拆分模块必须都还在（防"回滚式"删模块却留着旧锁）─────────────
+for mod in shared auth_store market request auth_api signals status alerts positions trade sse config consult research admin; do
+	if [ ! -f "web/src/api/${mod}.js" ]; then
+		echo "--- FAIL: §AUDIT1019-M8 web/src/api/${mod}.js 缺失（拆分被回退但锁仍指向新路径）"; exit 1; fi
+done
+if ! grep -q "export \*" web/src/api/index.js; then
+	echo "--- FAIL: §AUDIT1019-M8 index.js 不再是统一出口（export * 丢失 ⇒ 外部 import 全断）"; exit 1; fi
+echo "ok - §AUDIT1019-M8-b 门禁锁路径修复在位（4 符号正向锁 + 旧形态负锁 + 16 模块与统一出口在锁）"
+
 echo "==> 全部通过"

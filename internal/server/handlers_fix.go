@@ -1315,6 +1315,15 @@ func resolveSectorNewsItems(s *Server, userID string, dash *display.DashboardDat
 			continue
 		}
 		nt := normalizeTitle(t)
+		// §AUDIT1019-M6（2026-10-21）空白/纯标点标题必须跳过：归一下来是空串时，
+		// 下面的子串匹配 `strings.Contains(n, "")` **恒为真**，会把这条空标题匹配到
+		// 任意一条事件上（map 遍历顺序不定 ⇒ 命中哪条还是随机的），溯源弹窗因此
+		// 展示一条与本板块无关的新闻。修法：归一后为空即跳过（与 t=="" 同口径）。
+		// English: skip titles that normalize to empty — strings.Contains(n, "") is always true,
+		// which would match a blank/whitespace-only title against an arbitrary event.
+		if nt == "" {
+			continue
+		}
 		var best *newsagent.NewsEvent
 		// 1) 精确归一匹配；2) 子串包含匹配（改写标题与被改写标题互相包含）
 		if list, ok := byNorm[nt]; ok {

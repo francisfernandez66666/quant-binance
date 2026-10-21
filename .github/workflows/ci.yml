@@ -274,7 +274,7 @@ jobs:
           # §H5 新鲜度主判据
           grep -q 'at := sc.UpdatedAt' internal/engine/sell_shadow.go || { echo "新鲜度回退全局时钟（§H5）"; exit 1; }
           # §H6/§H7 前端 SSE 续传与登出闭包
-          grep -q 'sseReconnectTimer' web/src/api/index.js || { echo "§H6 重建定时器丢失"; exit 1; }
+          grep -q 'sseReconnectTimer' web/src/api/sse.js || { echo "§H6 重建定时器丢失"; exit 1; }
           grep -q 'loggedInRef.current' web/src/App.jsx || { echo "§H7 登出回调读陈旧闭包复活"; exit 1; }
           # §H9 outbox 下标定位防复活
           if grep -q 'jobs = append(jobs, job{idx: i' internal/notify/outbox.go; then echo "pump 回退数组下标定位（§H9 风暴复活）"; exit 1; fi
@@ -351,8 +351,8 @@ jobs:
           test -f mobile/app/src/main/java/com/liangzai/quant/SecureAuthStore.kt || { echo "NATIVEAUTH 原生加密存储缺失"; exit 1; }
           grep -q '"AndroidAuth"' mobile/app/src/main/java/com/liangzai/quant/MainActivity.kt || { echo "NATIVEAUTH 桥未注册"; exit 1; }
           grep -q 'security-crypto' mobile/app/build.gradle.kts || { echo "NATIVEAUTH 依赖丢失"; exit 1; }
-          grep -q 'nativeAuthBridge' web/src/api/index.js || { echo "NATIVEAUTH 前端桥探测丢失"; exit 1; }
-          if grep -rn "liangzai_token" web/src --include='*.js' --include='*.jsx' | grep -v __tests__ | grep -v 'src/api/index.js' | grep -vE ':[0-9]+:[[:space:]]*//' | grep -q .; then echo "NATIVEAUTH 业务代码直读 token 复活"; exit 1; fi
+          grep -q 'nativeAuthBridge' web/src/api/shared.js || { echo "NATIVEAUTH 前端桥探测丢失"; exit 1; }
+          if grep -rn "liangzai_token" web/src --include='*.js' --include='*.jsx' | grep -v __tests__ | grep -v 'src/api/shared.js' | grep -v 'src/api/index.js' | grep -vE ':[0-9]+:[[:space:]]*//' | grep -q .; then echo "NATIVEAUTH 业务代码直读 token 复活"; exit 1; fi
           # §ROOTQMT 死键防回潮：清理脚本随广州部署面下线（死键产物现场在被删的那台机器上），
           # 本仓口径改由「引擎 Save 只写 {rules,d1}」+ §GZ-OFFLINE 防回潮锁兜住，新部署位再补现场腿。
           # §APPVER 强制更新通道：公开端点（不得套鉴权）+ 构建腿在位 + 原生闸 + 版本跃迁

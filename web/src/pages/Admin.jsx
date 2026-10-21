@@ -12,7 +12,9 @@ import * as api from '../api/index.js'
 import { showToast, confirmDialog } from '../ui.jsx'
 
 // 从 api 模块导入权限判断工具：isAdmin() 读取 localStorage 中缓存的 role（由 App 的 refreshMe 写入）
-// 守卫判断来源：web/src/api/index.js 的 isAdmin()（基于 STORAGE_ROLE），与 App.jsx 中侧边栏 canAdmin 一致
+// 守卫判断来源：web/src/api/auth_store.js 的 isAdmin()（基于 STORAGE_ROLE），与 App.jsx 中侧边栏 canAdmin 一致
+// 注：isAdmin 原定义在 api/index.js，2026-10-21 §AUDIT1019-M8 按域拆分后迁至 auth_store.js；
+//     index.js 仍以 `export *` 转出，故本文件的 import 路径无需改动。
 import { isAdmin } from '../api/index.js'
 
 // 权限位中文标签映射：把后端下发的英文权限标识翻译为界面可读文案（当前仅"研究审批"一项）
