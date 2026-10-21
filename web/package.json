@@ -12,7 +12,8 @@
     "test:e2e": "playwright test",
     "test:e2e:headed": "PW_HEADED=1 playwright test",
     "lint": "eslint src",
-    "lint:fix": "eslint src --fix"
+    "lint:fix": "eslint src --fix",
+    "typecheck": "tsc --noEmit --strict --skipLibCheck --target es2020 --moduleResolution bundler --module esnext src/api/api_contract_probe.ts"
   },
   "dependencies": {
     "lightweight-charts": "^5.2.1",
@@ -30,6 +31,7 @@
     "eslint": "^10.11.0",
     "globals": "^17.12.0",
     "jsdom": "^29.1.1",
+    "typescript": "^5.9.3",
     "vite": "^7.0.0",
     "vitest": "^4.1.11"
   }

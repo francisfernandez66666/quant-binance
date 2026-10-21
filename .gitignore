@@ -122,3 +122,6 @@ qmt_gateway/bridge_cmd.json
 # §N7（2026-09-26 全量审计批）自运维变量真实值（服务器地址/账号等敏感项，禁止入库；
 # 入库模板见 scripts/ops.env.example）
 scripts/ops.env
+
+# WorkBuddy 本地工作区（memory/tmp）：本机会话产物，非项目资产
+.workbuddy/

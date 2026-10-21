@@ -2808,7 +2808,9 @@ if [ "${gofmt_off:-0}" -ne 0 ]; then
 #       它匹配的是 Go 源码里的 || 运算符，不是 BRE 交替问题，本就正确）。
 BRE_ALT_HITS=$(grep -nE "grep [^|]*'[^']*\\\\\|[^']*'" scripts/verify_changes.sh | grep -vE '^[0-9]+:[[:space:]]*#' | grep -vE "grep [^|]*-[a-zA-Z]*E[a-zA-Z]* " | grep -vE "printf .*AAA" | has_hit || true)
 if [ -n "${BRE_ALT_HITS}" ]; then
-	echo "--- FAIL: BRE 交替写法复活（$BRE_ALT_HITS）——本机 grep 不支持 \| 交替，按字面量匹配且不报错，正锁恒红/负锁恒绿；请改 -E + |"; exit 1; fi
+	# 注意这里必须写 ${BRE_ALT_HITS}：$VAR 紧跟全角「）」会被 bash 吞进变量名（set -u 下 unbound
+	# variable 直接中止）——本行曾经就是全仓唯一一处违规，被 §23 的变量名吞噬守卫自己扫出来。
+	echo "--- FAIL: BRE 交替写法复活（${BRE_ALT_HITS}）——本机 grep 不支持 \| 交替，按字面量匹配且不报错，正锁恒红/负锁恒绿；请改 -E + |"; exit 1; fi
 # 反证：临时植入一条 BRE 交替写法的假锁，**必须被扫出来**（扫出=本锁有效，判绿）；
 # 扫不出来=本锁恒不命中、形同虚设，才判红。判定方向别写反——`if (…); then` 成立即"有命中"。
 if ( T=$(mktemp); cp scripts/verify_changes.sh "$T"; \
@@ -3114,6 +3116,73 @@ inc_main=$(/usr/bin/grep -c "include: \['src/__tests__/\*\*/\*.test.{js,jsx}'\]"
 if [ "${inc_serial:-0}" -lt 1 ] || [ "${inc_main:-0}" -lt 1 ]; then
 	echo "--- FAIL: §AUDIT1019-M4 降级配置与原配置的 include 口径不一致（断言集被缩小=放水）"; exit 1; fi
 echo "ok - §AUDIT1019-M4 降级配置用 Vitest 4 顶层 singleThread（poolOptions 零复活 + 拓扑未放宽 + 断言集同口径）"
+
+echo ""
+echo "==> 87 §AUDIT1019-M5 FE↔BE 契约编译期强制（P1 + 防回潮，2026-10-20）..."
+# ── 背景：把「改路径/改字段」从「测试红」提前到「编译红」─────────────────────────
+# 链路：endpoint_payloads.json（后端权威契约，186 条）
+#   → tools/gen_api_types.py 生成 types.d.ts（类型）+ api_contract_probe.ts（编译期探针）
+#   → npm run typecheck（tsc 检查探针）→ 契约漂移即编译红。
+#
+# ★★ 本段每把锁都做过「植入反证」，以下四个坑全是反证时实测撞出来的，不是推想 ★★
+#   ① --skipLibCheck 跳过所有 .d.ts ⇒ 直接 tsc types.d.ts 永远返回 0。
+#      反证：注入 `export const b: number = "s"` 后 tsc 仍 exit 0 → 必须有 .ts 探针。
+#   ② 契约表写 `const M: Record<string, Meta>` ⇒ keyof 退化成 string ⇒ 任意路径都合法。
+#      反证：把 ApiEndpointKey 换成 string（退化等价形态）→ 探针 26 行 TS2344 红。
+#   ③ 让探针断言「自己生成的清单」= 同义反复：删 golden 条目后元组同步少一条，仍全绿。
+#      反证：删 GET /api/status 后全绿 → 改为断言**固化的前端基线**（外部事实）→ 红。
+#   ④ 基线若每次重新判定，删端点后该路径会被自动移出清单，闸门自愈失效。
+#      对策：基线固化在 internal/server/frontend_paths_baseline.json，反向由 --check 锁住。
+# ── 锁①：三件套齐全（生成器 + 两个生成物 + 基线）───────────────────────────────
+for f in tools/gen_api_types.py web/src/api/types.d.ts web/src/api/api_contract_probe.ts internal/server/frontend_paths_baseline.json; do
+	if [ ! -f "$f" ]; then
+		echo "--- FAIL: §AUDIT1019-M5 缺少 ${f}（契约编译期强制链路断裂）"; exit 1; fi
+done
+# ── 锁②：契约表必须是纯 type（不得退回 const + Record 标注，否则 keyof 退化）────
+# 只查**非注释行**：文件头注释为解释历史会写出缺陷形态原文，连注释扫会误判（同 §86 锁②教训）。
+if /usr/bin/grep -v '^[[:space:]]*//' web/src/api/types.d.ts | /usr/bin/grep -q 'export const ApiEndpointMap'; then
+	echo "--- FAIL: §AUDIT1019-M5 契约表退回 const 形态（.d.ts 不允许初始化器，且会诱导加 Record 标注）"; exit 1; fi
+if /usr/bin/grep -v '^[[:space:]]*//' web/src/api/types.d.ts | /usr/bin/grep -q 'Record<string, ApiEndpointMeta>'; then
+	echo "--- FAIL: §AUDIT1019-M5 契约表加了 Record<string, ApiEndpointMeta> 标注（keyof 退化成 string，断言永远绿）"; exit 1; fi
+# ── 锁③：typecheck 必须打在**探针**上（打在 .d.ts 上 = 永远绿的空转）────────────
+if ! /usr/bin/grep -q 'api_contract_probe\.ts' web/package.json; then
+	echo "--- FAIL: §AUDIT1019-M5 package.json 的 typecheck 未指向探针（--skipLibCheck 会跳过 .d.ts，等于没检查）"; exit 1; fi
+if /usr/bin/grep -E '"typecheck"[^}]*types\.d\.ts' web/package.json | /usr/bin/grep -q 'types\.d\.ts'; then
+	echo "--- FAIL: §AUDIT1019-M5 typecheck 仍指向 types.d.ts（已实证永远返回 0，闸门失效）"; exit 1; fi
+# ── 锁④：退化哨兵在位，且不得取 never（Expect<never> 不报错，哨兵会静默失效）────
+if ! /usr/bin/grep -q '_KeyNotDegraded' web/src/api/api_contract_probe.ts; then
+	echo "--- FAIL: §AUDIT1019-M5 探针缺少退化哨兵 _KeyNotDegraded（ApiEndpointKey 退化将无人报警）"; exit 1; fi
+if /usr/bin/grep -v '^[[:space:]]*//' web/src/api/api_contract_probe.ts | /usr/bin/grep -q 'extends true ? never :'; then
+	echo "--- FAIL: §AUDIT1019-M5 退化哨兵取 never（never extends true 成立，永远不会红）——必须取 false"; exit 1; fi
+# ── 锁⑤：探针不得断言"自己生成的清单"（同义反复，锁不住后端删端点）──────────────
+# 判据：断言 3 必须来自基线（frontend_paths_baseline.json），而非本次扫描结果。
+if ! /usr/bin/grep -q 'frontend_paths_baseline.json' web/src/api/api_contract_probe.ts; then
+	echo "--- FAIL: §AUDIT1019-M5 探针未声明基线来源（断言对象必须是外部事实，不是自造清单）"; exit 1; fi
+# ── 行为腿：--check 三方对拍（契约 + 生成物 + 基线）─────────────────────────────
+if command -v python3 > /dev/null 2>&1; then
+	python3 tools/gen_api_types.py --check > /tmp/qbn_apitypes_check.out 2>&1
+	chk=$?
+	if [ "$chk" -ne 0 ]; then
+		echo "--- FAIL: §AUDIT1019-M5 契约/生成物/基线 drift（详见 /tmp/qbn_apitypes_check.out）："
+		/usr/bin/sed -n '1,6p' /tmp/qbn_apitypes_check.out
+		exit 1
+	fi
+else
+	echo "WARN - §AUDIT1019-M5 python3 不可用，--check 行为腿跳过（静态锁仍生效）"
+fi
+# ── 行为腿：tsc 真的编译探针（契约漂移在此处红）────────────────────────────────
+if [ -x web/node_modules/.bin/tsc ]; then
+	(cd web && npm run typecheck > /tmp/qbn_typecheck.out 2>&1)
+	tsc_rc=$?
+	if [ "$tsc_rc" -ne 0 ]; then
+		echo "--- FAIL: §AUDIT1019-M5 npm run typecheck 编译红（契约漂移）："
+		/usr/bin/grep -E 'error TS' /tmp/qbn_typecheck.out | head -5
+		exit 1
+	fi
+	echo "ok - §AUDIT1019-M5 契约编译期强制在位（type 契约 + 探针 typecheck + 基线对拍，四坑零回潮）"
+else
+	echo "WARN - §AUDIT1019-M5 web/node_modules 无 tsc，typecheck 行为腿跳过（静态锁仍生效）"
+fi
 
 echo ""
 echo "==> 全部通过"

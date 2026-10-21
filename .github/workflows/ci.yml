@@ -94,6 +94,18 @@ jobs:
         working-directory: web
         run: npm run lint -- --quiet
 
+      # §AUDIT1019-M5（2026-10-20）FE↔BE 契约编译期强制：把「改路径/改字段」从「测试红」提前到
+      # 「编译红」。链路 = endpoint_payloads.json → gen_api_types.py 生成类型+探针 → tsc 检查探针。
+      # ⚠ 两个已实证的失效形态，CI 侧同样要避开（本机 verify_changes.sh §87 有同口径静态锁）：
+      #   ① tsc 打在 .d.ts 上恒绿（--skipLibCheck 跳过所有声明文件）→ 必须打在 .ts 探针上；
+      #   ② 契约表若写成 const + Record 标注，keyof 退化成 string → 断言永远绿。
+      - name: §AUDIT1019-M5 契约/生成物/基线三方对拍
+        run: python3 tools/gen_api_types.py --check
+
+      - name: §AUDIT1019-M5 编译期契约检查（tsc 打在 .ts 探针上）
+        working-directory: web
+        run: npm run typecheck
+
       - name: Test（§WS-I vitest 门禁：SSE 票据/认证/UI 组件回归）
         working-directory: web
         run: npm test
