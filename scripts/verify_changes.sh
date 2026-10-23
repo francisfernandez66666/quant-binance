@@ -3248,4 +3248,28 @@ if ! grep -q "export \*" web/src/api/index.js; then
 	echo "--- FAIL: §AUDIT1019-M8 index.js 不再是统一出口（export * 丢失 ⇒ 外部 import 全断）"; exit 1; fi
 echo "ok - §AUDIT1019-M8-b 门禁锁路径修复在位（4 符号正向锁 + 旧形态负锁 + 16 模块与统一出口在锁）"
 
+echo "==> 90 §AUDIT1019-M6 长尾第三批：research 文件IO端点 + optRefIDFor 纯逻辑（P1 覆盖补强，2026-10-23）..."
+# ── 背景：server 包 140 个零覆盖函数里，端点 handler 多需真引擎 + 真数据源 ───────────────
+# （computeResearchProgress / handleResearchCandidates / approveCandidate …）硬啃会退化成
+# 「伪造引擎写无用断言」。本批专挑**零外部依赖**的零件：optRefIDFor（纯确定性映射：
+# 已知目标槽位 990-994 + FNV32 散列兜底）与 research.go 只碰本地文件的端点
+# （handleResearchFactors 只消费 factor 注册表；handleSchedulerStatus /
+# handleResearchEventFactor / schedulerState / handleResearchTaskLog 只碰本地文件，守卫集中在
+# 「文件缺失 / 超 4MB / JSON 损坏 / 超 200KB 截断」四态——正是静默故障高发处）。
+# 零网络、零产品落盘；测试自身临时目录不算产品落盘。成果：server 覆盖率 48.5% → 49.2%，
+# 6 个函数从 0% 升到 ≥81.8%，其中 5 个 100%。
+# ── 锁①：行为锁（go_run_gate 单源出口：退出码 + [no tests to run] + RUN 数三重判红）──────
+go_run_gate internal/server 'TestOptRefIDFor|TestHandleResearchFactors|TestHandleSchedulerStatus|TestHandleResearchEventFactor|TestSchedulerState|TestHandleResearchTaskLog' '§AUDIT1019-M6 长尾第三批'
+# ── 锁②：静态锁——6 个被测函数在测试文件里都真有断言（防覆盖被掏空成恒真）────────────
+for fn in TestOptRefIDFor TestHandleResearchFactors TestHandleSchedulerStatus TestHandleResearchEventFactor TestSchedulerState TestHandleResearchTaskLog; do
+	if ! /usr/bin/grep -q "${fn}(" internal/server/research_opt_test.go; then
+		echo "--- FAIL: §AUDIT1019-M6 长尾第三批 测试文件缺少对 ${fn} 的断言（本批覆盖被掏空）"; exit 1; fi
+done
+# ── 锁③：静态锁——被覆盖的 6 个源函数必须都还在（防"回滚式"删函数却留着测试）────────
+for fn in optRefIDFor handleResearchFactors handleSchedulerStatus handleResearchEventFactor schedulerState handleResearchTaskLog; do
+	if ! /usr/bin/grep -qE "func .*${fn}\(" internal/server/optimizations.go internal/server/research.go; then
+		echo "--- FAIL: §AUDIT1019-M6 长尾第三批 源函数 ${fn} 缺失（被测面被回退但锁仍指向旧符号）"; exit 1; fi
+done
+echo "ok - §AUDIT1019-M6 长尾第三批在位（行为锁 + 6 函数断言清单 + 6 源函数在锁）"
+
 echo "==> 全部通过"
