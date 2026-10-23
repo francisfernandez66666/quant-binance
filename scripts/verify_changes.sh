@@ -3272,4 +3272,36 @@ for fn in optRefIDFor handleResearchFactors handleSchedulerStatus handleResearch
 done
 echo "ok - §AUDIT1019-M6 长尾第三批在位（行为锁 + 6 函数断言清单 + 6 源函数在锁）"
 
+echo "==> 91 §AUDIT1019-M8 尾巴：Research.jsx 纯函数抽取（research_format.js 行为锁，2026-10-23）..."
+# ── 背景：1889 行 god component Research.jsx 抽出 16 个零组件状态依赖的纯格式化/派生函数 ──
+# 到 web/src/pages/research_format.js（fmtPctGlobal/pct/fmtRows/fmt/signClass/signColor/fmtNum/
+# weightList/depthSummary/kindLabel/factorDirs/parseReason/fmtPct/verdict/plainLines/btTested），
+# Research.jsx 改为 import，调用点零改动，行为逐字节等价。留组件内的同族函数（factorName/
+# factorRule/btPct 读组件状态）不动。
+# 本机 8GB，vitest worker 无法启动（前台段走 SKIP，设计行为），故用纯 Node ESM 校验 harness
+# 作为可运行行为锁（CI / 正常机也会跑 vitest 同名单测 research_format.test.js）。
+# ── 锁①：行为锁——跑 node 校验 harness，要求绿（fail=0）──────────────────────────────
+if [ ! -f web/verify_research_format.mjs ]; then
+	echo "--- FAIL: §AUDIT1019-M8 校验 harness web/verify_research_format.mjs 缺失"; exit 1; fi
+out=$(node web/verify_research_format.mjs 2>&1) || { echo "--- FAIL: §AUDIT1019-M8 行为锁 node harness 退出非零"; echo "$out"; exit 1; }
+if ! echo "$out" | /usr/bin/grep -q 'fail=0'; then
+	echo "--- FAIL: §AUDIT1019-M8 行为锁 harness 报告 fail!=0（抽取行为回归）"; echo "$out"; exit 1; fi
+# ── 锁②：静态锁——16 个导出函数齐全 + Research.jsx 真接了线 ────────────────────────────
+if [ ! -f web/src/pages/research_format.js ]; then
+	echo "--- FAIL: §AUDIT1019-M8 源模块 research_format.js 缺失"; exit 1; fi
+for fn in fmtPctGlobal pct fmtRows fmt signClass signColor fmtNum weightList depthSummary kindLabel factorDirs parseReason fmtPct verdict plainLines btTested; do
+	if ! /usr/bin/grep -q "export function ${fn}(" web/src/pages/research_format.js; then
+		echo "--- FAIL: §AUDIT1019-M8 research_format.js 缺少导出 ${fn}"; exit 1; fi
+done
+if ! /usr/bin/grep -q "from './research_format.js'" web/src/pages/Research.jsx; then
+	echo "--- FAIL: §AUDIT1019-M8 Research.jsx 未从 research_format.js 导入（抽取未接线）"; exit 1; fi
+# ── 锁③：静态锁——vitest 单测文件存在且 16 函数都在断言里（防覆盖被掏空）──────────────
+if [ ! -f web/src/__tests__/research_format.test.js ]; then
+	echo "--- FAIL: §AUDIT1019-M8 vitest 单测 research_format.test.js 缺失"; exit 1; fi
+for fn in fmtPctGlobal pct fmtRows fmt signClass signColor fmtNum weightList depthSummary kindLabel factorDirs parseReason fmtPct verdict plainLines btTested; do
+	if ! /usr/bin/grep -q "${fn}" web/src/__tests__/research_format.test.js; then
+		echo "--- FAIL: §AUDIT1019-M8 单测未覆盖 ${fn}（覆盖被掏空）"; exit 1; fi
+done
+echo "ok - §AUDIT1019-M8 尾巴在位（行为锁 node harness + 16 导出 + 接线 + 16 单测断言）"
+
 echo "==> 全部通过"
