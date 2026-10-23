@@ -68,6 +68,16 @@ export default defineConfig({
       output: {
         manualChunks(id) {
           if (!id.includes('node_modules')) return undefined
+          // §AUDIT1019-M3（2026-10-21）：**只被懒加载面引用的大依赖不得进 eager vendor chunk**。
+          // manualChunks 会把命中规则的模块**强制**聚成一个 chunk，而该 chunk 一旦出现在
+          // index.html 的 modulepreload 里，首屏就必拉——即使它只被 React.lazy 的页面用到。
+          // 实测：lightweight-charts（~250KB）只被 XProChart.jsx 引用，而 XProChart 只被
+          // 懒加载的 StockDetailDrawer 引用，却因下面的兜底分支被塞进 vendor-misc 首屏预载
+          // （首屏 1.52MiB 里约 270KB 是它）。修法：显式排除，交回 Rollup 按动态 import
+          // 边界自动分包 ⇒ 它落到 StockDetailDrawer 的懒加载 chunk，进对应路由才拉取。
+          // English: exclude lazy-only heavy deps from eager vendor chunks so they land in the
+          // route's async chunk instead of being modulepreloaded on first paint.
+          if (id.includes('lightweight-charts')) return undefined
           if (id.includes('tdesign-react') || id.includes('tdesign-icons')) return 'vendor-tdesign'
           if (id.includes('react') || id.includes('scheduler') || id.includes('axios')) return 'vendor-react'
           return 'vendor-misc'
